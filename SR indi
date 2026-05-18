@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
-//|                                              S_R_Zones_FEELS.mq5 |
+//|                                              S_R_Zones_b1dii.mq5 |
 //|                                    Mirror of Pine v6 (Audit Fix) |
 //+------------------------------------------------------------------+
-#property copyright "FeelsStrategy"
+#property copyright "bidiisStrategy"
 #property version   "1.01"
 #property indicator_chart_window
 #property indicator_plots   0
