@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.08"
+#property version   "1.09"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -69,7 +69,7 @@ input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter
 input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
 input group "=== Entry Filter ==="
-input int    InpSigCooldownBars = 5;     // Bars between signals on same zone
+input int    InpSigCooldownBars = 20;    // Bars between signals on same zone (M5: 20 bars = 100 min)
 input bool   InpUseVolFilter    = false; // Enable ATR volatility filter (disable for Gold/indices)
 input double InpMinAtrPips      = 5;     // Min ATR pips (forex) / points (Gold: ~100)
 input double InpMaxAtrPips      = 2000;  // Max ATR pips (forex: ~80) / points (Gold: ~2000)
@@ -81,13 +81,13 @@ input int    InpSlippage   = 10;      // Slippage (points)
 input double InpLotInitial = 0.05;    // Initial lot (largest)
 input double InpLotAddon1  = 0.03;    // Add-on 1 lot
 input double InpLotAddon2  = 0.02;    // Add-on 2 lot
-input double InpSlZoneBuffer = 0.3;   // SL buffer beyond zone edge (x ATR)
+input double InpSlZoneBuffer = 1.5;   // SL buffer beyond zone edge (x ATR) – 1.5x gives breathing room
 
 input group "=== Pyramid Triggers ==="
-input double InpAddon1TrigPips  = 500;  // Add-on 1 trigger (pips) – Gold: 500 = $5
-input double InpAddon2TrigPips  = 1000; // Add-on 2 trigger (pips) – Gold: 1000 = $10
-input double InpStopAddon1Pips  = 300;  // Stop distance after add-on 1 – Gold: 300 = $3
-input double InpStopAddon2Pips  = 150;  // Stop distance after add-on 2 – Gold: 150 = $1.50
+input double InpAddon1TrigPips  = 1500; // Add-on 1 trigger (pips) – Gold: 1500 = $15 sustained move
+input double InpAddon2TrigPips  = 2500; // Add-on 2 trigger (pips) – Gold: 2500 = $25
+input double InpStopAddon1Pips  = 800;  // Stop distance after add-on 1 – Gold: 800 = $8 above entry
+input double InpStopAddon2Pips  = 400;  // Stop distance after add-on 2 – Gold: 400 = $4 above entry
 input bool   InpTrailAfterFull  = true; // Trail after full pyramid
 input double InpTrailPips       = 200;  // Trail distance – Gold: 200 = $2
 input double InpTrailStepPips   = 50;   // Trail step – Gold: 50 = $0.50
@@ -95,7 +95,7 @@ input double InpTrailStepPips   = 50;   // Trail step – Gold: 50 = $0.50
 input group "=== Role Flip Retests ==="
 input bool   InpUseRetests       = true;  // Trade/signal role-flip retests
 input int    InpRetestWindowBars = 80;    // Max bars after break to accept retest
-input double InpRetestSlBuffer   = 0.3;  // SL buffer beyond flipped zone (x ATR)
+input double InpRetestSlBuffer   = 1.5;  // SL buffer beyond flipped zone (x ATR)
 
 input group "=== Manual Trade Manager (Signal mode, magic 0) ==="
 input bool   InpManageManual    = true;  // Manage manually opened trades
