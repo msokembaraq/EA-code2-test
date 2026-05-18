@@ -1,0 +1,1113 @@
+//+------------------------------------------------------------------+
+//|                                              S_R_Zones_FEELS.mq5 |
+//|                                    Mirror of Pine v6 (Audit Fix) |
+//+------------------------------------------------------------------+
+#property copyright "FeelsStrategy"
+#property version   "1.01"
+#property indicator_chart_window
+
+//+------------------------------------------------------------------+
+//| ENUMS                                                             |
+//+------------------------------------------------------------------+
+enum ENUM_STRENGTH_PRESET
+  {
+   SCALP = 0,
+   LOCAL = 1,
+   SWING = 2,
+   MAJOR = 3,
+   CUSTOM = 4
+  };
+
+enum ENUM_VOLUME_FORMAT
+  {
+   ABSOLUTE = 0,
+   PERCENTAGE = 1
+  };
+
+//+------------------------------------------------------------------+
+//| STRUCTURES                                                        |
+//+------------------------------------------------------------------+
+struct Pivot
+  {
+   double            price;
+   int               bar;       // absolute bar index (0 = oldest)
+   double            vol;
+   double            wick;
+  };
+
+struct Zone
+  {
+   double            top;
+   double            bot;
+   double            center;
+   double            strength;
+   double            volSum;
+   int               touches;
+   int               firstBar;   // absolute bar index
+   int               lastTouch;  // absolute bar index
+   int               diedBar;    // absolute bar index, -1 if alive
+   bool              isResistance;
+   bool              wasBroken;
+   bool              isLiveBreak;
+  };
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                  |
+//+------------------------------------------------------------------+
+input group "Zone Strength"
+input ENUM_STRENGTH_PRESET InpPreset = SWING;                       // Strength preset
+
+input group "Custom Parameters"
+input int      InpPivLeft    = 15;     // Left bars
+input int      InpPivRight   = 8;      // Right bars
+input double   InpClusterTol = 0.9;    // Cluster tolerance (x ATR)
+input int      InpMinSpacing = 20;     // Min bars between touches
+input int      InpPivBuffer  = 80;     // Pivot memory
+
+input group "Zones"
+input int      InpZoneCount  = 6;      // Active zones per side
+input int      InpMinTouches = 2;      // Minimum touches
+input int      InpFadeAge    = 120;    // Fade after bars
+input double   InpHideFar    = 60.0;   // Hide zones farther than (%)
+
+input group "Broken Zones"
+input bool     InpShowBroken   = false;   // Show broken zones
+input bool     InpShowDropped  = false;   // Show dropped zones
+input color    InpBrokenBull   = clrDarkSeaGreen;   // Broken support color
+input color    InpBrokenBear   = clrLightPink;      // Broken resistance color
+input int      InpBrokenOp     = 85;     // Broken zone opacity (0-100)
+
+input group "Signals"
+input bool     InpShowTest     = false;  // Show test markers
+input bool     InpShowRetest   = false;  // Show retest markers
+input bool     InpShowReaction = false;  // Show reaction marks
+input int      InpSigCooldown  = 20;     // Cooldown bars
+input int      InpRetestWindow = 50;     // Retest window bars
+
+input group "Style"
+input color    InpResColor    = clrOrangeRed;       // Resistance color
+input color    InpSupColor    = clrMediumSeaGreen;  // Support color
+input bool     InpUseVolColor = true;    // Color zones by volume
+input bool     InpShowLabels  = true;    // Show zone labels
+input bool     InpShowVolText = true;    // Show volume score
+input ENUM_VOLUME_FORMAT InpVolFormat = ABSOLUTE;  // Volume format
+input bool     InpSingleLine  = false;  // Single line label
+input int      InpZoneOpacity = 82;     // Zone opacity low volume (0-100)
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                  |
+//+------------------------------------------------------------------+
+int      pivLeft, pivRight;
+double   clusterTol;
+int      minSpacing;
+
+// ATR handle
+int      atrHandle;
+
+// Pivot arrays (dynamic)
+Pivot    highPivots[];
+Pivot    lowPivots[];
+int      highPivotCount, lowPivotCount;
+
+// Zone arrays
+Zone     resZones[];
+Zone     supZones[];
+Zone     brokenZones[];
+int      resCount, supCount, brokenCount;
+
+// Signal tracking
+double   sigZoneCenters[];
+int      sigZoneBars[];
+int      sigCount;
+
+// Drawing prefix
+string   prefix = "FEELS_SR_";
+
+//+------------------------------------------------------------------+
+//| Safe volume (guards against zero/negative)                        |
+//+------------------------------------------------------------------+
+double SafeVolume(long vol)
+  {
+   return (vol <= 0) ? 1.0 : (double)vol;
+  }
+
+//+------------------------------------------------------------------+
+//| Upper wick length                                                 |
+//|   Uses OnCalculate array values, bar = absolute index             |
+//+------------------------------------------------------------------+
+double UpperWick(double h, double o, double c)
+  {
+   return h - MathMax(o, c);
+  }
+
+//+------------------------------------------------------------------+
+//| Lower wick length                                                 |
+//+------------------------------------------------------------------+
+double LowerWick(double l, double o, double c)
+  {
+   return MathMin(o, c) - l;
+  }
+
+//+------------------------------------------------------------------+
+//| Check if absolute bar index 'b' is a pivot high                   |
+//|   OnCalculate arrays: 0 = oldest                                  |
+//|   "Left"  = older bars = lower indices                           |
+//|   "Right" = newer bars = higher indices                          |
+//+------------------------------------------------------------------+
+bool IsPivotHigh(int b, const double &high[], int total)
+  {
+   if(b < pivLeft || b + pivRight >= total)
+      return false;
+
+   double h = high[b];
+   if(h <= 0) return false;
+
+   // Left bars (older, lower indices)
+   for(int i = 1; i <= pivLeft; i++)
+      if(high[b - i] >= h) return false;
+
+   // Right bars (newer, higher indices)
+   for(int i = 1; i <= pivRight; i++)
+      if(high[b + i] > h) return false;
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Check if absolute bar index 'b' is a pivot low                    |
+//+------------------------------------------------------------------+
+bool IsPivotLow(int b, const double &low[], int total)
+  {
+   if(b < pivLeft || b + pivRight >= total)
+      return false;
+
+   double l = low[b];
+   if(l <= 0) return false;
+
+   // Left bars (older, lower indices)
+   for(int i = 1; i <= pivLeft; i++)
+      if(low[b - i] <= l) return false;
+
+   // Right bars (newer, higher indices)
+   for(int i = 1; i <= pivRight; i++)
+      if(low[b + i] < l) return false;
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Check for duplicate pivot at the same bar index                   |
+//+------------------------------------------------------------------+
+bool IsDuplicatePivot(const Pivot &arr[], int count, int bar)
+  {
+   for(int i = count - 1; i >= 0 && i >= count - 10; i--)
+     {
+      if(arr[i].bar == bar)
+         return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Add pivot to dynamic array (circular buffer)                      |
+//+------------------------------------------------------------------+
+void AddPivot(Pivot &arr[], int &count, Pivot p, int maxCount)
+  {
+   if(count < maxCount)
+     {
+      if(count >= ArraySize(arr))
+         ArrayResize(arr, count + 10);
+      arr[count++] = p;
+     }
+   else
+     {
+      for(int i = 0; i < count - 1; i++)
+         arr[i] = arr[i + 1];
+      arr[count - 1] = p;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Compute rolling SMA of tick_volume over N bars                    |
+//+------------------------------------------------------------------+
+void RollingVolumeSMA(const long &tick_volume[], int total, int period, double &out[])
+  {
+   ArrayResize(out, total);
+   ArrayInitialize(out, 0);
+
+   if(total < period) return;
+
+   double sum = 0;
+   for(int i = 0; i < period; i++)
+      sum += (double)tick_volume[i];
+   out[period - 1] = sum / period;
+
+   for(int i = period; i < total; i++)
+     {
+      sum += (double)tick_volume[i] - (double)tick_volume[i - period];
+      out[i] = sum / period;
+     }
+
+   // Fill first period-1 bars with the first valid value
+   double firstVal = out[period - 1];
+   for(int i = 0; i < period - 1; i++)
+      out[i] = firstVal;
+  }
+
+//+------------------------------------------------------------------+
+//| Pivot weight calculation                                          |
+//+------------------------------------------------------------------+
+double PivotWeight(Pivot &p, double atr, double vAvg, int currentBar)
+  {
+   double safeVol  = (p.vol <= 0) ? 0.0 : p.vol;
+   double safeWick = (p.wick < 0) ? 0.0 : p.wick;
+   int    age      = MathMax(1, currentBar - p.bar);
+   double decay    = 1.0 / (1.0 + age / 200.0);
+   double volNorm  = (vAvg > 0) ? safeVol / vAvg : 1.0;
+   double wickNorm = (atr > 0)  ? safeWick / atr : 0.0;
+   return (1.0 + volNorm * 0.5 + wickNorm * 0.5) * decay;
+  }
+
+//+------------------------------------------------------------------+
+//| Build zones from pivot array                                      |
+//+------------------------------------------------------------------+
+void BuildZones(Pivot &src[], int srcCount, bool isResistance, double atr,
+                double vAvg, int currentBar, Zone &outZones[], int &outCount)
+  {
+   outCount = 0;
+   ArrayResize(outZones, 0);
+
+   if(srcCount < InpMinTouches || atr <= 0)
+      return;
+
+   bool used[];
+   ArrayResize(used, srcCount);
+   ArrayInitialize(used, false);
+
+   double tol = atr * clusterTol;
+   Zone tempZones[];
+   int tempCount = 0;
+   ArrayResize(tempZones, srcCount);
+
+   for(int i = 0; i < srcCount; i++)
+     {
+      if(used[i]) continue;
+
+      Pivot seed = src[i];
+      int memberIndices[];
+      int memberCount = 0;
+      ArrayResize(memberIndices, srcCount);
+      memberIndices[memberCount++] = i;
+      used[i] = true;
+
+      for(int j = i + 1; j < srcCount; j++)
+        {
+         if(used[j]) continue;
+         if(MathAbs(src[j].price - seed.price) <= tol)
+           {
+            bool farEnough = true;
+            if(minSpacing > 0)
+              {
+               for(int k = 0; k < memberCount && farEnough; k++)
+                  if(MathAbs(src[j].bar - src[memberIndices[k]].bar) < minSpacing)
+                     farEnough = false;
+              }
+            if(farEnough)
+              {
+               memberIndices[memberCount++] = j;
+               used[j] = true;
+              }
+           }
+        }
+
+      if(memberCount >= InpMinTouches)
+        {
+         double priceSum  = 0;
+         double weightSum = 0;
+         double volSum    = 0;
+         int    earliest  = src[memberIndices[0]].bar;
+         int    latest    = src[memberIndices[0]].bar;
+
+         for(int k = 0; k < memberCount; k++)
+           {
+            Pivot m = src[memberIndices[k]];
+            double w = PivotWeight(m, atr, vAvg, currentBar);
+            priceSum  += m.price * w;
+            weightSum += w;
+            volSum    += (m.vol > 0) ? m.vol : 0;
+            earliest   = MathMin(earliest, m.bar);
+            latest     = MathMax(latest,   m.bar);
+           }
+
+         if(weightSum > 0)
+           {
+            double center = priceSum / weightSum;
+            double pad    = atr * 0.25;
+
+            tempZones[tempCount].top          = center + pad;
+            tempZones[tempCount].bot          = center - pad;
+            tempZones[tempCount].center       = center;
+            tempZones[tempCount].strength     = weightSum;
+            tempZones[tempCount].volSum       = volSum;
+            tempZones[tempCount].touches      = memberCount;
+            tempZones[tempCount].firstBar     = earliest;
+            tempZones[tempCount].lastTouch    = latest;
+            tempZones[tempCount].diedBar      = -1;
+            tempZones[tempCount].isResistance = isResistance;
+            tempZones[tempCount].wasBroken    = false;
+            tempZones[tempCount].isLiveBreak  = false;
+            tempCount++;
+           }
+        }
+     }
+
+   // Trim to top N by strength
+   if(tempCount > 0)
+     {
+      int keep = MathMin(InpZoneCount, tempCount);
+      for(int i = 0; i < keep && i < tempCount; i++)
+        {
+         int bestIdx = i;
+         for(int j = i + 1; j < tempCount; j++)
+            if(tempZones[j].strength > tempZones[bestIdx].strength)
+               bestIdx = j;
+         if(bestIdx != i)
+           {
+            Zone tmp = tempZones[i];
+            tempZones[i] = tempZones[bestIdx];
+            tempZones[bestIdx] = tmp;
+           }
+        }
+
+      outCount = keep;
+      ArrayResize(outZones, keep);
+      for(int i = 0; i < keep; i++)
+         outZones[i] = tempZones[i];
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Zone survives in new set                                          |
+//+------------------------------------------------------------------+
+bool ZoneSurvives(Zone &old, Zone &newZones[], int newCount, double atr)
+  {
+   double tol = atr * clusterTol;
+   for(int i = 0; i < newCount; i++)
+      if(MathAbs(newZones[i].center - old.center) <= tol)
+         return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Already broken in archive                                         |
+//+------------------------------------------------------------------+
+bool IsAlreadyBroken(Zone &z, double atr)
+  {
+   double tol = atr * clusterTol * 0.7;
+   for(int i = 0; i < brokenCount; i++)
+      if(brokenZones[i].isResistance == z.isResistance &&
+         brokenZones[i].wasBroken &&
+         MathAbs(brokenZones[i].center - z.center) <= tol)
+         return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Archive zone to broken list                                       |
+//+------------------------------------------------------------------+
+void ArchiveZone(Zone &z, double atr)
+  {
+   double tol = atr * clusterTol * 0.7;
+   for(int i = 0; i < brokenCount; i++)
+     {
+      if(brokenZones[i].isResistance == z.isResistance &&
+         MathAbs(brokenZones[i].center - z.center) <= tol)
+        {
+         if(z.wasBroken && !brokenZones[i].wasBroken)
+           {
+            brokenZones[i].wasBroken   = true;
+            brokenZones[i].diedBar     = z.diedBar;
+            brokenZones[i].isLiveBreak = z.isLiveBreak;
+           }
+         return;
+        }
+     }
+
+   if(brokenCount >= ArraySize(brokenZones))
+      ArrayResize(brokenZones, brokenCount + 10);
+   brokenZones[brokenCount++] = z;
+
+   if(brokenCount > 100)
+     {
+      for(int i = 0; i < brokenCount - 1; i++)
+         brokenZones[i] = brokenZones[i + 1];
+      brokenCount--;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Inherit lastTouch from old zone                                   |
+//+------------------------------------------------------------------+
+void InheritState(Zone &newZ, Zone &oldZones[], int oldCount, double atr)
+  {
+   double tol = atr * clusterTol;
+   for(int i = 0; i < oldCount; i++)
+      if(MathAbs(oldZones[i].center - newZ.center) <= tol)
+        {
+         newZ.lastTouch = oldZones[i].lastTouch;
+         break;
+        }
+  }
+
+//+------------------------------------------------------------------+
+//| Signal cooldown check                                             |
+//+------------------------------------------------------------------+
+bool CooldownOk(double center, double atr, int currentBar)
+  {
+   for(int i = 0; i < sigCount; i++)
+      if(MathAbs(sigZoneCenters[i] - center) <= atr * clusterTol)
+         if(currentBar - sigZoneBars[i] < InpSigCooldown)
+            return false;
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Record signal                                                     |
+//+------------------------------------------------------------------+
+void RecordSignal(double center, int currentBar)
+  {
+   if(sigCount >= ArraySize(sigZoneCenters))
+     {
+      ArrayResize(sigZoneCenters, sigCount + 10);
+      ArrayResize(sigZoneBars, sigCount + 10);
+     }
+   sigZoneCenters[sigCount] = center;
+   sigZoneBars[sigCount]    = currentBar;
+   sigCount++;
+   if(sigCount > 50)
+     {
+      for(int i = 0; i < sigCount - 1; i++)
+        {
+         sigZoneCenters[i] = sigZoneCenters[i + 1];
+         sigZoneBars[i]    = sigZoneBars[i + 1];
+        }
+      sigCount--;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Zone is renderable                                                |
+//+------------------------------------------------------------------+
+bool ZoneRenderable(Zone &z)
+  {
+   return (z.diedBar < 0 && z.touches >= InpMinTouches &&
+           z.top > 0 && z.bot > 0 && z.bot < z.top);
+  }
+
+//+------------------------------------------------------------------+
+//| Signal checks using direct array access                           |
+//+------------------------------------------------------------------+
+bool CheckSupBounce(int bar, const double &open[], const double &high[],
+                    const double &low[], const double &close[], double atr)
+  {
+   for(int i = 0; i < supCount; i++)
+     {
+      if(!ZoneRenderable(supZones[i])) continue;
+      bool pierced = (low[bar]  <= supZones[i].top);
+      bool heldUp  = (close[bar] >= supZones[i].bot && close[bar] >= open[bar]);
+      if(pierced && heldUp && CooldownOk(supZones[i].center, atr, bar))
+        {
+         RecordSignal(supZones[i].center, bar);
+         return true;
+        }
+     }
+   return false;
+  }
+
+bool CheckResReject(int bar, const double &open[], const double &high[],
+                    const double &low[], const double &close[], double atr)
+  {
+   for(int i = 0; i < resCount; i++)
+     {
+      if(!ZoneRenderable(resZones[i])) continue;
+      bool pierced = (high[bar] >= resZones[i].bot);
+      bool heldDn  = (close[bar] <= resZones[i].top && close[bar] <= open[bar]);
+      if(pierced && heldDn && CooldownOk(resZones[i].center, atr, bar))
+        {
+         RecordSignal(resZones[i].center, bar);
+         return true;
+        }
+     }
+   return false;
+  }
+
+bool CheckRetestBull(int bar, const double &open[], const double &high[],
+                     const double &low[], const double &close[])
+  {
+   for(int i = 0; i < brokenCount; i++)
+     {
+      if(!brokenZones[i].isResistance || !brokenZones[i].wasBroken || brokenZones[i].diedBar < 0)
+         continue;
+      int age = bar - brokenZones[i].diedBar;
+      if(age > 0 && age <= InpRetestWindow)
+         if(low[bar] <= brokenZones[i].top &&
+            close[bar] >= brokenZones[i].bot &&
+            close[bar] >= open[bar])
+            return true;
+     }
+   return false;
+  }
+
+bool CheckRetestBear(int bar, const double &open[], const double &high[],
+                     const double &low[], const double &close[])
+  {
+   for(int i = 0; i < brokenCount; i++)
+     {
+      if(brokenZones[i].isResistance || !brokenZones[i].wasBroken || brokenZones[i].diedBar < 0)
+         continue;
+      int age = bar - brokenZones[i].diedBar;
+      if(age > 0 && age <= InpRetestWindow)
+         if(high[bar] >= brokenZones[i].bot &&
+            close[bar] <= brokenZones[i].top &&
+            close[bar] <= open[bar])
+            return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Strength to stars                                                 |
+//+------------------------------------------------------------------+
+string StrengthStars(double s, double maxS)
+  {
+   double ratio = (maxS > 0) ? s / maxS : 0.0;
+   if(ratio >= 0.85) return "★★★";
+   if(ratio >= 0.55) return "★★";
+   return "★";
+  }
+
+//+------------------------------------------------------------------+
+//| Age fade opacity offset                                           |
+//+------------------------------------------------------------------+
+int AgeFade(int lastTouch, int currentBar)
+  {
+   if(InpFadeAge <= 0) return 0;
+   int age = currentBar - lastTouch;
+   if(age <= 0) return 0;
+   return MathMin(15, (int)(age * 15.0 / InpFadeAge));
+  }
+
+//+------------------------------------------------------------------+
+//| Far from current price                                            |
+//+------------------------------------------------------------------+
+bool IsFar(double zoneCenter, double currentClose)
+  {
+   if(InpHideFar <= 0 || currentClose <= 0) return false;
+   return (MathAbs(zoneCenter - currentClose) / currentClose * 100.0) > InpHideFar;
+  }
+
+//+------------------------------------------------------------------+
+//| Format volume                                                     |
+//+------------------------------------------------------------------+
+string FormatVolume(double v)
+  {
+   if(v >= 1000000000) return DoubleToString(v / 1000000000, 2) + "B";
+   if(v >= 1000000)    return DoubleToString(v / 1000000, 2) + "M";
+   if(v >= 1000)       return DoubleToString(v / 1000, 2) + "K";
+   return DoubleToString(v, 2);
+  }
+
+//+------------------------------------------------------------------+
+//| Convert transparency 0-100 to MQL5 0-255 range                    |
+//+------------------------------------------------------------------+
+int TranspTo255(int pct)
+  {
+   return (int)MathRound((100 - pct) * 2.55);
+  }
+
+//+------------------------------------------------------------------+
+//| Safe start bar index for drawing (clamp to chart boundary)        |
+//+------------------------------------------------------------------+
+int SafeStartIdx(int b, int totalBars)
+  {
+   int minSafe = MathMax(0, totalBars - 4900);
+   return (b < minSafe) ? minSafe : b;
+  }
+
+//+------------------------------------------------------------------+
+//| Draw alive zone                                                   |
+//+------------------------------------------------------------------+
+void DrawAlive(Zone &z, color baseCol, double maxS, double maxVol,
+               int currentBar, int totalBars, const datetime &time[],
+               double currentClose)
+  {
+   if(z.top <= 0 || z.bot <= 0 || z.center <= 0 || z.bot >= z.top) return;
+   if(IsFar(z.center, currentClose)) return;
+
+   datetime rightTime = time[currentBar] + 25 * PeriodSeconds(_Period);
+   int      startIdx  = SafeStartIdx(z.firstBar, totalBars);
+   datetime startTime = time[startIdx];
+
+   int extra    = AgeFade(z.lastTouch, currentBar);
+   int volBoost = 0;
+
+   if(InpUseVolColor && maxVol > 0)
+     {
+      double volRatio = MathMin(1.0, z.volSum / maxVol);
+      volBoost = (int)(volRatio * 35);
+     }
+
+   // Opacity: higher = more opaque (less transparent)
+   int fillOp = MathMax(40, MathMin(100, InpZoneOpacity + extra - volBoost));
+   int edgeOp = MathMin(100, 35 + extra - volBoost / 2);
+
+   string uid = IntegerToString(currentBar) + "_" + IntegerToString(MathRand());
+
+   // Box
+   string boxName = prefix + "B_" + (z.isResistance ? "R_" : "S_") + uid;
+   ObjectCreate(0, boxName, OBJ_RECTANGLE, 0, startTime, z.top, rightTime, z.bot);
+   ObjectSetInteger(0, boxName, OBJPROP_COLOR, clrNONE);
+   ObjectSetInteger(0, boxName, OBJPROP_BGCOLOR, baseCol);
+   ObjectSetInteger(0, boxName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, boxName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, boxName, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, boxName, OBJPROP_TRANSPARENCY, TranspTo255(fillOp));
+
+   // Center line
+   string lineName = prefix + "L_" + (z.isResistance ? "R_" : "S_") + uid;
+   ObjectCreate(0, lineName, OBJ_TREND, 0, startTime, z.center, rightTime, z.center);
+   ObjectSetInteger(0, lineName, OBJPROP_COLOR, baseCol);
+   ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, lineName, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, lineName, OBJPROP_TRANSPARENCY, TranspTo255(edgeOp));
+
+   // Label
+   if(InpShowLabels)
+     {
+      string labelName = prefix + "LB_" + (z.isResistance ? "R_" : "S_") + uid;
+      string txt = "";
+      string stars = StrengthStars(z.strength, maxS);
+
+      if(InpShowVolText && maxVol > 0)
+        {
+         string volVal = "";
+         if(InpVolFormat == PERCENTAGE)
+            volVal = IntegerToString((int)((z.volSum / maxVol) * 100)) + "%";
+         else
+            volVal = FormatVolume(z.volSum);
+
+         if(InpSingleLine)
+            txt = stars + "  " + IntegerToString(z.touches) + "x  •  Vol: " + volVal;
+         else
+            txt = "Vol: " + volVal + "\n" + stars + "  " + IntegerToString(z.touches) + "x";
+        }
+      else
+         txt = stars + "  " + IntegerToString(z.touches) + "x";
+
+      ObjectCreate(0, labelName, OBJ_TEXT, 0, rightTime, z.center);
+      ObjectSetString(0, labelName, OBJPROP_TEXT, txt);
+      ObjectSetInteger(0, labelName, OBJPROP_COLOR, ChartGetInteger(0, CHART_COLOR_FOREGROUND));
+      ObjectSetInteger(0, labelName, OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, labelName, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, labelName, OBJPROP_BACK, false);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Draw broken zone                                                  |
+//+------------------------------------------------------------------+
+void DrawBroken(Zone &z, int totalBars, const datetime &time[], double currentClose)
+  {
+   if(z.top <= 0 || z.bot <= 0 || z.bot >= z.top) return;
+   if(IsFar(z.center, currentClose)) return;
+
+   color useCol = z.isResistance ? InpBrokenBear : InpBrokenBull;
+
+   int startIdx = SafeStartIdx(z.firstBar, totalBars);
+   int endIdx   = (z.diedBar < 0) ? 0 : SafeStartIdx(z.diedBar, totalBars);
+
+   datetime startTime = time[startIdx];
+   datetime endTime   = time[endIdx];
+
+   string uid = IntegerToString(MathRand());
+
+   // Box
+   string boxName = prefix + "BROKEN_B_" + uid;
+   ObjectCreate(0, boxName, OBJ_RECTANGLE, 0, startTime, z.top, endTime, z.bot);
+   ObjectSetInteger(0, boxName, OBJPROP_COLOR, clrNONE);
+   ObjectSetInteger(0, boxName, OBJPROP_BGCOLOR, useCol);
+   ObjectSetInteger(0, boxName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, boxName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, boxName, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, boxName, OBJPROP_TRANSPARENCY, TranspTo255(InpBrokenOp));
+
+   // Line
+   string lineName = prefix + "BROKEN_L_" + uid;
+   ObjectCreate(0, lineName, OBJ_TREND, 0, startTime, z.center, endTime, z.center);
+   ObjectSetInteger(0, lineName, OBJPROP_COLOR, useCol);
+   ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, lineName, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, lineName, OBJPROP_TRANSPARENCY, TranspTo255(MathMin(100, InpBrokenOp + 10)));
+
+   // Break label
+   if(InpShowReaction && z.wasBroken && z.diedBar >= 0 && z.isLiveBreak)
+     {
+      string labelName = prefix + "BREAK_LB_" + uid;
+      double lblY = z.isResistance ? z.top : z.bot;
+      string txt  = z.isResistance ? "Break R" : "Break S";
+      color  lblCol = z.isResistance ? clrOrangeRed : clrMediumSeaGreen;
+      ObjectCreate(0, labelName, OBJ_TEXT, 0, endTime, lblY);
+      ObjectSetString(0, labelName, OBJPROP_TEXT, txt);
+      ObjectSetInteger(0, labelName, OBJPROP_COLOR, lblCol);
+      ObjectSetInteger(0, labelName, OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, labelName, OBJPROP_HIDDEN, true);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Clear all objects with prefix                                     |
+//+------------------------------------------------------------------+
+void ClearDrawings()
+  {
+   int total = ObjectsTotal(0, 0, -1);
+   for(int i = total - 1; i >= 0; i--)
+     {
+      string name = ObjectName(0, i);
+      if(StringFind(name, prefix) == 0)
+         ObjectDelete(0, name);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Max strength across alive zones                                   |
+//+------------------------------------------------------------------+
+double MaxStrengthAcross()
+  {
+   double m = 0;
+   for(int i = 0; i < resCount; i++)
+      if(resZones[i].diedBar < 0)
+         m = MathMax(m, resZones[i].strength);
+   for(int i = 0; i < supCount; i++)
+      if(supZones[i].diedBar < 0)
+         m = MathMax(m, supZones[i].strength);
+   return m;
+  }
+
+//+------------------------------------------------------------------+
+//| Max volume across alive zones                                     |
+//+------------------------------------------------------------------+
+double MaxVolAcross()
+  {
+   double m = 0;
+   for(int i = 0; i < resCount; i++)
+      if(resZones[i].diedBar < 0)
+         m = MathMax(m, resZones[i].volSum);
+   for(int i = 0; i < supCount; i++)
+      if(supZones[i].diedBar < 0)
+         m = MathMax(m, supZones[i].volSum);
+   return m;
+  }
+
+//+------------------------------------------------------------------+
+//| OnInit                                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   switch(InpPreset)
+     {
+      case SCALP:  pivLeft = 4;  pivRight = 2;  clusterTol = 0.4; minSpacing = 4;  break;
+      case LOCAL:  pivLeft = 6;  pivRight = 4;  clusterTol = 0.5; minSpacing = 8;  break;
+      case SWING:  pivLeft = 15; pivRight = 8;  clusterTol = 0.9; minSpacing = 20; break;
+      case MAJOR:  pivLeft = 35; pivRight = 15; clusterTol = 1.4; minSpacing = 50; break;
+      case CUSTOM: pivLeft = InpPivLeft; pivRight = InpPivRight;
+                   clusterTol = InpClusterTol; minSpacing = InpMinSpacing; break;
+     }
+
+   ArrayResize(highPivots, InpPivBuffer + 10);
+   ArrayResize(lowPivots,  InpPivBuffer + 10);
+   highPivotCount = 0;
+   lowPivotCount  = 0;
+
+   ArrayResize(resZones,    InpZoneCount + 10);
+   ArrayResize(supZones,    InpZoneCount + 10);
+   ArrayResize(brokenZones, 100);
+   resCount    = 0;
+   supCount    = 0;
+   brokenCount = 0;
+
+   ArrayResize(sigZoneCenters, 50);
+   ArrayResize(sigZoneBars,    50);
+   sigCount = 0;
+
+   atrHandle = iATR(_Symbol, _Period, 50);
+   if(atrHandle == INVALID_HANDLE)
+     {
+      Print("Failed to create ATR handle");
+      return INIT_FAILED;
+     }
+
+   IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
+   IndicatorSetString(INDICATOR_SHORTNAME, "S&R Zones [FEELS]");
+
+   return INIT_SUCCEEDED;
+  }
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   ClearDrawings();
+   IndicatorRelease(atrHandle);
+  }
+
+//+------------------------------------------------------------------+
+//| OnCalculate                                                       |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   if(rates_total < pivLeft + pivRight + 50)
+      return 0;
+
+   // --- ATR buffer (copy into local array) ---
+   double atrArr[];
+   ArrayResize(atrArr, rates_total);
+   if(CopyBuffer(atrHandle, 0, 0, rates_total, atrArr) <= 0)
+      return prev_calculated;
+
+   // --- Volume SMA (manual rolling, fixes C5) ---
+   double volMaArr[];
+   RollingVolumeSMA(tick_volume, rates_total, 50, volMaArr);
+
+   // --- Determine start for pivot scanning ---
+   int start = prev_calculated > 0 ? MathMax(pivLeft + pivRight, prev_calculated - 1) : pivLeft + pivRight;
+
+   // --- Main loop ---
+   for(int bar = start; bar < rates_total; bar++)
+     {
+      double atr   = atrArr[bar];
+      double volMa = volMaArr[bar];
+      if(atr <= 0 || volMa <= 0) continue;
+
+      // --- Pivot detection (bar - pivRight is the candidate) ---
+      int candidateBar = bar - pivRight;
+      if(candidateBar < pivLeft) continue;
+
+      bool newHighPivot = false;
+      bool newLowPivot  = false;
+
+      if(!IsDuplicatePivot(highPivots, highPivotCount, candidateBar) &&
+         IsPivotHigh(candidateBar, high, rates_total))
+        {
+         Pivot p;
+         p.price = high[candidateBar];
+         p.bar   = candidateBar;
+         p.vol   = SafeVolume(tick_volume[candidateBar]);
+         p.wick  = UpperWick(high[candidateBar], open[candidateBar], close[candidateBar]);
+         AddPivot(highPivots, highPivotCount, p, InpPivBuffer);
+         newHighPivot = true;
+        }
+
+      if(!IsDuplicatePivot(lowPivots, lowPivotCount, candidateBar) &&
+         IsPivotLow(candidateBar, low, rates_total))
+        {
+         Pivot p;
+         p.price = low[candidateBar];
+         p.bar   = candidateBar;
+         p.vol   = SafeVolume(tick_volume[candidateBar]);
+         p.wick  = LowerWick(low[candidateBar], open[candidateBar], close[candidateBar]);
+         AddPivot(lowPivots, lowPivotCount, p, InpPivBuffer);
+         newLowPivot = true;
+        }
+
+      // --- Zone break detection ---
+      for(int i = 0; i < resCount; i++)
+        {
+         if(resZones[i].diedBar < 0 && close[bar] > resZones[i].top)
+           {
+            resZones[i].diedBar     = bar;
+            resZones[i].wasBroken   = true;
+            resZones[i].isLiveBreak = (close[bar - 1] <= resZones[i].top);
+            ArchiveZone(resZones[i], atr);
+           }
+        }
+
+      for(int i = 0; i < supCount; i++)
+        {
+         if(supZones[i].diedBar < 0 && close[bar] < supZones[i].bot)
+           {
+            supZones[i].diedBar     = bar;
+            supZones[i].wasBroken   = true;
+            supZones[i].isLiveBreak = (close[bar - 1] >= supZones[i].bot);
+            ArchiveZone(supZones[i], atr);
+           }
+        }
+
+      // --- Zone touch detection ---
+      for(int i = 0; i < resCount; i++)
+         if(resZones[i].diedBar < 0 && high[bar] >= resZones[i].bot && low[bar] <= resZones[i].top)
+            resZones[i].lastTouch = bar;
+
+      for(int i = 0; i < supCount; i++)
+         if(supZones[i].diedBar < 0 && high[bar] >= supZones[i].bot && low[bar] <= supZones[i].top)
+            supZones[i].lastTouch = bar;
+
+      // --- Zone rebuilding on new pivots ---
+      if(newHighPivot || newLowPivot)
+        {
+         Zone newRes[], newSup[];
+         int  newResCount = 0, newSupCount = 0;
+
+         BuildZones(highPivots, highPivotCount, true,  atr, volMa, bar, newRes, newResCount);
+         BuildZones(lowPivots,  lowPivotCount,  false, atr, volMa, bar, newSup, newSupCount);
+
+         // Archive survivals
+         Zone oldRes[], oldSup[];
+         int oldResCount = resCount, oldSupCount = supCount;
+         ArrayResize(oldRes, resCount);
+         ArrayResize(oldSup, supCount);
+         for(int i = 0; i < resCount; i++) oldRes[i] = resZones[i];
+         for(int i = 0; i < supCount; i++) oldSup[i] = supZones[i];
+
+         for(int i = 0; i < oldResCount; i++)
+            if(oldRes[i].diedBar < 0 && oldRes[i].touches >= InpMinTouches &&
+               !ZoneSurvives(oldRes[i], newRes, newResCount, atr))
+              {
+               oldRes[i].diedBar = bar;
+               oldRes[i].wasBroken = false;
+               ArchiveZone(oldRes[i], atr);
+              }
+
+         for(int i = 0; i < oldSupCount; i++)
+            if(oldSup[i].diedBar < 0 && oldSup[i].touches >= InpMinTouches &&
+               !ZoneSurvives(oldSup[i], newSup, newSupCount, atr))
+              {
+               oldSup[i].diedBar = bar;
+               oldSup[i].wasBroken = false;
+               ArchiveZone(oldSup[i], atr);
+              }
+
+         // Replace
+         resCount = 0;
+         ArrayResize(resZones, InpZoneCount);
+         for(int i = 0; i < newResCount; i++)
+            if(!IsAlreadyBroken(newRes[i], atr))
+              {
+               InheritState(newRes[i], oldRes, oldResCount, atr);
+               if(resCount >= ArraySize(resZones)) ArrayResize(resZones, resCount + 10);
+               resZones[resCount++] = newRes[i];
+              }
+
+         supCount = 0;
+         ArrayResize(supZones, InpZoneCount);
+         for(int i = 0; i < newSupCount; i++)
+            if(!IsAlreadyBroken(newSup[i], atr))
+              {
+               InheritState(newSup[i], oldSup, oldSupCount, atr);
+               if(supCount >= ArraySize(supZones)) ArrayResize(supZones, supCount + 10);
+               supZones[supCount++] = newSup[i];
+              }
+        }
+
+      // --- Signals & Drawing (final bar only) ---
+      if(bar == rates_total - 1)
+        {
+         bool bounceUp   = CheckSupBounce(bar, open, high, low, close, atr);
+         bool bounceDown = CheckResReject(bar, open, high, low, close, atr);
+         bool retestUp   = CheckRetestBull(bar, open, high, low, close);
+         bool retestDown = CheckRetestBear(bar, open, high, low, close);
+
+         if(InpShowTest && bounceUp)
+           {
+            string n = prefix + "ARROW_UP_" + IntegerToString(bar);
+            ObjectCreate(0, n, OBJ_ARROW_THUMB_UP, 0, time[bar], low[bar] - 5 * _Point);
+            ObjectSetInteger(0, n, OBJPROP_COLOR, InpSupColor);
+            ObjectSetInteger(0, n, OBJPROP_WIDTH, 1);
+           }
+         if(InpShowTest && bounceDown)
+           {
+            string n = prefix + "ARROW_DN_" + IntegerToString(bar);
+            ObjectCreate(0, n, OBJ_ARROW_THUMB_DOWN, 0, time[bar], high[bar] + 5 * _Point);
+            ObjectSetInteger(0, n, OBJPROP_COLOR, InpResColor);
+            ObjectSetInteger(0, n, OBJPROP_WIDTH, 1);
+           }
+         if(InpShowRetest && retestUp)
+           {
+            string n = prefix + "RETEST_UP_" + IntegerToString(bar);
+            ObjectCreate(0, n, OBJ_ARROW_UP, 0, time[bar], low[bar] - 10 * _Point);
+            ObjectSetInteger(0, n, OBJPROP_COLOR, InpSupColor);
+            ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+           }
+         if(InpShowRetest && retestDown)
+           {
+            string n = prefix + "RETEST_DN_" + IntegerToString(bar);
+            ObjectCreate(0, n, OBJ_ARROW_DOWN, 0, time[bar], high[bar] + 10 * _Point);
+            ObjectSetInteger(0, n, OBJPROP_COLOR, InpResColor);
+            ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+           }
+
+         if(InpShowReaction)
+           {
+            for(int i = 0; i < supCount; i++)
+               if(ZoneRenderable(supZones[i]) && low[bar] <= supZones[i].top && close[bar] > supZones[i].bot)
+                 {
+                  string n = prefix + "HOLD_UP_" + IntegerToString(bar) + "_" + IntegerToString(i);
+                  ObjectCreate(0, n, OBJ_ARROW_UP, 0, time[bar], low[bar] - 15 * _Point);
+                  ObjectSetInteger(0, n, OBJPROP_COLOR, InpSupColor);
+                  ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+                 }
+            for(int i = 0; i < resCount; i++)
+               if(ZoneRenderable(resZones[i]) && high[bar] >= resZones[i].bot && close[bar] < resZones[i].top)
+                 {
+                  string n = prefix + "HOLD_DN_" + IntegerToString(bar) + "_" + IntegerToString(i);
+                  ObjectCreate(0, n, OBJ_ARROW_DOWN, 0, time[bar], high[bar] + 15 * _Point);
+                  ObjectSetInteger(0, n, OBJPROP_COLOR, InpResColor);
+                  ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+                 }
+           }
+
+         // --- Redraw zones ---
+         ClearDrawings();
+
+         double mxStrength = MaxStrengthAcross();
+         double mxVol      = MaxVolAcross();
+         double curClose   = close[bar];
+
+         for(int i = 0; i < resCount; i++)
+            if(resZones[i].diedBar < 0)
+               DrawAlive(resZones[i], InpResColor, mxStrength, mxVol, bar, rates_total, time, curClose);
+
+         for(int i = 0; i < supCount; i++)
+            if(supZones[i].diedBar < 0)
+               DrawAlive(supZones[i], InpSupColor, mxStrength, mxVol, bar, rates_total, time, curClose);
+
+         if(InpShowBroken || InpShowDropped)
+            for(int i = 0; i < brokenCount; i++)
+              {
+               bool show = (brokenZones[i].wasBroken && InpShowBroken) ||
+                           (!brokenZones[i].wasBroken && InpShowDropped);
+               if(show) DrawBroken(brokenZones[i], rates_total, time, curClose);
+              }
+        }
+     }
+
+   return rates_total;
+  }
+//+------------------------------------------------------------------+
