@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -90,6 +90,14 @@ input double InpStopAddon2Pips  = 10;   // Stop distance after add-on 2 (pips)
 input bool   InpTrailAfterFull  = true; // Trail after full pyramid
 input double InpTrailPips       = 15;   // Trail distance (pips)
 input double InpTrailStepPips   = 5;    // Trail step (pips)
+
+input group "=== Manual Trade Manager (Signal mode, magic 0) ==="
+input bool   InpManageManual    = true;  // Manage manually opened trades
+input double InpManualBePips    = 20;    // Move SL to breakeven after (pips)
+input double InpManualBeBuffer  = 2;     // Breakeven buffer beyond entry (pips)
+input bool   InpManualTrail     = true;  // Enable trailing stop on manual trades
+input double InpManualTrailPips = 15;    // Trail distance (pips)
+input double InpManualTrailStep = 5;     // Min pips to move trail
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -589,6 +597,87 @@ bool CheckSellSignal(double atr, double &outEntry, double &outSL,
 }
 
 //+------------------------------------------------------------------+
+//| Manage manually opened trades (magic = 0) on current symbol      |
+//| Applies breakeven then trailing stop, every tick                 |
+//+------------------------------------------------------------------+
+void ManageManualTrades()
+{
+    if(!InpManageManual) return;
+
+    double pip      = GetPipSize(_Symbol);
+    double be_dist  = InpManualBePips    * pip;
+    double be_buf   = InpManualBeBuffer  * pip;
+    double tr_dist  = InpManualTrailPips * pip;
+    double tr_step  = InpManualTrailStep * pip;
+
+    CTrade trade;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!PositionSelectByTicket(ticket))                            continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol)             continue;
+        if(PositionGetInteger(POSITION_MAGIC)  != 0)                  continue;
+        if(!IsModificationAllowed(_Symbol, ticket))                   continue;
+
+        long   pos_type  = PositionGetInteger(POSITION_TYPE);
+        double open_p    = PositionGetDouble(POSITION_PRICE_OPEN);
+        double current_sl = PositionGetDouble(POSITION_SL);
+        double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask       = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+        double new_sl = current_sl;
+
+        if(pos_type == POSITION_TYPE_BUY)
+        {
+            double profit_pips = (bid - open_p) / pip;
+
+            // Phase 1: move to breakeven
+            double be_target = open_p + be_buf;
+            if(profit_pips >= InpManualBePips && current_sl < be_target)
+                new_sl = be_target;
+
+            // Phase 2: trail (only once BE is set)
+            if(InpManualTrail && current_sl >= open_p)
+            {
+                double trail_candidate = bid - tr_dist;
+                if(trail_candidate > current_sl + tr_step)
+                    new_sl = trail_candidate;
+            }
+
+            if(new_sl > current_sl && IsStopLevelValid(_Symbol, new_sl, ORDER_TYPE_BUY))
+            {
+                new_sl = NormalizeDouble(new_sl, _Digits);
+                if(!trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP)))
+                    Print("ManageManual: BUY modify failed. Err=", GetLastError());
+            }
+        }
+        else // SELL
+        {
+            double profit_pips = (open_p - ask) / pip;
+
+            double be_target = open_p - be_buf;
+            if(profit_pips >= InpManualBePips && (current_sl == 0 || current_sl > be_target))
+                new_sl = be_target;
+
+            if(InpManualTrail && current_sl > 0 && current_sl <= open_p)
+            {
+                double trail_candidate = ask + tr_dist;
+                if(trail_candidate < current_sl - tr_step)
+                    new_sl = trail_candidate;
+            }
+
+            if(new_sl != current_sl && new_sl > 0 && IsStopLevelValid(_Symbol, new_sl, ORDER_TYPE_SELL))
+            {
+                new_sl = NormalizeDouble(new_sl, _Digits);
+                if(!trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP)))
+                    Print("ManageManual: SELL modify failed. Err=", GetLastError());
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
 //| Is a new bar open?                                               |
 //+------------------------------------------------------------------+
 bool IsNewBar()
@@ -664,6 +753,10 @@ void OnTick()
     // Always manage pyramid on every tick
     if(InpMode == EA_MODE)
         pyramid.Manage();
+
+    // Manage manually opened trades (magic 0) in Signal mode
+    if(InpMode == SIGNAL_MODE)
+        ManageManualTrades();
 
     // Signal / entry logic only on new bars
     if(!IsNewBar()) return;
