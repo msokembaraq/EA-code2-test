@@ -538,7 +538,7 @@ void SendTradeAlert(string direction, double entry, double sl,
 bool CheckBuySignal(double atr, double &outEntry, double &outSL,
                     double &outZoneCenter, string &outZoneType)
 {
-    double rates_close[2], rates_open[2], rates_low[2], rates_high[2];
+    double rates_close[], rates_open[], rates_low[], rates_high[];
     ArraySetAsSeries(rates_close, true); ArraySetAsSeries(rates_open, true);
     ArraySetAsSeries(rates_low,   true); ArraySetAsSeries(rates_high, true);
     CopyClose(_Symbol, _Period, 0, 2, rates_close);
@@ -569,7 +569,7 @@ bool CheckBuySignal(double atr, double &outEntry, double &outSL,
 bool CheckSellSignal(double atr, double &outEntry, double &outSL,
                      double &outZoneCenter, string &outZoneType)
 {
-    double rates_close[2], rates_open[2], rates_low[2], rates_high[2];
+    double rates_close[], rates_open[], rates_low[], rates_high[];
     ArraySetAsSeries(rates_close, true); ArraySetAsSeries(rates_open, true);
     ArraySetAsSeries(rates_low,   true); ArraySetAsSeries(rates_high, true);
     CopyClose(_Symbol, _Period, 0, 2, rates_close);
