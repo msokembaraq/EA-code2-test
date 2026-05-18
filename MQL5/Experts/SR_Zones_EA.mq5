@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.07"
+#property version   "1.08"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -84,13 +84,13 @@ input double InpLotAddon2  = 0.02;    // Add-on 2 lot
 input double InpSlZoneBuffer = 0.3;   // SL buffer beyond zone edge (x ATR)
 
 input group "=== Pyramid Triggers ==="
-input double InpAddon1TrigPips  = 50;   // Add-on 1 trigger (pips)
-input double InpAddon2TrigPips  = 100;  // Add-on 2 trigger (pips)
-input double InpStopAddon1Pips  = 25;   // Stop distance after add-on 1 (pips)
-input double InpStopAddon2Pips  = 10;   // Stop distance after add-on 2 (pips)
+input double InpAddon1TrigPips  = 500;  // Add-on 1 trigger (pips) – Gold: 500 = $5
+input double InpAddon2TrigPips  = 1000; // Add-on 2 trigger (pips) – Gold: 1000 = $10
+input double InpStopAddon1Pips  = 300;  // Stop distance after add-on 1 – Gold: 300 = $3
+input double InpStopAddon2Pips  = 150;  // Stop distance after add-on 2 – Gold: 150 = $1.50
 input bool   InpTrailAfterFull  = true; // Trail after full pyramid
-input double InpTrailPips       = 15;   // Trail distance (pips)
-input double InpTrailStepPips   = 5;    // Trail step (pips)
+input double InpTrailPips       = 200;  // Trail distance – Gold: 200 = $2
+input double InpTrailStepPips   = 50;   // Trail step – Gold: 50 = $0.50
 
 input group "=== Role Flip Retests ==="
 input bool   InpUseRetests       = true;  // Trade/signal role-flip retests

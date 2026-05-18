@@ -215,6 +215,15 @@ bool CPyramidEngine::PositionStillOpen(ulong ticket)
 //+------------------------------------------------------------------+
 bool CPyramidEngine::ModifyAllStops(double new_stop)
 {
+    // Validate against broker minimum stop distance before sending any request
+    ENUM_ORDER_TYPE chk = (m_state.direction == POSITION_TYPE_BUY)
+                          ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    if(!IsStopLevelValid(_Symbol, new_stop, chk))
+    {
+        PrintFormat("PyramidEngine: new_stop=%.5f rejected – inside broker minimum stop distance.", new_stop);
+        return false;
+    }
+
     bool ok = true;
 
     if(PositionStillOpen(m_state.ticket_initial))
@@ -255,6 +264,9 @@ void CPyramidEngine::Manage()
                          ? (current - m_state.entry_price) / pip
                          : (m_state.entry_price - current) / pip;
 
+    ENUM_ORDER_TYPE order_type = (m_state.direction == POSITION_TYPE_BUY)
+                                 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
     // Addon 1 trigger
     if(!m_state.addon1_open && pips_gained >= m_addon1_trigger_pips)
     {
@@ -262,6 +274,13 @@ void CPyramidEngine::Manage()
         double new_stop = (m_state.direction == POSITION_TYPE_BUY)
                           ? m_state.entry_price + m_stop_after_addon1_pips * pip
                           : m_state.entry_price - m_stop_after_addon1_pips * pip;
+        new_stop = NormalizeDouble(new_stop, _Digits);
+
+        if(!IsStopLevelValid(_Symbol, new_stop, order_type))
+        {
+            Print("PyramidEngine: Addon1 new SL too close to market – waiting.");
+            return;
+        }
 
         bool opened = (m_state.direction == POSITION_TYPE_BUY)
                       ? m_trade.Buy(m_lot_addon1, _Symbol, price, new_stop, 0, "SR_Addon1")
@@ -275,7 +294,7 @@ void CPyramidEngine::Manage()
             {
                 m_state.ticket_addon1 = ticket;
                 m_state.addon1_open   = true;
-                ModifyAllStops(NormalizeDouble(new_stop, _Digits));
+                ModifyAllStops(new_stop);
                 Print("PyramidEngine: Addon1 opened. Ticket=", ticket, " NewSL=", new_stop);
                 return; // gap-bar protection
             }
@@ -291,6 +310,13 @@ void CPyramidEngine::Manage()
         double new_stop = (m_state.direction == POSITION_TYPE_BUY)
                           ? m_state.entry_price + m_stop_after_addon2_pips * pip
                           : m_state.entry_price - m_stop_after_addon2_pips * pip;
+        new_stop = NormalizeDouble(new_stop, _Digits);
+
+        if(!IsStopLevelValid(_Symbol, new_stop, order_type))
+        {
+            Print("PyramidEngine: Addon2 new SL too close to market – waiting.");
+            return;
+        }
 
         bool opened = (m_state.direction == POSITION_TYPE_BUY)
                       ? m_trade.Buy(m_lot_addon2, _Symbol, price, new_stop, 0, "SR_Addon2")
@@ -304,7 +330,7 @@ void CPyramidEngine::Manage()
             {
                 m_state.ticket_addon2 = ticket;
                 m_state.addon2_open   = true;
-                ModifyAllStops(NormalizeDouble(new_stop, _Digits));
+                ModifyAllStops(new_stop);
                 Print("PyramidEngine: Addon2 opened. Ticket=", ticket, " NewSL=", new_stop);
             }
         }
@@ -320,15 +346,15 @@ void CPyramidEngine::Manage()
 
         if(m_state.direction == POSITION_TYPE_BUY)
         {
-            double candidate = bid - trail_dist;
+            double candidate = NormalizeDouble(bid - trail_dist, _Digits);
             if(candidate > m_state.unified_stop + trail_step)
-                ModifyAllStops(NormalizeDouble(candidate, _Digits));
+                ModifyAllStops(candidate); // validation inside ModifyAllStops
         }
         else
         {
-            double candidate = ask + trail_dist;
+            double candidate = NormalizeDouble(ask + trail_dist, _Digits);
             if(candidate < m_state.unified_stop - trail_step)
-                ModifyAllStops(NormalizeDouble(candidate, _Digits));
+                ModifyAllStops(candidate);
         }
     }
 }
