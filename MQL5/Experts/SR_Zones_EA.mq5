@@ -553,7 +553,12 @@ void SendAlert(string msg)
 {
     Print(msg);
     if(InpMetaID != "")
-        SendNotification(msg);
+    {
+        if(SendNotification(msg))
+            Print("Push sent OK → ", InpMetaID);
+        else
+            Print("Push FAILED (err=", GetLastError(), ") → ", InpMetaID);
+    }
 }
 
 //+------------------------------------------------------------------+
