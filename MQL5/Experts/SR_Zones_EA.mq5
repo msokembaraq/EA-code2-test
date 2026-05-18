@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.06"
+#property version   "1.07"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -65,8 +65,8 @@ input double InpClusterTol = 0.9;   // Cluster tolerance (x ATR)
 input int    InpMinSpacing = 20;    // Min bars between touches
 input int    InpPivBuffer  = 80;    // Pivot memory
 input int    InpZoneCount  = 6;     // Active zones per side
-input int    InpMinTouches = 3;     // Minimum touches
-input int    InpHistBars   = 600;   // Bars of history for zone detection
+input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter)
+input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
 input group "=== Entry Filter ==="
 input int    InpSigCooldownBars = 5;     // Bars between signals on same zone
@@ -125,6 +125,9 @@ int     resCount = 0, supCount = 0;
 SZone   brokenZones[];
 int     brokenCount = 0;
 int     lastBreakCheckBar = -1;
+
+// Log throttle: only print zone details when counts change
+int     lastLogRes = -1, lastLogSup = -1, lastLogBroken = -1;
 
 // Signal cooldown tracking per zone center
 double  sigCenters[];
@@ -942,18 +945,32 @@ void OnTick()
     // Rebuild alive zones
     RebuildAllZones();
 
-    PrintFormat("SR_Zones_EA: NewBar | ResZones=%d SupZones=%d BrokenZones=%d ATR=%.5f",
-                resCount, supCount, brokenCount, atr);
+    // Only log when zone counts change to avoid spam
+    bool zonesChanged = (resCount != lastLogRes || supCount != lastLogSup || brokenCount != lastLogBroken);
+    if(zonesChanged)
+    {
+        lastLogRes    = resCount;
+        lastLogSup    = supCount;
+        lastLogBroken = brokenCount;
 
-    for(int i = 0; i < resCount; i++)
-        PrintFormat("  RES[%d] top=%.5f center=%.5f bot=%.5f touches=%d strength=%.2f",
-                    i, resZones[i].top, resZones[i].center, resZones[i].bot,
-                    resZones[i].touches, resZones[i].strength);
+        PrintFormat("SR_Zones_EA: Zones changed | Res=%d Sup=%d Broken=%d ATR=%.5f",
+                    resCount, supCount, brokenCount, atr);
 
-    for(int i = 0; i < supCount; i++)
-        PrintFormat("  SUP[%d] top=%.5f center=%.5f bot=%.5f touches=%d strength=%.2f",
-                    i, supZones[i].top, supZones[i].center, supZones[i].bot,
-                    supZones[i].touches, supZones[i].strength);
+        for(int i = 0; i < resCount; i++)
+            PrintFormat("  RES[%d] top=%.5f center=%.5f bot=%.5f touches=%d strength=%.2f",
+                        i, resZones[i].top, resZones[i].center, resZones[i].bot,
+                        resZones[i].touches, resZones[i].strength);
+
+        for(int i = 0; i < supCount; i++)
+            PrintFormat("  SUP[%d] top=%.5f center=%.5f bot=%.5f touches=%d strength=%.2f",
+                        i, supZones[i].top, supZones[i].center, supZones[i].bot,
+                        supZones[i].touches, supZones[i].strength);
+
+        for(int i = 0; i < brokenCount; i++)
+            PrintFormat("  BROKEN[%d] %s top=%.5f center=%.5f bot=%.5f",
+                        i, brokenZones[i].isResistance ? "RES→SUP" : "SUP→RES",
+                        brokenZones[i].top, brokenZones[i].center, brokenZones[i].bot);
+    }
 
     // Volatility filter (disabled by default – enable and tune per instrument)
     if(InpUseVolFilter &&
