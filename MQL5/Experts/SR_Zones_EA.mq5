@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.10"
+#property version   "1.11"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -86,8 +86,8 @@ input double InpSlZoneBuffer = 1.5;   // SL buffer beyond zone edge (x ATR) – 
 input group "=== Pyramid Triggers ==="
 input double InpAddon1TrigPips  = 1500; // Add-on 1 trigger (pips) – Gold: 1500 = $15 sustained move
 input double InpAddon2TrigPips  = 2500; // Add-on 2 trigger (pips) – Gold: 2500 = $25
-input double InpStopAddon1Pips  = 800;  // Stop distance after add-on 1 – Gold: 800 = $8 above entry
-input double InpStopAddon2Pips  = 400;  // Stop distance after add-on 2 – Gold: 400 = $4 above entry
+input double InpStopAddon1Pips  = 300;  // SL above entry after add-on 1 – Gold $3 (gap to addon=$12, > broker min)
+input double InpStopAddon2Pips  = 1200; // SL above entry after add-on 2 – Gold $12 (must be > addon1 stop)
 input bool   InpTrailAfterFull  = true; // Trail after full pyramid
 input double InpTrailPips       = 200;  // Trail distance – Gold: 200 = $2
 input double InpTrailStepPips   = 50;   // Trail step – Gold: 50 = $0.50

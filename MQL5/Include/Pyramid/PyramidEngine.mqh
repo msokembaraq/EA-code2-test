@@ -46,6 +46,7 @@ private:
     double          m_trail_pips;
     double          m_trail_step_pips;
     bool            m_initialized;
+    bool            m_sl_needs_retry;   // retry SL modify when broker rejected on addon open
 
     void            ResetState();
     bool            ModifyAllStops(double new_stop);
@@ -74,7 +75,8 @@ public:
 //+------------------------------------------------------------------+
 CPyramidEngine::CPyramidEngine()
 {
-    m_initialized = false;
+    m_initialized    = false;
+    m_sl_needs_retry = false;
     ResetState();
 }
 
@@ -90,6 +92,7 @@ void CPyramidEngine::ResetState()
     m_state.addon1_open    = false;
     m_state.addon2_open    = false;
     m_state.active         = false;
+    m_sl_needs_retry       = false;
 }
 
 //+------------------------------------------------------------------+
@@ -117,6 +120,13 @@ bool CPyramidEngine::Init(ulong magic, int slippage,
         return false;
     }
 
+    if(stop_after_addon1_pips >= stop_after_addon2_pips)
+    {
+        Print("PyramidEngine: stop_after_addon2 must exceed stop_after_addon1 (SL must lock in more profit as pyramid grows).");
+        return false;
+    }
+
+    m_sl_needs_retry = false;
     m_magic                  = magic;
     m_slippage               = slippage;
     m_lot_initial            = lot_initial;
@@ -255,6 +265,43 @@ void CPyramidEngine::Manage()
         return;
     }
 
+    // Retry SL modification for any position whose actual SL doesn't match unified_stop
+    if(m_sl_needs_retry && m_state.unified_stop > 0)
+    {
+        bool retry_ok = true;
+        ENUM_ORDER_TYPE chk = (m_state.direction == POSITION_TYPE_BUY)
+                              ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+        if(IsStopLevelValid(_Symbol, m_state.unified_stop, chk))
+        {
+            if(init_alive)
+            {
+                if(PositionSelectByTicket(m_state.ticket_initial) &&
+                   MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
+                    if(!m_trade.PositionModify(m_state.ticket_initial, m_state.unified_stop, 0))
+                        retry_ok = false;
+            }
+            if(addon1_alive)
+            {
+                if(PositionSelectByTicket(m_state.ticket_addon1) &&
+                   MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
+                    if(!m_trade.PositionModify(m_state.ticket_addon1, m_state.unified_stop, 0))
+                        retry_ok = false;
+            }
+            if(addon2_alive)
+            {
+                if(PositionSelectByTicket(m_state.ticket_addon2) &&
+                   MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
+                    if(!m_trade.PositionModify(m_state.ticket_addon2, m_state.unified_stop, 0))
+                        retry_ok = false;
+            }
+            if(retry_ok)
+            {
+                Print("PyramidEngine: SL retry succeeded. UnifiedSL=", m_state.unified_stop);
+                m_sl_needs_retry = false;
+            }
+        }
+    }
+
     double pip     = GetPipSize(_Symbol);
     double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -294,8 +341,14 @@ void CPyramidEngine::Manage()
             {
                 m_state.ticket_addon1 = ticket;
                 m_state.addon1_open   = true;
-                ModifyAllStops(new_stop);
-                Print("PyramidEngine: Addon1 opened. Ticket=", ticket, " NewSL=", new_stop);
+                if(!ModifyAllStops(new_stop))
+                {
+                    m_state.unified_stop = new_stop; // store target even if modify partial-failed
+                    m_sl_needs_retry     = true;
+                    Print("PyramidEngine: Addon1 SL partial-fail – retry queued. TargetSL=", new_stop);
+                }
+                else
+                    Print("PyramidEngine: Addon1 opened. Ticket=", ticket, " NewSL=", new_stop);
                 return; // gap-bar protection
             }
         }
@@ -330,8 +383,14 @@ void CPyramidEngine::Manage()
             {
                 m_state.ticket_addon2 = ticket;
                 m_state.addon2_open   = true;
-                ModifyAllStops(new_stop);
-                Print("PyramidEngine: Addon2 opened. Ticket=", ticket, " NewSL=", new_stop);
+                if(!ModifyAllStops(new_stop))
+                {
+                    m_state.unified_stop = new_stop;
+                    m_sl_needs_retry     = true;
+                    Print("PyramidEngine: Addon2 SL partial-fail – retry queued. TargetSL=", new_stop);
+                }
+                else
+                    Print("PyramidEngine: Addon2 opened. Ticket=", ticket, " NewSL=", new_stop);
             }
         }
         else
