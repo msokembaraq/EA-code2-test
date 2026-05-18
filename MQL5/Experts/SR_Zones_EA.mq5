@@ -945,6 +945,16 @@ void OnTick()
     PrintFormat("SR_Zones_EA: NewBar | ResZones=%d SupZones=%d BrokenZones=%d ATR=%.5f",
                 resCount, supCount, brokenCount, atr);
 
+    for(int i = 0; i < resCount; i++)
+        PrintFormat("  RES[%d] top=%.5f center=%.5f bot=%.5f touches=%d strength=%.2f",
+                    i, resZones[i].top, resZones[i].center, resZones[i].bot,
+                    resZones[i].touches, resZones[i].strength);
+
+    for(int i = 0; i < supCount; i++)
+        PrintFormat("  SUP[%d] top=%.5f center=%.5f bot=%.5f touches=%d strength=%.2f",
+                    i, supZones[i].top, supZones[i].center, supZones[i].bot,
+                    supZones[i].touches, supZones[i].strength);
+
     // Volatility filter (disabled by default – enable and tune per instrument)
     if(InpUseVolFilter &&
        !IsVolatilityAcceptable(_Symbol, _Period, InpAtrPeriod, InpMinAtrPips, InpMaxAtrPips))
