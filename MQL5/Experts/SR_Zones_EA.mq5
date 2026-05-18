@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.03"
+#property version   "1.04"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -91,6 +91,11 @@ input bool   InpTrailAfterFull  = true; // Trail after full pyramid
 input double InpTrailPips       = 15;   // Trail distance (pips)
 input double InpTrailStepPips   = 5;    // Trail step (pips)
 
+input group "=== Role Flip Retests ==="
+input bool   InpUseRetests       = true;  // Trade/signal role-flip retests
+input int    InpRetestWindowBars = 80;    // Max bars after break to accept retest
+input double InpRetestSlBuffer   = 0.3;  // SL buffer beyond flipped zone (x ATR)
+
 input group "=== Manual Trade Manager (Signal mode, magic 0) ==="
 input bool   InpManageManual    = true;  // Manage manually opened trades
 input double InpManualBePips    = 20;    // Move SL to breakeven after (pips)
@@ -115,6 +120,10 @@ int     highPivotCount = 0, lowPivotCount = 0;
 
 SZone   resZones[], supZones[];
 int     resCount = 0, supCount = 0;
+
+SZone   brokenZones[];
+int     brokenCount = 0;
+int     lastBreakCheckBar = -1;
 
 // Signal cooldown tracking per zone center
 double  sigCenters[];
@@ -273,6 +282,70 @@ void BuildZones(SPivot &src[], int srcCount, bool isRes, double atr,
         outCount = keep;
         ArrayResize(outZones, keep);
         for(int i = 0; i < keep; i++) outZones[i] = temp[i];
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Archive a zone to the broken list (deduplicates by center+side)  |
+//+------------------------------------------------------------------+
+void ArchiveBrokenZone(SZone &z, double atr, int breakBar)
+{
+    double tol = atr * clusterTol * 0.7;
+    for(int i = 0; i < brokenCount; i++)
+        if(brokenZones[i].isResistance == z.isResistance &&
+           MathAbs(brokenZones[i].center - z.center) <= tol)
+            return; // already archived
+
+    if(brokenCount >= ArraySize(brokenZones))
+        ArrayResize(brokenZones, brokenCount + 10);
+
+    brokenZones[brokenCount]           = z;
+    brokenZones[brokenCount].wasBroken = true;
+    brokenZones[brokenCount].diedBar   = breakBar;
+    brokenCount++;
+
+    // Keep list bounded
+    if(brokenCount > 60)
+    {
+        for(int i = 0; i < brokenCount - 1; i++)
+            brokenZones[i] = brokenZones[i + 1];
+        brokenCount--;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Detect fresh zone breaks on the last closed bar                  |
+//| Must be called BEFORE zones are rebuilt for this bar             |
+//+------------------------------------------------------------------+
+void DetectBreaks(double lastClose, double atr, int currentBarIdx)
+{
+    if(currentBarIdx == lastBreakCheckBar) return;
+    lastBreakCheckBar = currentBarIdx;
+
+    // Resistance broken: close above zone top → flips to support
+    for(int i = 0; i < resCount; i++)
+    {
+        if(resZones[i].diedBar >= 0) continue;
+        if(lastClose > resZones[i].top)
+        {
+            resZones[i].diedBar     = currentBarIdx;
+            resZones[i].wasBroken   = true;
+            resZones[i].isLiveBreak = true;
+            ArchiveBrokenZone(resZones[i], atr, currentBarIdx);
+        }
+    }
+
+    // Support broken: close below zone bot → flips to resistance
+    for(int i = 0; i < supCount; i++)
+    {
+        if(supZones[i].diedBar >= 0) continue;
+        if(lastClose < supZones[i].bot)
+        {
+            supZones[i].diedBar     = currentBarIdx;
+            supZones[i].wasBroken   = true;
+            supZones[i].isLiveBreak = true;
+            ArchiveBrokenZone(supZones[i], atr, currentBarIdx);
+        }
     }
 }
 
@@ -597,6 +670,90 @@ bool CheckSellSignal(double atr, double &outEntry, double &outSL,
 }
 
 //+------------------------------------------------------------------+
+//| Retest BUY: broken resistance now acts as support                |
+//| Price dips back into the flipped zone and closes bullish         |
+//+------------------------------------------------------------------+
+bool CheckRetestBuy(double atr, double &outEntry, double &outSL,
+                    double &outZoneCenter, string &outZoneType, int currentBarIdx)
+{
+    if(!InpUseRetests) return false;
+
+    double rates_close[], rates_open[], rates_low[], rates_high[];
+    ArraySetAsSeries(rates_close, true); ArraySetAsSeries(rates_open, true);
+    ArraySetAsSeries(rates_low,   true); ArraySetAsSeries(rates_high, true);
+    CopyClose(_Symbol, _Period, 0, 2, rates_close);
+    CopyOpen(_Symbol,  _Period, 0, 2, rates_open);
+    CopyLow(_Symbol,   _Period, 0, 2, rates_low);
+    CopyHigh(_Symbol,  _Period, 0, 2, rates_high);
+
+    double o = rates_open[1], l = rates_low[1], c = rates_close[1];
+
+    for(int i = 0; i < brokenCount; i++)
+    {
+        SZone &z = brokenZones[i];
+        if(!z.isResistance || !z.wasBroken || z.diedBar < 0) continue;
+
+        int age = currentBarIdx - z.diedBar;
+        if(age <= 0 || age > InpRetestWindowBars)              continue;
+
+        bool dippedIn  = (l <= z.top);
+        bool heldAbove = (c >= z.bot && c >= o);
+
+        if(dippedIn && heldAbove && CooldownOk(z.center, atr))
+        {
+            outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            outSL         = z.bot - atr * InpRetestSlBuffer;
+            outZoneCenter = z.center;
+            outZoneType   = "Flipped Support";
+            return true;
+        }
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Retest SELL: broken support now acts as resistance               |
+//| Price rallies back into the flipped zone and closes bearish      |
+//+------------------------------------------------------------------+
+bool CheckRetestSell(double atr, double &outEntry, double &outSL,
+                     double &outZoneCenter, string &outZoneType, int currentBarIdx)
+{
+    if(!InpUseRetests) return false;
+
+    double rates_close[], rates_open[], rates_low[], rates_high[];
+    ArraySetAsSeries(rates_close, true); ArraySetAsSeries(rates_open, true);
+    ArraySetAsSeries(rates_low,   true); ArraySetAsSeries(rates_high, true);
+    CopyClose(_Symbol, _Period, 0, 2, rates_close);
+    CopyOpen(_Symbol,  _Period, 0, 2, rates_open);
+    CopyLow(_Symbol,   _Period, 0, 2, rates_low);
+    CopyHigh(_Symbol,  _Period, 0, 2, rates_high);
+
+    double o = rates_open[1], h = rates_high[1], c = rates_close[1];
+
+    for(int i = 0; i < brokenCount; i++)
+    {
+        SZone &z = brokenZones[i];
+        if(z.isResistance || !z.wasBroken || z.diedBar < 0) continue;
+
+        int age = currentBarIdx - z.diedBar;
+        if(age <= 0 || age > InpRetestWindowBars)             continue;
+
+        bool rallyedIn = (h >= z.bot);
+        bool heldBelow = (c <= z.top && c <= o);
+
+        if(rallyedIn && heldBelow && CooldownOk(z.center, atr))
+        {
+            outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            outSL         = z.top + atr * InpRetestSlBuffer;
+            outZoneCenter = z.center;
+            outZoneType   = "Flipped Resistance";
+            return true;
+        }
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
 //| Manage manually opened trades (magic = 0) on current symbol      |
 //| Applies breakeven then trailing stop, every tick                 |
 //+------------------------------------------------------------------+
@@ -715,6 +872,10 @@ int OnInit()
     ArrayResize(sigTimes,   50);
     sigCoolCount = 0;
 
+    ArrayResize(brokenZones, 60);
+    brokenCount        = 0;
+    lastBreakCheckBar  = -1;
+
     if(InpMode == EA_MODE)
     {
         if(!pyramid.Init(InpMagic, InpSlippage,
@@ -761,15 +922,24 @@ void OnTick()
     // Signal / entry logic only on new bars
     if(!IsNewBar()) return;
 
-    // Rebuild zones on each new bar
-    RebuildAllZones();
-
-    // Get current ATR
+    // Get current ATR before zone detection (needed for DetectBreaks)
     double atrBuf[];
     ArraySetAsSeries(atrBuf, true);
     if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) <= 0) return;
     double atr = atrBuf[0];
     if(atr <= 0) return;
+
+    // Detect breaks on last closed bar BEFORE rebuilding zones
+    double closeBuf[];
+    ArraySetAsSeries(closeBuf, true);
+    if(CopyClose(_Symbol, _Period, 0, 2, closeBuf) > 0)
+    {
+        int barIdx = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
+        DetectBreaks(closeBuf[1], atr, barIdx);
+    }
+
+    // Rebuild alive zones
+    RebuildAllZones();
 
     // Volatility filter
     if(!IsVolatilityAcceptable(_Symbol, _Period, InpAtrPeriod, InpMinAtrPips, InpMaxAtrPips))
@@ -781,17 +951,17 @@ void OnTick()
     double tp1 = 0, tp2 = 0, tp3 = 0;
     string zoneType = "";
 
+    int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
+
     // --- Check BUY (support bounce) ---
     if(CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
-        int tpCount = FindTpTargets(entry, 1, tp1, tp2, tp3);
+        FindTpTargets(entry, 1, tp1, tp2, tp3);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-        {
             SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
-        }
-        else // EA_MODE
+        else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
             {
@@ -799,22 +969,20 @@ void OnTick()
                     SendTradeAlert("BUY", entry, sl, tp1, tp2, tp3, InpLotInitial);
             }
             else
-                Print("SR_Zones_EA: BUY SL too close to market – skipped.");
+                Print("SR_Zones_EA: BUY SL too close – skipped.");
         }
-        return; // one signal per bar
+        return;
     }
 
     // --- Check SELL (resistance reject) ---
     if(CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
-        int tpCount = FindTpTargets(entry, -1, tp1, tp2, tp3);
+        FindTpTargets(entry, -1, tp1, tp2, tp3);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-        {
             SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
-        }
-        else // EA_MODE
+        else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
             {
@@ -822,7 +990,49 @@ void OnTick()
                     SendTradeAlert("SELL", entry, sl, tp1, tp2, tp3, InpLotInitial);
             }
             else
-                Print("SR_Zones_EA: SELL SL too close to market – skipped.");
+                Print("SR_Zones_EA: SELL SL too close – skipped.");
+        }
+        return;
+    }
+
+    // --- Check BUY retest (broken resistance → flipped support) ---
+    if(CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+    {
+        FindTpTargets(entry, 1, tp1, tp2, tp3);
+        RecordCooldown(zoneCenter);
+
+        if(InpMode == SIGNAL_MODE)
+            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+        else
+        {
+            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
+            {
+                if(pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                    SendTradeAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, InpLotInitial);
+            }
+            else
+                Print("SR_Zones_EA: BUY RETEST SL too close – skipped.");
+        }
+        return;
+    }
+
+    // --- Check SELL retest (broken support → flipped resistance) ---
+    if(CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+    {
+        FindTpTargets(entry, -1, tp1, tp2, tp3);
+        RecordCooldown(zoneCenter);
+
+        if(InpMode == SIGNAL_MODE)
+            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+        else
+        {
+            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
+            {
+                if(pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                    SendTradeAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, InpLotInitial);
+            }
+            else
+                Print("SR_Zones_EA: SELL RETEST SL too close – skipped.");
         }
     }
 }
