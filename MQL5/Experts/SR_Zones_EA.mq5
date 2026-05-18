@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.13"
+#property version   "1.14"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -123,13 +123,13 @@ input double InpHammerWickMult  = 2.0;   // Hammer wick must be >= X * body size
 input double InpHammerOppWickPct= 30.0;  // Max opposite wick as % of body (default 30%)
 
 input group "=== Stochastic Confluence ==="
-input bool   InpUseStoch        = true;  // Require stochastic confirmation at zone
-input int    InpStochK          = 5;     // Stochastic %K period
-input int    InpStochD          = 3;     // Stochastic %D period
-input int    InpStochSlowing    = 3;     // Stochastic slowing
-input double InpStochOB         = 80.0;  // Overbought level (sell signals)
-input double InpStochOS         = 20.0;  // Oversold level (buy signals)
-input bool   InpStochCrossOnly  = true;  // Require K cross D (not just level)
+input bool            InpUseStoch     = true;         // Require stochastic confirmation at zone
+input ENUM_TIMEFRAMES InpStochTF      = PERIOD_M12;   // Stochastic timeframe (M12 recommended)
+input int             InpStochK       = 10;           // Stochastic %K period
+input int             InpStochD       = 4;            // Stochastic %D period
+input int             InpStochSlowing = 3;            // Stochastic slowing
+input double          InpStochOB      = 85.0;         // Overbought level – sell zone (85-100)
+input double          InpStochOS      = 20.0;         // Oversold level  – buy zone  (0-20)
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -675,6 +675,8 @@ bool HasBearishPattern()
 //+------------------------------------------------------------------+
 
 // +1 = bullish stoch confirmation, -1 = bearish, 0 = no confirmation
+// Logic: HTF stochastic K must be in OB/OS zone AND K must cross D on the
+// last completed HTF bar (K[2] on opposite side of D[2], K[1] crossed over D[1])
 int StochConfluence()
 {
     if(!InpUseStoch) return 0;
@@ -685,16 +687,19 @@ int StochConfluence()
     if(CopyBuffer(stochHandle, 0, 0, 3, kBuf) < 3) return 0;
     if(CopyBuffer(stochHandle, 1, 0, 3, dBuf) < 3) return 0;
 
-    double k1 = kBuf[1], k2 = kBuf[2]; // bar[1] and bar[2] values
-    double d1 = dBuf[1];
+    double k1 = kBuf[1], k2 = kBuf[2];
+    double d1 = dBuf[1], d2 = dBuf[2];
 
-    // Bullish: K in OS zone; if CrossOnly, K must have crossed above D
-    bool bullish = (k1 <= InpStochOS) &&
-                   (!InpStochCrossOnly || (k2 < d1 && k1 >= d1));
+    // Bullish: K in oversold zone (0-20) AND K crossed above D
+    // Cross: previous bar K was below D, current bar K is above D
+    bool kInOS        = (k1 <= InpStochOS);
+    bool kCrossedUpD  = (k2 < d2 && k1 > d1);
+    bool bullish      = kInOS && kCrossedUpD;
 
-    // Bearish: K in OB zone; if CrossOnly, K must have crossed below D
-    bool bearish = (k1 >= InpStochOB) &&
-                   (!InpStochCrossOnly || (k2 > d1 && k1 <= d1));
+    // Bearish: K in overbought zone (85-100) AND K crossed below D
+    bool kInOB        = (k1 >= InpStochOB);
+    bool kCrossedDnD  = (k2 > d2 && k1 < d1);
+    bool bearish      = kInOB && kCrossedDnD;
 
     if(bullish) return  1;
     if(bearish) return -1;
@@ -1040,7 +1045,7 @@ int OnInit()
         return INIT_FAILED;
     }
 
-    stochHandle = iStochastic(_Symbol, _Period, InpStochK, InpStochD, InpStochSlowing,
+    stochHandle = iStochastic(_Symbol, InpStochTF, InpStochK, InpStochD, InpStochSlowing,
                               MODE_SMA, STO_LOWHIGH);
     if(stochHandle == INVALID_HANDLE)
     {
@@ -1180,8 +1185,9 @@ void OnTick()
     bool bearCandle  = HasBearishPattern();
     int  stochConf   = StochConfluence(); // +1 bull, -1 bear, 0 = no conf / filter off
 
-    bool bullConf = bullCandle && (InpUseStoch ? (stochConf >= 0) : true);
-    bool bearConf = bearCandle && (InpUseStoch ? (stochConf <= 0) : true);
+    // When stoch enabled: require explicit +1/-1 confirmation (cross in OB/OS zone)
+    bool bullConf = bullCandle && (InpUseStoch ? (stochConf == 1)  : true);
+    bool bearConf = bearCandle && (InpUseStoch ? (stochConf == -1) : true);
 
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
