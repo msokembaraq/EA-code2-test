@@ -622,7 +622,7 @@ string FormatVolume(double v)
 //+------------------------------------------------------------------+
 int TranspTo255(int pct)
   {
-   return (int)MathRound((100 - pct) * 2.55);
+   return (int)MathRound(pct * 2.55);
   }
 
 //+------------------------------------------------------------------+
@@ -658,8 +658,8 @@ void DrawAlive(Zone &z, color baseCol, double maxS, double maxVol,
      }
 
    // Opacity: higher = more opaque (less transparent)
-   int fillOp = MathMax(40, MathMin(100, InpZoneOpacity + extra - volBoost));
-   int edgeOp = MathMin(100, 35 + extra - volBoost / 2);
+   int fillOp = MathMax(40, MathMin(95, InpZoneOpacity + extra - volBoost));
+   int edgeOp = MathMin(95, 35 + extra - volBoost / 2);
 
    string uid = IntegerToString(currentBar) + "_" + IntegerToString(MathRand());
 
@@ -728,7 +728,7 @@ void DrawBroken(Zone &z, int totalBars, const datetime &time[], double currentCl
    color useCol = z.isResistance ? InpBrokenBear : InpBrokenBull;
 
    int startIdx = SafeStartIdx(z.firstBar, totalBars);
-   int endIdx   = (z.diedBar < 0) ? 0 : SafeStartIdx(z.diedBar, totalBars);
+   int endIdx   = (z.diedBar < 0) ? totalBars - 1 : SafeStartIdx(z.diedBar, totalBars);
 
    datetime startTime = time[startIdx];
    datetime endTime   = time[endIdx];
@@ -754,7 +754,7 @@ void DrawBroken(Zone &z, int totalBars, const datetime &time[], double currentCl
    ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
    ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, lineName, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, lineName, OBJPROP_TRANSPARENCY, TranspTo255(MathMin(100, InpBrokenOp + 10)));
+   ObjectSetInteger(0, lineName, OBJPROP_TRANSPARENCY, TranspTo255(MathMin(90, InpBrokenOp + 10)));
 
    // Break label
    if(InpShowReaction && z.wasBroken && z.diedBar >= 0 && z.isLiveBreak)
@@ -1029,11 +1029,45 @@ int OnCalculate(const int rates_total,
       // --- Signals & Drawing (final bar only) ---
       if(bar == rates_total - 1)
         {
+         // Evaluate signal conditions first (recording cooldowns internally)
          bool bounceUp   = CheckSupBounce(bar, open, high, low, close, atr);
          bool bounceDown = CheckResReject(bar, open, high, low, close, atr);
          bool retestUp   = CheckRetestBull(bar, open, high, low, close);
          bool retestDown = CheckRetestBear(bar, open, high, low, close);
 
+         // One bool per reaction type (mirrors Pine's single plotshape per bar)
+         bool supHold = false, resHold = false;
+         for(int i = 0; i < supCount && !supHold; i++)
+            if(ZoneRenderable(supZones[i]) && low[bar] <= supZones[i].top && close[bar] > supZones[i].bot)
+               supHold = true;
+         for(int i = 0; i < resCount && !resHold; i++)
+            if(ZoneRenderable(resZones[i]) && high[bar] >= resZones[i].bot && close[bar] < resZones[i].top)
+               resHold = true;
+
+         // --- Redraw zones first so ClearDrawings does not erase signal arrows ---
+         ClearDrawings();
+
+         double mxStrength = MaxStrengthAcross();
+         double mxVol      = MaxVolAcross();
+         double curClose   = close[bar];
+
+         for(int i = 0; i < resCount; i++)
+            if(resZones[i].diedBar < 0)
+               DrawAlive(resZones[i], InpResColor, mxStrength, mxVol, bar, rates_total, time, curClose);
+
+         for(int i = 0; i < supCount; i++)
+            if(supZones[i].diedBar < 0)
+               DrawAlive(supZones[i], InpSupColor, mxStrength, mxVol, bar, rates_total, time, curClose);
+
+         if(InpShowBroken || InpShowDropped)
+            for(int i = 0; i < brokenCount; i++)
+              {
+               bool show = (brokenZones[i].wasBroken && InpShowBroken) ||
+                           (!brokenZones[i].wasBroken && InpShowDropped);
+               if(show) DrawBroken(brokenZones[i], rates_total, time, curClose);
+              }
+
+         // --- Draw signal markers after zone drawing ---
          if(InpShowTest && bounceUp)
            {
             string n = prefix + "ARROW_UP_" + IntegerToString(bar);
@@ -1062,49 +1096,20 @@ int OnCalculate(const int rates_total,
             ObjectSetInteger(0, n, OBJPROP_COLOR, InpResColor);
             ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
            }
-
-         if(InpShowReaction)
+         if(InpShowReaction && supHold)
            {
-            for(int i = 0; i < supCount; i++)
-               if(ZoneRenderable(supZones[i]) && low[bar] <= supZones[i].top && close[bar] > supZones[i].bot)
-                 {
-                  string n = prefix + "HOLD_UP_" + IntegerToString(bar) + "_" + IntegerToString(i);
-                  ObjectCreate(0, n, OBJ_ARROW_UP, 0, time[bar], low[bar] - 15 * _Point);
-                  ObjectSetInteger(0, n, OBJPROP_COLOR, InpSupColor);
-                  ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
-                 }
-            for(int i = 0; i < resCount; i++)
-               if(ZoneRenderable(resZones[i]) && high[bar] >= resZones[i].bot && close[bar] < resZones[i].top)
-                 {
-                  string n = prefix + "HOLD_DN_" + IntegerToString(bar) + "_" + IntegerToString(i);
-                  ObjectCreate(0, n, OBJ_ARROW_DOWN, 0, time[bar], high[bar] + 15 * _Point);
-                  ObjectSetInteger(0, n, OBJPROP_COLOR, InpResColor);
-                  ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
-                 }
+            string n = prefix + "HOLD_UP_" + IntegerToString(bar);
+            ObjectCreate(0, n, OBJ_ARROW_UP, 0, time[bar], low[bar] - 15 * _Point);
+            ObjectSetInteger(0, n, OBJPROP_COLOR, InpSupColor);
+            ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
            }
-
-         // --- Redraw zones ---
-         ClearDrawings();
-
-         double mxStrength = MaxStrengthAcross();
-         double mxVol      = MaxVolAcross();
-         double curClose   = close[bar];
-
-         for(int i = 0; i < resCount; i++)
-            if(resZones[i].diedBar < 0)
-               DrawAlive(resZones[i], InpResColor, mxStrength, mxVol, bar, rates_total, time, curClose);
-
-         for(int i = 0; i < supCount; i++)
-            if(supZones[i].diedBar < 0)
-               DrawAlive(supZones[i], InpSupColor, mxStrength, mxVol, bar, rates_total, time, curClose);
-
-         if(InpShowBroken || InpShowDropped)
-            for(int i = 0; i < brokenCount; i++)
-              {
-               bool show = (brokenZones[i].wasBroken && InpShowBroken) ||
-                           (!brokenZones[i].wasBroken && InpShowDropped);
-               if(show) DrawBroken(brokenZones[i], rates_total, time, curClose);
-              }
+         if(InpShowReaction && resHold)
+           {
+            string n = prefix + "HOLD_DN_" + IntegerToString(bar);
+            ObjectCreate(0, n, OBJ_ARROW_DOWN, 0, time[bar], high[bar] + 15 * _Point);
+            ObjectSetInteger(0, n, OBJPROP_COLOR, InpResColor);
+            ObjectSetInteger(0, n, OBJPROP_WIDTH, 2);
+           }
         }
      }
 
