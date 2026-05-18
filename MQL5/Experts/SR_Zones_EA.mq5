@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.12"
+#property version   "1.13"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -113,12 +113,31 @@ input bool   InpManualTrail     = true;  // Enable trailing stop on manual trade
 input double InpManualTrailPips = 15;    // Trail distance (pips)
 input double InpManualTrailStep = 5;     // Min pips to move trail
 
+input group "=== Candle Confluence (zone confirmation) ==="
+input bool   InpReqCandle       = true;  // Require at least one candle pattern at zone
+input bool   InpUseEngulf       = true;  // Engulfing candle (body fully engulfs prev bar)
+input bool   InpUseDoji         = true;  // Doji (body ≤ DojiBodyPct % of candle range)
+input double InpDojiBodyPct     = 10.0;  // Doji max body % of total range (default 10%)
+input bool   InpUseHammer       = true;  // Hammer / Shooting Star (wick 2x body, small opp wick)
+input double InpHammerWickMult  = 2.0;   // Hammer wick must be >= X * body size
+input double InpHammerOppWickPct= 30.0;  // Max opposite wick as % of body (default 30%)
+
+input group "=== Stochastic Confluence ==="
+input bool   InpUseStoch        = true;  // Require stochastic confirmation at zone
+input int    InpStochK          = 5;     // Stochastic %K period
+input int    InpStochD          = 3;     // Stochastic %D period
+input int    InpStochSlowing    = 3;     // Stochastic slowing
+input double InpStochOB         = 80.0;  // Overbought level (sell signals)
+input double InpStochOS         = 20.0;  // Oversold level (buy signals)
+input bool   InpStochCrossOnly  = true;  // Require K cross D (not just level)
+
 //+------------------------------------------------------------------+
 //| Globals                                                          |
 //+------------------------------------------------------------------+
 CPyramidEngine  pyramid;
 int             atrHandle;
 int             trendMAHandle;
+int             stochHandle;
 int             pivLeft, pivRight;
 double          clusterTol;
 int             minSpacing;
@@ -572,6 +591,117 @@ int TrendDirection()
 }
 
 //+------------------------------------------------------------------+
+//| Candle pattern helpers (operate on bar[1] = last closed bar)     |
+//+------------------------------------------------------------------+
+
+// Returns true if bar[1] is a bullish engulfing (body engulfs bar[2] body)
+bool IsBullEngulf()
+{
+    double o1 = iOpen(_Symbol,_Period,1),  c1 = iClose(_Symbol,_Period,1);
+    double o2 = iOpen(_Symbol,_Period,2),  c2 = iClose(_Symbol,_Period,2);
+    if(c1 <= o1) return false;             // bar[1] must be bullish
+    if(c2 >= o2) return false;             // bar[2] must be bearish
+    return (c1 > o2 && o1 < c2);          // body of [1] fully engulfs body of [2]
+}
+
+// Returns true if bar[1] is a bearish engulfing
+bool IsBearEngulf()
+{
+    double o1 = iOpen(_Symbol,_Period,1),  c1 = iClose(_Symbol,_Period,1);
+    double o2 = iOpen(_Symbol,_Period,2),  c2 = iClose(_Symbol,_Period,2);
+    if(c1 >= o1) return false;
+    if(c2 <= o2) return false;
+    return (o1 > c2 && c1 < o2);
+}
+
+// Returns true if bar[1] is a doji (body ≤ DojiBodyPct% of total range)
+bool IsDoji()
+{
+    double o = iOpen(_Symbol,_Period,1), c = iClose(_Symbol,_Period,1);
+    double h = iHigh(_Symbol,_Period,1), l = iLow(_Symbol,_Period,1);
+    double range = h - l;
+    if(range <= 0) return false;
+    return (MathAbs(c - o) / range * 100.0) <= InpDojiBodyPct;
+}
+
+// Returns true if bar[1] is a hammer (bullish rejection from bottom)
+bool IsHammer()
+{
+    double o = iOpen(_Symbol,_Period,1), c = iClose(_Symbol,_Period,1);
+    double h = iHigh(_Symbol,_Period,1), l = iLow(_Symbol,_Period,1);
+    double body      = MathAbs(c - o);
+    double lowerWick = MathMin(o,c) - l;
+    double upperWick = h - MathMax(o,c);
+    if(body <= 0) return false;
+    return (lowerWick >= InpHammerWickMult * body) &&
+           (upperWick <= InpHammerOppWickPct / 100.0 * body);
+}
+
+// Returns true if bar[1] is a shooting star (bearish rejection from top)
+bool IsShootingStar()
+{
+    double o = iOpen(_Symbol,_Period,1), c = iClose(_Symbol,_Period,1);
+    double h = iHigh(_Symbol,_Period,1), l = iLow(_Symbol,_Period,1);
+    double body      = MathAbs(c - o);
+    double upperWick = h - MathMax(o,c);
+    double lowerWick = MathMin(o,c) - l;
+    if(body <= 0) return false;
+    return (upperWick >= InpHammerWickMult * body) &&
+           (lowerWick <= InpHammerOppWickPct / 100.0 * body);
+}
+
+// Returns true if at least one bullish pattern is present on bar[1]
+bool HasBullishPattern()
+{
+    if(!InpReqCandle) return true;
+    if(InpUseEngulf && IsBullEngulf()) return true;
+    if(InpUseDoji   && IsDoji())       return true;
+    if(InpUseHammer && IsHammer())     return true;
+    return false;
+}
+
+// Returns true if at least one bearish pattern is present on bar[1]
+bool HasBearishPattern()
+{
+    if(!InpReqCandle) return true;
+    if(InpUseEngulf && IsBearEngulf())      return true;
+    if(InpUseDoji   && IsDoji())            return true;
+    if(InpUseHammer && IsShootingStar())    return true;
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Stochastic confluence                                            |
+//+------------------------------------------------------------------+
+
+// +1 = bullish stoch confirmation, -1 = bearish, 0 = no confirmation
+int StochConfluence()
+{
+    if(!InpUseStoch) return 0;
+
+    double kBuf[], dBuf[];
+    ArraySetAsSeries(kBuf, true);
+    ArraySetAsSeries(dBuf, true);
+    if(CopyBuffer(stochHandle, 0, 0, 3, kBuf) < 3) return 0;
+    if(CopyBuffer(stochHandle, 1, 0, 3, dBuf) < 3) return 0;
+
+    double k1 = kBuf[1], k2 = kBuf[2]; // bar[1] and bar[2] values
+    double d1 = dBuf[1];
+
+    // Bullish: K in OS zone; if CrossOnly, K must have crossed above D
+    bool bullish = (k1 <= InpStochOS) &&
+                   (!InpStochCrossOnly || (k2 < d1 && k1 >= d1));
+
+    // Bearish: K in OB zone; if CrossOnly, K must have crossed below D
+    bool bearish = (k1 >= InpStochOB) &&
+                   (!InpStochCrossOnly || (k2 > d1 && k1 <= d1));
+
+    if(bullish) return  1;
+    if(bearish) return -1;
+    return 0;
+}
+
+//+------------------------------------------------------------------+
 //| Send push notification helper                                    |
 //+------------------------------------------------------------------+
 void SendAlert(string msg)
@@ -910,6 +1040,14 @@ int OnInit()
         return INIT_FAILED;
     }
 
+    stochHandle = iStochastic(_Symbol, _Period, InpStochK, InpStochD, InpStochSlowing,
+                              MODE_SMA, STO_LOWHIGH);
+    if(stochHandle == INVALID_HANDLE)
+    {
+        Print("SR_Zones_EA: Failed to create stochastic handle.");
+        return INIT_FAILED;
+    }
+
     ArrayResize(sigCenters, 50);
     ArrayResize(sigTimes,   50);
     sigCoolCount = 0;
@@ -947,6 +1085,7 @@ void OnDeinit(const int reason)
 {
     IndicatorRelease(atrHandle);
     IndicatorRelease(trendMAHandle);
+    IndicatorRelease(stochHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -1036,6 +1175,14 @@ void OnTick()
         lastLogTrend = trendDir;
     }
 
+    // Evaluate candle and stochastic confluence once per bar (shared by all signal types)
+    bool bullCandle  = HasBullishPattern();
+    bool bearCandle  = HasBearishPattern();
+    int  stochConf   = StochConfluence(); // +1 bull, -1 bear, 0 = no conf / filter off
+
+    bool bullConf = bullCandle && (InpUseStoch ? (stochConf >= 0) : true);
+    bool bearConf = bearCandle && (InpUseStoch ? (stochConf <= 0) : true);
+
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
     string zoneType = "";
@@ -1043,7 +1190,8 @@ void OnTick()
     int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
 
     // --- Check BUY (support bounce) ---
-    if(!InpRetestOnly && (trendDir >= 0) && CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
+    if(!InpRetestOnly && (trendDir >= 0) && bullConf &&
+       CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1069,7 +1217,8 @@ void OnTick()
     }
 
     // --- Check SELL (resistance reject) ---
-    if(!InpRetestOnly && (trendDir <= 0) && CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
+    if(!InpRetestOnly && (trendDir <= 0) && bearConf &&
+       CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1095,7 +1244,8 @@ void OnTick()
     }
 
     // --- Check BUY retest (broken resistance → flipped support) ---
-    if((trendDir >= 0) && CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+    if((trendDir >= 0) && bullConf &&
+       CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1121,7 +1271,8 @@ void OnTick()
     }
 
     // --- Check SELL retest (broken support → flipped resistance) ---
-    if((trendDir <= 0) && CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+    if((trendDir <= 0) && bearConf &&
+       CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
