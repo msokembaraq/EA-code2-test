@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.11"
+#property version   "1.12"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -68,6 +68,13 @@ input int    InpZoneCount  = 6;     // Active zones per side
 input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter)
 input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
+input group "=== Trend Filter ==="
+input bool             InpUseTrendFilter = true;          // Only trade in trend direction (MA on HTF)
+input ENUM_TIMEFRAMES  InpTrendTF        = PERIOD_H1;     // Higher timeframe for trend MA
+input int              InpTrendMAPeriod  = 200;           // Trend MA period
+input ENUM_MA_METHOD   InpTrendMAMethod  = MODE_EMA;      // Trend MA method
+input int              InpTrendMAShift   = 0;             // Trend MA shift
+
 input group "=== Entry Filter ==="
 input int    InpSigCooldownBars = 20;    // Bars between signals on same zone (M5: 20 bars = 100 min)
 input bool   InpUseVolFilter    = false; // Enable ATR volatility filter (disable for Gold/indices)
@@ -111,6 +118,7 @@ input double InpManualTrailStep = 5;     // Min pips to move trail
 //+------------------------------------------------------------------+
 CPyramidEngine  pyramid;
 int             atrHandle;
+int             trendMAHandle;
 int             pivLeft, pivRight;
 double          clusterTol;
 int             minSpacing;
@@ -129,6 +137,7 @@ int     lastBreakCheckBar = -1;
 
 // Log throttle: only print zone details when counts change
 int     lastLogRes = -1, lastLogSup = -1, lastLogBroken = -1;
+int     lastLogTrend = 0;
 
 // Signal cooldown tracking per zone center
 double  sigCenters[];
@@ -548,6 +557,21 @@ int FindTpTargets(double fromPrice, int direction, double &tp1, double &tp2, dou
 }
 
 //+------------------------------------------------------------------+
+//| Trend direction: +1 = bullish, -1 = bearish, 0 = filter off     |
+//+------------------------------------------------------------------+
+int TrendDirection()
+{
+    if(!InpUseTrendFilter) return 0;
+
+    double maBuf[];
+    ArraySetAsSeries(maBuf, true);
+    if(CopyBuffer(trendMAHandle, 0, 0, 1, maBuf) <= 0) return 0;
+
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    return (price > maBuf[0]) ? 1 : -1;
+}
+
+//+------------------------------------------------------------------+
 //| Send push notification helper                                    |
 //+------------------------------------------------------------------+
 void SendAlert(string msg)
@@ -878,6 +902,14 @@ int OnInit()
         return INIT_FAILED;
     }
 
+    trendMAHandle = iMA(_Symbol, InpTrendTF, InpTrendMAPeriod, InpTrendMAShift,
+                        InpTrendMAMethod, PRICE_CLOSE);
+    if(trendMAHandle == INVALID_HANDLE)
+    {
+        Print("SR_Zones_EA: Failed to create trend MA handle.");
+        return INIT_FAILED;
+    }
+
     ArrayResize(sigCenters, 50);
     ArrayResize(sigTimes,   50);
     sigCoolCount = 0;
@@ -914,6 +946,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     IndicatorRelease(atrHandle);
+    IndicatorRelease(trendMAHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -994,6 +1027,15 @@ void OnTick()
         return;
     }
 
+    int trendDir = TrendDirection(); // +1 bull, -1 bear, 0 filter off
+    if(InpUseTrendFilter && trendDir != lastLogTrend)
+    {
+        PrintFormat("SR_Zones_EA: Trend changed → %s (HTF %s EMA%d)",
+                    trendDir > 0 ? "BULL" : "BEAR",
+                    EnumToString(InpTrendTF), InpTrendMAPeriod);
+        lastLogTrend = trendDir;
+    }
+
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
     string zoneType = "";
@@ -1001,7 +1043,7 @@ void OnTick()
     int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
 
     // --- Check BUY (support bounce) ---
-    if(!InpRetestOnly && CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
+    if(!InpRetestOnly && (trendDir >= 0) && CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1027,7 +1069,7 @@ void OnTick()
     }
 
     // --- Check SELL (resistance reject) ---
-    if(!InpRetestOnly && CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
+    if(!InpRetestOnly && (trendDir <= 0) && CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1053,7 +1095,7 @@ void OnTick()
     }
 
     // --- Check BUY retest (broken resistance → flipped support) ---
-    if(CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+    if((trendDir >= 0) && CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1079,7 +1121,7 @@ void OnTick()
     }
 
     // --- Check SELL retest (broken support → flipped resistance) ---
-    if(CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+    if((trendDir <= 0) && CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
