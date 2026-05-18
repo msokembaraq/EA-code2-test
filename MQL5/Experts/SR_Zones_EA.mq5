@@ -55,7 +55,7 @@ struct SZone
 //+------------------------------------------------------------------+
 input group "=== Operation ==="
 input ENUM_OPERATION_MODE InpMode       = EA_MODE;         // Operation mode
-input string              InpMetaID     = "";              // MetaTrader ID (push notifications)
+input string              InpMetaID     = "407DBF6E";              // MetaTrader ID (push notifications)
 
 input group "=== Zone Detection ==="
 input ENUM_STRENGTH_PRESET_EA InpPreset = SWING_EA;        // Strength preset
@@ -78,9 +78,9 @@ input int    InpAtrPeriod       = 14;    // ATR period
 input group "=== Trade Settings (EA mode) ==="
 input ulong  InpMagic      = 202401;  // Magic number
 input int    InpSlippage   = 10;      // Slippage (points)
-input double InpLotInitial = 0.30;    // Initial lot (largest)
-input double InpLotAddon1  = 0.20;    // Add-on 1 lot
-input double InpLotAddon2  = 0.10;    // Add-on 2 lot
+input double InpLotInitial = 0.05;    // Initial lot (largest)
+input double InpLotAddon1  = 0.03;    // Add-on 1 lot
+input double InpLotAddon2  = 0.02;    // Add-on 2 lot
 input double InpSlZoneBuffer = 0.3;   // SL buffer beyond zone edge (x ATR)
 
 input group "=== Pyramid Triggers ==="
