@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.09"
+#property version   "1.10"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -94,6 +94,7 @@ input double InpTrailStepPips   = 50;   // Trail step – Gold: 50 = $0.50
 
 input group "=== Role Flip Retests ==="
 input bool   InpUseRetests       = true;  // Trade/signal role-flip retests
+input bool   InpRetestOnly       = true;  // Only trade retests (skip raw bounce signals)
 input int    InpRetestWindowBars = 80;    // Max bars after break to accept retest
 input double InpRetestSlBuffer   = 1.5;  // SL buffer beyond flipped zone (x ATR)
 
@@ -1000,7 +1001,7 @@ void OnTick()
     int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
 
     // --- Check BUY (support bounce) ---
-    if(CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
+    if(!InpRetestOnly && CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1026,7 +1027,7 @@ void OnTick()
     }
 
     // --- Check SELL (resistance reject) ---
-    if(CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
+    if(!InpRetestOnly && CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
