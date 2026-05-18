@@ -179,8 +179,30 @@ bool CPyramidEngine::OpenInitial(ENUM_POSITION_TYPE direction, double price,
 ulong CPyramidEngine::GetTicketFromLastDeal()
 {
     ulong deal = m_trade.ResultDeal();
-    if(deal == 0) return 0;
-    if(!HistoryDealSelect(deal)) return 0;
+    if(deal == 0)
+    {
+        Print("PyramidEngine: ResultDeal()=0 – no deal from last request.");
+        return 0;
+    }
+
+    // Load recent history so HistoryDealSelect can find the deal
+    HistorySelect(TimeCurrent() - 60, TimeCurrent() + 1);
+
+    if(!HistoryDealSelect(deal))
+    {
+        Print("PyramidEngine: HistoryDealSelect failed for deal=", deal);
+        // Fallback: scan open positions for our magic number
+        for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+            ulong ticket = PositionGetTicket(i);
+            if(!PositionSelectByTicket(ticket)) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != (long)m_magic) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol)        continue;
+            Print("PyramidEngine: Ticket recovered via position scan. Ticket=", ticket);
+            return ticket;
+        }
+        return 0;
+    }
     return (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
 }
 

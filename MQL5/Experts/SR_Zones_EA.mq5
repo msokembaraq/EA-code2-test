@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.04"
+#property version   "1.05"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -941,11 +941,23 @@ void OnTick()
     // Rebuild alive zones
     RebuildAllZones();
 
+    PrintFormat("SR_Zones_EA: NewBar | ResZones=%d SupZones=%d BrokenZones=%d ATR=%.5f",
+                resCount, supCount, brokenCount, atr);
+
     // Volatility filter
     if(!IsVolatilityAcceptable(_Symbol, _Period, InpAtrPeriod, InpMinAtrPips, InpMaxAtrPips))
+    {
+        double atrPips = atr / GetPipSize(_Symbol);
+        PrintFormat("SR_Zones_EA: Volatility filter blocked. ATR=%.1f pips (min=%.1f max=%.1f)",
+                    atrPips, InpMinAtrPips, InpMaxAtrPips);
         return;
+    }
 
-    if(InpMode == EA_MODE && pyramid.IsActive()) return; // already in trade
+    if(InpMode == EA_MODE && pyramid.IsActive())
+    {
+        Print("SR_Zones_EA: Pyramid active – skipping entry check.");
+        return;
+    }
 
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
@@ -956,6 +968,8 @@ void OnTick()
     // --- Check BUY (support bounce) ---
     if(CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
+        Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
+              " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, 1, tp1, tp2, tp3);
         RecordCooldown(zoneCenter);
 
@@ -965,11 +979,14 @@ void OnTick()
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
             {
-                if(pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                    Print("SR_Zones_EA: BUY OpenInitial returned false.");
+                else
                     SendTradeAlert("BUY", entry, sl, tp1, tp2, tp3, InpLotInitial);
             }
             else
-                Print("SR_Zones_EA: BUY SL too close – skipped.");
+                PrintFormat("SR_Zones_EA: BUY SL too close to market. SL=%.5f Ask=%.5f",
+                            sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
         }
         return;
     }
@@ -977,6 +994,8 @@ void OnTick()
     // --- Check SELL (resistance reject) ---
     if(CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
+        Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
+              " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, -1, tp1, tp2, tp3);
         RecordCooldown(zoneCenter);
 
@@ -986,11 +1005,14 @@ void OnTick()
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
             {
-                if(pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                    Print("SR_Zones_EA: SELL OpenInitial returned false.");
+                else
                     SendTradeAlert("SELL", entry, sl, tp1, tp2, tp3, InpLotInitial);
             }
             else
-                Print("SR_Zones_EA: SELL SL too close – skipped.");
+                PrintFormat("SR_Zones_EA: SELL SL too close to market. SL=%.5f Bid=%.5f",
+                            sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
         return;
     }
@@ -998,6 +1020,8 @@ void OnTick()
     // --- Check BUY retest (broken resistance → flipped support) ---
     if(CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
+        Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
+              " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, 1, tp1, tp2, tp3);
         RecordCooldown(zoneCenter);
 
@@ -1007,11 +1031,14 @@ void OnTick()
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
             {
-                if(pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                    Print("SR_Zones_EA: BUY RETEST OpenInitial returned false.");
+                else
                     SendTradeAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, InpLotInitial);
             }
             else
-                Print("SR_Zones_EA: BUY RETEST SL too close – skipped.");
+                PrintFormat("SR_Zones_EA: BUY RETEST SL too close. SL=%.5f Ask=%.5f",
+                            sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
         }
         return;
     }
@@ -1019,6 +1046,8 @@ void OnTick()
     // --- Check SELL retest (broken support → flipped resistance) ---
     if(CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
+        Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
+              " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, -1, tp1, tp2, tp3);
         RecordCooldown(zoneCenter);
 
@@ -1028,11 +1057,14 @@ void OnTick()
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
             {
-                if(pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                    Print("SR_Zones_EA: SELL RETEST OpenInitial returned false.");
+                else
                     SendTradeAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, InpLotInitial);
             }
             else
-                Print("SR_Zones_EA: SELL RETEST SL too close – skipped.");
+                PrintFormat("SR_Zones_EA: SELL RETEST SL too close. SL=%.5f Bid=%.5f",
+                            sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
     }
 }
