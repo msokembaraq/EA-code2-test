@@ -5,6 +5,7 @@
 #property copyright "FeelsStrategy"
 #property version   "1.01"
 #property indicator_chart_window
+#property indicator_plots   0
 
 //+------------------------------------------------------------------+
 //| ENUMS                                                             |
@@ -58,31 +59,31 @@ input group "Zone Strength"
 input ENUM_STRENGTH_PRESET InpPreset = SWING;                       // Strength preset
 
 input group "Custom Parameters"
-input int      InpPivLeft    = 15;     // Left bars
-input int      InpPivRight   = 8;      // Right bars
+input int      InpPivLeft    = 50;     // Left bars
+input int      InpPivRight   = 15;      // Right bars
 input double   InpClusterTol = 0.9;    // Cluster tolerance (x ATR)
 input int      InpMinSpacing = 20;     // Min bars between touches
 input int      InpPivBuffer  = 80;     // Pivot memory
 
 input group "Zones"
 input int      InpZoneCount  = 6;      // Active zones per side
-input int      InpMinTouches = 2;      // Minimum touches
+input int      InpMinTouches = 3;      // Minimum touches
 input int      InpFadeAge    = 120;    // Fade after bars
 input double   InpHideFar    = 60.0;   // Hide zones farther than (%)
 
 input group "Broken Zones"
-input bool     InpShowBroken   = false;   // Show broken zones
-input bool     InpShowDropped  = false;   // Show dropped zones
+input bool     InpShowBroken   = true;   // Show broken zones
+input bool     InpShowDropped  = true;   // Show dropped zones
 input color    InpBrokenBull   = clrDarkSeaGreen;   // Broken support color
 input color    InpBrokenBear   = clrLightPink;      // Broken resistance color
-input int      InpBrokenOp     = 85;     // Broken zone opacity (0-100)
+input int      InpBrokenOp     = 100;     // Broken zone opacity (0-100)
 
 input group "Signals"
-input bool     InpShowTest     = false;  // Show test markers
-input bool     InpShowRetest   = false;  // Show retest markers
+input bool     InpShowTest     = true;  // Show test markers
+input bool     InpShowRetest   = true;  // Show retest markers
 input bool     InpShowReaction = false;  // Show reaction marks
 input int      InpSigCooldown  = 20;     // Cooldown bars
-input int      InpRetestWindow = 50;     // Retest window bars
+input int      InpRetestWindow = 120;     // Retest window bars
 
 input group "Style"
 input color    InpResColor    = clrOrangeRed;       // Resistance color
@@ -91,8 +92,8 @@ input bool     InpUseVolColor = true;    // Color zones by volume
 input bool     InpShowLabels  = true;    // Show zone labels
 input bool     InpShowVolText = true;    // Show volume score
 input ENUM_VOLUME_FORMAT InpVolFormat = ABSOLUTE;  // Volume format
-input bool     InpSingleLine  = false;  // Single line label
-input int      InpZoneOpacity = 82;     // Zone opacity low volume (0-100)
+input bool     InpSingleLine  = true;  // Single line label
+input int      InpZoneOpacity = 100;     // Zone opacity low volume (0-100)
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                  |
@@ -211,7 +212,7 @@ bool IsDuplicatePivot(const Pivot &arr[], int count, int bar)
 //+------------------------------------------------------------------+
 //| Add pivot to dynamic array (circular buffer)                      |
 //+------------------------------------------------------------------+
-void AddPivot(Pivot &arr[], int &count, Pivot p, int maxCount)
+void AddPivot(Pivot &arr[], int &count, const Pivot &p, int maxCount)
   {
    if(count < maxCount)
      {
@@ -667,22 +668,21 @@ void DrawAlive(Zone &z, color baseCol, double maxS, double maxVol,
    string boxName = prefix + "B_" + (z.isResistance ? "R_" : "S_") + uid;
    ObjectCreate(0, boxName, OBJ_RECTANGLE, 0, startTime, z.top, rightTime, z.bot);
    ObjectSetInteger(0, boxName, OBJPROP_COLOR, clrNONE);
-   ObjectSetInteger(0, boxName, OBJPROP_BGCOLOR, baseCol);
+ObjectSetInteger(0, boxName, OBJPROP_BGCOLOR, ColorToARGB(baseCol, (uchar)MathRound(fillOp * 2.55)));
+   ObjectSetInteger(0, boxName, OBJPROP_FILL, true);
    ObjectSetInteger(0, boxName, OBJPROP_BACK, true);
    ObjectSetInteger(0, boxName, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, boxName, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, boxName, OBJPROP_TRANSPARENCY, TranspTo255(fillOp));
 
    // Center line
    string lineName = prefix + "L_" + (z.isResistance ? "R_" : "S_") + uid;
    ObjectCreate(0, lineName, OBJ_TREND, 0, startTime, z.center, rightTime, z.center);
-   ObjectSetInteger(0, lineName, OBJPROP_COLOR, baseCol);
+ObjectSetInteger(0, lineName, OBJPROP_COLOR, ColorToARGB(baseCol, (uchar)MathRound(edgeOp * 2.55)));
    ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASH);
    ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 1);
    ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
    ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, lineName, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, lineName, OBJPROP_TRANSPARENCY, TranspTo255(edgeOp));
 
    // Label
    if(InpShowLabels)
@@ -739,22 +739,21 @@ void DrawBroken(Zone &z, int totalBars, const datetime &time[], double currentCl
    string boxName = prefix + "BROKEN_B_" + uid;
    ObjectCreate(0, boxName, OBJ_RECTANGLE, 0, startTime, z.top, endTime, z.bot);
    ObjectSetInteger(0, boxName, OBJPROP_COLOR, clrNONE);
-   ObjectSetInteger(0, boxName, OBJPROP_BGCOLOR, useCol);
+ObjectSetInteger(0, boxName, OBJPROP_BGCOLOR, ColorToARGB(useCol, (uchar)MathRound(InpBrokenOp * 2.55)));
+   ObjectSetInteger(0, boxName, OBJPROP_FILL, true);
    ObjectSetInteger(0, boxName, OBJPROP_BACK, true);
    ObjectSetInteger(0, boxName, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, boxName, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, boxName, OBJPROP_TRANSPARENCY, TranspTo255(InpBrokenOp));
 
    // Line
    string lineName = prefix + "BROKEN_L_" + uid;
    ObjectCreate(0, lineName, OBJ_TREND, 0, startTime, z.center, endTime, z.center);
-   ObjectSetInteger(0, lineName, OBJPROP_COLOR, useCol);
+ObjectSetInteger(0, lineName, OBJPROP_COLOR, ColorToARGB(useCol, (uchar)MathRound(MathMin(100, InpBrokenOp + 10) * 2.55)));
    ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASH);
    ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 1);
    ObjectSetInteger(0, lineName, OBJPROP_BACK, true);
    ObjectSetInteger(0, lineName, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, lineName, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, lineName, OBJPROP_TRANSPARENCY, TranspTo255(MathMin(100, InpBrokenOp + 10)));
 
    // Break label
    if(InpShowReaction && z.wasBroken && z.diedBar >= 0 && z.isLiveBreak)
@@ -1111,3 +1110,4 @@ int OnCalculate(const int rates_total,
    return rates_total;
   }
 //+------------------------------------------------------------------+
+
