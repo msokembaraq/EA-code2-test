@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.05"
+#property version   "1.06"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -69,10 +69,11 @@ input int    InpMinTouches = 3;     // Minimum touches
 input int    InpHistBars   = 600;   // Bars of history for zone detection
 
 input group "=== Entry Filter ==="
-input int    InpSigCooldownBars = 5;  // Bars between signals on same zone
-input double InpMinAtrPips      = 5;  // Min ATR pips for volatility filter
-input double InpMaxAtrPips      = 80; // Max ATR pips for volatility filter
-input int    InpAtrPeriod       = 14; // ATR period
+input int    InpSigCooldownBars = 5;     // Bars between signals on same zone
+input bool   InpUseVolFilter    = false; // Enable ATR volatility filter (disable for Gold/indices)
+input double InpMinAtrPips      = 5;     // Min ATR pips (forex) / points (Gold: ~100)
+input double InpMaxAtrPips      = 2000;  // Max ATR pips (forex: ~80) / points (Gold: ~2000)
+input int    InpAtrPeriod       = 14;    // ATR period
 
 input group "=== Trade Settings (EA mode) ==="
 input ulong  InpMagic      = 202401;  // Magic number
@@ -944,8 +945,9 @@ void OnTick()
     PrintFormat("SR_Zones_EA: NewBar | ResZones=%d SupZones=%d BrokenZones=%d ATR=%.5f",
                 resCount, supCount, brokenCount, atr);
 
-    // Volatility filter
-    if(!IsVolatilityAcceptable(_Symbol, _Period, InpAtrPeriod, InpMinAtrPips, InpMaxAtrPips))
+    // Volatility filter (disabled by default – enable and tune per instrument)
+    if(InpUseVolFilter &&
+       !IsVolatilityAcceptable(_Symbol, _Period, InpAtrPeriod, InpMinAtrPips, InpMaxAtrPips))
     {
         double atrPips = atr / GetPipSize(_Symbol);
         PrintFormat("SR_Zones_EA: Volatility filter blocked. ATR=%.1f pips (min=%.1f max=%.1f)",
