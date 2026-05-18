@@ -690,7 +690,7 @@ bool CheckRetestBuy(double atr, double &outEntry, double &outSL,
 
     for(int i = 0; i < brokenCount; i++)
     {
-        SZone &z = brokenZones[i];
+        SZone z = brokenZones[i];
         if(!z.isResistance || !z.wasBroken || z.diedBar < 0) continue;
 
         int age = currentBarIdx - z.diedBar;
@@ -732,7 +732,7 @@ bool CheckRetestSell(double atr, double &outEntry, double &outSL,
 
     for(int i = 0; i < brokenCount; i++)
     {
-        SZone &z = brokenZones[i];
+        SZone z = brokenZones[i];
         if(z.isResistance || !z.wasBroken || z.diedBar < 0) continue;
 
         int age = currentBarIdx - z.diedBar;
