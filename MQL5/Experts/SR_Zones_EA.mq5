@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.20"
+#property version   "1.21"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -68,7 +68,7 @@ struct SZone
 //+------------------------------------------------------------------+
 input group "=== Operation ==="
 input ENUM_OPERATION_MODE InpMode       = EA_MODE;         // Operation mode
-input string              InpMetaID     = "407DBF6E";              // MetaTrader ID (push notifications)
+input string              InpMetaID     = "";              // MetaTrader ID (push notifications) — MUST set your own device ID
 
 input group "=== Zone Detection ==="
 input ENUM_STRENGTH_PRESET_EA InpPreset = SWING_EA;        // Strength preset
@@ -771,6 +771,7 @@ bool CheckOBBuySignal(double atr, double &outEntry, double &outSL,
         {
             outEntry  = ask;
             outSL     = NormalizeDouble(ob.wickLow - atr * InpOBSlBuffer, _Digits);
+            if(outSL >= outEntry) continue; // inverted SL — OB body too tight or ATR too small
             outCenter = ob.mid;
             outType   = ob.fromChoch ? "OB (CHoCH)" : "OB (BOS)";
             return true;
@@ -798,6 +799,7 @@ bool CheckOBSellSignal(double atr, double &outEntry, double &outSL,
         {
             outEntry  = bid;
             outSL     = NormalizeDouble(ob.wickHigh + atr * InpOBSlBuffer, _Digits);
+            if(outSL <= outEntry) continue; // inverted SL — OB body too tight or ATR too small
             outCenter = ob.mid;
             outType   = ob.fromChoch ? "OB (CHoCH)" : "OB (BOS)";
             return true;
@@ -1072,8 +1074,10 @@ bool HasBullishPattern()
 {
     if(!InpReqCandle) return true;
     if(InpUseEngulf && IsBullEngulf()) return true;
-    if(InpUseDoji   && IsDoji())       return true;
     if(InpUseHammer && IsHammer())     return true;
+    // Doji: directionally neutral — counts only as bullish confluence (rejection of lower prices)
+    // Removed from HasBearishPattern to prevent bullConf AND bearConf both being true on same bar
+    if(InpUseDoji   && IsDoji())       return true;
     return false;
 }
 
@@ -1081,9 +1085,11 @@ bool HasBullishPattern()
 bool HasBearishPattern()
 {
     if(!InpReqCandle) return true;
-    if(InpUseEngulf && IsBearEngulf())      return true;
-    if(InpUseDoji   && IsDoji())            return true;
-    if(InpUseHammer && IsShootingStar())    return true;
+    if(InpUseEngulf && IsBearEngulf())   return true;
+    if(InpUseHammer && IsShootingStar()) return true;
+    // IsDoji intentionally excluded: doji is treated as a bullish-bias neutral pattern.
+    // Including it here caused bullConf AND bearConf to both be true simultaneously,
+    // which could fire opposing OB signals on the same bar in a ranging market.
     return false;
 }
 
@@ -1217,6 +1223,7 @@ bool CheckBuySignal(double atr, double &outEntry, double &outSL,
         {
             outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             outSL         = supZones[i].bot - atr * InpSlZoneBuffer;
+            if(outSL >= outEntry) continue; // inverted SL — zone too thin or ATR too small
             outZoneCenter = supZones[i].center;
             outZoneType   = "Support";
             return true;
@@ -1247,6 +1254,7 @@ bool CheckSellSignal(double atr, double &outEntry, double &outSL,
         {
             outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             outSL         = resZones[i].top + atr * InpSlZoneBuffer;
+            if(outSL <= outEntry) continue; // inverted SL — zone too thin or ATR too small
             outZoneCenter = resZones[i].center;
             outZoneType   = "Resistance";
             return true;
@@ -1289,6 +1297,7 @@ bool CheckRetestBuy(double atr, double &outEntry, double &outSL,
         {
             outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             outSL         = z.bot - atr * InpRetestSlBuffer;
+            if(outSL >= outEntry) continue;
             outZoneCenter = z.center;
             outZoneType   = "Flipped Support";
             return true;
@@ -1331,6 +1340,7 @@ bool CheckRetestSell(double atr, double &outEntry, double &outSL,
         {
             outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             outSL         = z.top + atr * InpRetestSlBuffer;
+            if(outSL <= outEntry) continue;
             outZoneCenter = z.center;
             outZoneType   = "Flipped Resistance";
             return true;
@@ -1501,6 +1511,9 @@ int OnInit()
         }
         pyramid.RecoverState();
     }
+
+    if(InpMetaID == "")
+        Print("SR_Zones_EA: WARNING — InpMetaID is empty. Push notifications will be silently skipped. Set your MetaTrader device ID in the inputs.");
 
     if(!RebuildAllZones())
         Print("SR_Zones_EA: Initial zone build incomplete – will retry on first bar.");
