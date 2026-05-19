@@ -1819,13 +1819,11 @@ void OnTick()
     if(atr <= 0) return;
 
     // Detect breaks on last closed bar BEFORE rebuilding zones
+    int barIdx = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
     double closeBuf[];
     ArraySetAsSeries(closeBuf, true);
     if(CopyClose(_Symbol, _Period, 0, 2, closeBuf) > 0)
-    {
-        int barIdx = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
         DetectBreaks(closeBuf[1], atr, barIdx);
-    }
 
     // Rebuild alive zones then update swing structure bias and OBs
     RebuildAllZones();
@@ -1885,7 +1883,6 @@ void OnTick()
     double tp1 = 0, tp2 = 0, tp3 = 0;
     string zoneType = "";
 
-    int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
 
     // Signal dispatch priority (highest quality first):
     //   1. OB (CHoCH/BOS) — single-candle precision, tightest SL
@@ -1951,7 +1948,7 @@ void OnTick()
 
     // --- 2a. BUY retest (broken resistance → flipped support) ---
     if(structAllowBuy && bullCandle &&
-       CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+       CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx))
     {
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
@@ -1982,7 +1979,7 @@ void OnTick()
 
     // --- 2b. SELL retest (broken support → flipped resistance) ---
     if(structAllowSell && bearCandle &&
-       CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
+       CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx))
     {
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
