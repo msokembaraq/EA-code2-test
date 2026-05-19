@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.16"
+#property version   "1.17"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -68,11 +68,14 @@ input int    InpZoneCount  = 6;     // Active zones per side
 input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter)
 input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
-input group "=== Swing Structure (BOS / Ranging / Manipulation) ==="
-input bool   InpUseStructure      = true;  // Use market structure as primary directional filter
-input int    InpStructureLookback = 3;     // Pivot highs/lows to compare for BOS (2-4)
-input double InpEqualTolerance    = 0.4;   // Equal high/low tolerance (x ATR) – range detection
-input bool   InpTradeManipulation = true;  // Trade wick sweep reversals at range boundaries
+input group "=== Swing Structure (BOS / CHoCH / Ranging / Manipulation) ==="
+input bool   InpUseStructure        = true;  // Use market structure as primary directional filter
+input int    InpStructureLookback   = 3;     // Pivot highs/lows to compare for BOS (2-4)
+input double InpEqualTolerance      = 0.4;   // Equal high/low tolerance (x ATR) – range detection
+input bool   InpTradeManipulation   = true;  // Trade wick sweep reversals at range boundaries
+input bool   InpDetectChoch         = true;  // Detect CHoCH (early trend flip signal)
+input double InpChochDisplacement   = 0.5;   // CHoCH break candle body must be >= X * ATR
+input bool   InpChochZoneConfluence = true;  // Require CHoCH swing high/low at known S/R zone
 
 input group "=== Trend Filter (HTF MA – optional, disabled by default) ==="
 input bool             InpUseTrendFilter = false;         // HTF MA filter (structure is primary)
@@ -171,8 +174,13 @@ int     structureBias    = 0;
 double  lastBullBOS      = 0;
 double  lastBearBOS      = 0;
 bool    isRanging        = false;
-double  rangeHigh        = 0;   // top of detected consolidation range
-double  rangeLow         = 0;   // bottom of detected consolidation range
+double  rangeHigh        = 0;
+double  rangeLow         = 0;
+// CHoCH tracking
+double  lastHL           = 0;   // last confirmed higher low (bullish trend)
+double  lastLH           = 0;   // last confirmed lower high (bearish trend)
+double  chochLevel       = 0;   // level of last CHoCH for logging
+bool    chochActive      = false; // CHoCH detected, waiting for BOS confirmation
 
 // Signal cooldown tracking per zone center
 double  sigCenters[];
@@ -613,6 +621,34 @@ int TrendDirection()
 //|   0 = ranging (equal HH + equal LL within ATR tolerance)        |
 //|       → buy at range low, sell at range high                     |
 //+------------------------------------------------------------------+
+// Returns true if price is within any zone of the given array
+bool IsAtKnownZone(double price, const SZone &zones[], int count)
+{
+    for(int i = 0; i < count; i++)
+        if(price >= zones[i].bot && price <= zones[i].top) return true;
+    return false;
+}
+
+// Adds a CHoCH level as a synthetic broken zone for retest tracking
+void AddChochZone(double level, double atr, bool wasResistance)
+{
+    if(brokenCount >= ArraySize(brokenZones)) ArrayResize(brokenZones, brokenCount + 10);
+    SZone z;
+    z.top          = NormalizeDouble(level + atr * 0.3, _Digits);
+    z.bot          = NormalizeDouble(level - atr * 0.3, _Digits);
+    z.center       = level;
+    z.strength     = 2.5;   // CHoCH levels carry high weight
+    z.touches      = 1;
+    z.isResistance = wasResistance;
+    z.wasBroken    = true;
+    z.isLiveBreak  = true;
+    z.firstBar     = 0;
+    z.lastTouch    = 0;
+    z.diedBar      = 0;
+    z.volSum       = 0;
+    brokenZones[brokenCount++] = z;
+}
+
 void UpdateStructureBias()
 {
     if(!InpUseStructure) { structureBias = 0; isRanging = false; return; }
@@ -634,38 +670,97 @@ void UpdateStructureBias()
     double highDiff = MathAbs(highPivots[hTop].price - highPivots[hTop-1].price);
     double lowDiff  = MathAbs(lowPivots[lTop].price  - lowPivots[lTop-1].price);
 
-    bool higherHigh  = (highPivots[hTop].price > highPivots[hTop-1].price + tol);
-    bool lowerHigh   = (highPivots[hTop].price < highPivots[hTop-1].price - tol);
-    bool equalHigh   = (highDiff <= tol);
+    bool higherHigh = (highPivots[hTop].price > highPivots[hTop-1].price + tol);
+    bool lowerHigh  = (highPivots[hTop].price < highPivots[hTop-1].price - tol);
+    bool equalHigh  = (highDiff <= tol);
 
-    bool higherLow   = (lowPivots[lTop].price  > lowPivots[lTop-1].price  + tol);
-    bool lowerLow    = (lowPivots[lTop].price  < lowPivots[lTop-1].price  - tol);
-    bool equalLow    = (lowDiff <= tol);
+    bool higherLow  = (lowPivots[lTop].price  > lowPivots[lTop-1].price  + tol);
+    bool lowerLow   = (lowPivots[lTop].price  < lowPivots[lTop-1].price  - tol);
+    bool equalLow   = (lowDiff <= tol);
 
-    int    prevBias    = structureBias;
-    bool   prevRanging = isRanging;
+    // Track lastHL and lastLH from confirmed pivots
+    if(structureBias == 1 && higherLow)   lastHL = lowPivots[lTop].price;
+    if(structureBias == -1 && lowerHigh)  lastLH = highPivots[hTop].price;
 
+    int  prevBias    = structureBias;
+    bool prevRanging = isRanging;
+
+    // ── CHoCH detection ───────────────────────────────────────────────
+    if(InpDetectChoch)
+    {
+        double close1  = iClose(_Symbol, _Period, 1);
+        double open1   = iOpen(_Symbol,  _Period, 1);
+        double body1   = MathAbs(close1 - open1);
+        bool   displaced = (atr > 0 && body1 >= atr * InpChochDisplacement);
+
+        // Bearish CHoCH: bullish trend, price closes below last HL
+        // Confluence: the swing high that formed LH is at a known resistance zone
+        if(structureBias == 1 && lastHL > 0 && close1 < lastHL && displaced)
+        {
+            bool zoneConf = !InpChochZoneConfluence ||
+                            IsAtKnownZone(highPivots[hTop].price, resZones, resCount);
+
+            if(zoneConf)
+            {
+                chochLevel  = lastHL;
+                chochActive = true;
+                AddChochZone(lastHL, atr, false); // lastHL was support, now resistance
+                structureBias = -1;
+                isRanging     = false;
+                lastBearBOS   = lastHL;
+                PrintFormat("SR_Zones_EA: CHoCH BEARISH | Broke HL=%.2f | SwingHigh=%.2f at ResZone=%s",
+                            lastHL, highPivots[hTop].price,
+                            zoneConf ? "YES" : "NO");
+                return;
+            }
+        }
+
+        // Bullish CHoCH: bearish trend, price closes above last LH
+        // Confluence: the swing low that formed HL is at a known support zone
+        if(structureBias == -1 && lastLH > 0 && close1 > lastLH && displaced)
+        {
+            bool zoneConf = !InpChochZoneConfluence ||
+                            IsAtKnownZone(lowPivots[lTop].price, supZones, supCount);
+
+            if(zoneConf)
+            {
+                chochLevel  = lastLH;
+                chochActive = true;
+                AddChochZone(lastLH, atr, true); // lastLH was resistance, now support
+                structureBias = 1;
+                isRanging     = false;
+                lastBullBOS   = lastLH;
+                PrintFormat("SR_Zones_EA: CHoCH BULLISH | Broke LH=%.2f | SwingLow=%.2f at SupZone=%s",
+                            lastLH, lowPivots[lTop].price,
+                            zoneConf ? "YES" : "NO");
+                return;
+            }
+        }
+    }
+    // ── BOS detection ─────────────────────────────────────────────────
     if(higherHigh && higherLow)
     {
         if(structureBias != 1) lastBullBOS = highPivots[hTop].price;
         structureBias = 1;
         isRanging     = false;
+        chochActive   = false; // full BOS confirmed, CHoCH phase over
     }
     else if(lowerHigh && lowerLow)
     {
         if(structureBias != -1) lastBearBOS = lowPivots[lTop].price;
         structureBias = -1;
         isRanging     = false;
+        chochActive   = false;
     }
     else if(equalHigh && equalLow)
     {
-        // Consolidation: equal highs + equal lows
         rangeHigh     = MathMax(highPivots[hTop].price, highPivots[hTop-1].price);
         rangeLow      = MathMin(lowPivots[lTop].price,  lowPivots[lTop-1].price);
         structureBias = 0;
         isRanging     = true;
+        chochActive   = false;
     }
-    // Mixed (HH+LL or LH+HL) → hold previous state
+    // Mixed → hold previous state
 
     if(structureBias != prevBias || isRanging != prevRanging)
     {
@@ -673,9 +768,10 @@ void UpdateStructureBias()
             PrintFormat("SR_Zones_EA: Structure → RANGING | High=%.2f Low=%.2f",
                         rangeHigh, rangeLow);
         else
-            PrintFormat("SR_Zones_EA: Structure BOS → %s | Level=%.2f",
+            PrintFormat("SR_Zones_EA: Structure BOS → %s | Level=%.2f%s",
                         structureBias > 0 ? "BULLISH" : "BEARISH",
-                        structureBias > 0 ? lastBullBOS : lastBearBOS);
+                        structureBias > 0 ? lastBullBOS : lastBearBOS,
+                        chochActive ? " (CHoCH→BOS confirmed)" : "");
     }
 }
 
