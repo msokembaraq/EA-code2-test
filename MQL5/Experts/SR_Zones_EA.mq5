@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.21"
+#property version   "1.22"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -83,7 +83,6 @@ input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
 input group "=== Swing Structure (BOS / CHoCH / Ranging / Manipulation) ==="
 input bool   InpUseStructure        = true;  // Use market structure as primary directional filter
-input int    InpStructureLookback   = 3;     // Pivot highs/lows to compare for BOS (2-4)
 input double InpEqualTolerance      = 0.4;   // Equal high/low tolerance (x ATR) – range detection
 input bool   InpTradeManipulation   = true;  // Trade wick sweep reversals at range boundaries
 input bool   InpDetectChoch         = true;  // Detect CHoCH (early trend flip signal)
@@ -171,7 +170,6 @@ int             pivLeft, pivRight;
 double          clusterTol;
 int             minSpacing;
 datetime        lastBarTime = 0;
-datetime        lastSignalTime = 0;
 
 SPivot  highPivots[], lowPivots[];
 int     highPivotCount = 0, lowPivotCount = 0;
@@ -1809,7 +1807,6 @@ void OnTick()
     // Bullish sweep: wick below rangeLow, close back inside → accumulation → BUY
     if(bullManip && bullConf && CooldownOk(rangeLow, atr))
     {
-        double pip  = GetPipSize(_Symbol);
         double atrV = atr;
         entry       = iClose(_Symbol, _Period, 1);
         sl          = NormalizeDouble(rangeLow - atrV * InpRetestSlBuffer, _Digits);
