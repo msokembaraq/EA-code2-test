@@ -66,11 +66,11 @@ struct SZone
 //+------------------------------------------------------------------+
 //| INPUTS                                                           |
 //+------------------------------------------------------------------+
-input group "=== OPERATION ==="
+input group "============== OPERATION =============="
 input ENUM_OPERATION_MODE InpMode       = EA_MODE;         // Operation mode
 input string              InpMetaID     = "407DBF6E";              // MetaTrader ID (push notifications) — MUST set your own device ID
 
-input group "=== ZONE DETECTION ==="
+input group "============== ZONE DETECTION =============="
 input ENUM_STRENGTH_PRESET_EA InpPreset = SWING_EA;        // Strength preset
 input int    InpPivLeft    = 15;    // Left bars
 input int    InpPivRight   = 8;     // Right bars
@@ -81,7 +81,7 @@ input int    InpZoneCount  = 6;     // Active zones per side
 input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter)
 input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
-input group "=== SWING STRUCTURE (BOS / CHoCH / RANGING / MANIPULATION) ==="
+input group "============== SWING STRUCTURE =============="
 input bool   InpUseStructure        = true;  // Use market structure as primary directional filter
 input double InpEqualTolerance      = 0.4;   // Equal high/low tolerance (x ATR) – range detection
 input bool   InpTradeManipulation   = true;  // Trade wick sweep reversals at range boundaries
@@ -89,20 +89,20 @@ input bool   InpDetectChoch         = true;  // Detect CHoCH (early trend flip s
 input double InpChochDisplacement   = 0.5;   // CHoCH break candle body must be >= X * ATR
 input bool   InpChochZoneConfluence = true;  // Require CHoCH swing high/low at known S/R zone
 
-input group "=== ORDER BLOCKS ==="
+input group "============== ORDER BLOCKS =============="
 input bool   InpUseOB           = true;  // Detect and trade Order Block retests
 input int    InpOBLookback      = 10;    // Bars to scan back for OB candle after BOS/CHoCH
 input int    InpMaxOBZones      = 6;     // Max active OBs to track per side
 input double InpOBSlBuffer      = 1.0;   // SL buffer beyond OB wick (x ATR)
 
-input group "=== ENTRY FILTER ==="
+input group "============== ENTRY FILTER =============="
 input int    InpSigCooldownBars = 20;    // Bars between signals on same zone (M5: 20 bars = 100 min)
 input bool   InpUseVolFilter    = false; // Enable ATR volatility filter (disable for Gold/indices)
 input double InpMinAtrPips      = 5;     // Min ATR pips (forex) / points (Gold: ~100)
 input double InpMaxAtrPips      = 2000;  // Max ATR pips (forex: ~80) / points (Gold: ~2000)
 input int    InpAtrPeriod       = 14;    // ATR period
 
-input group "=== TRADE SETTINGS (EA MODE) ==="
+input group "============== TRADE SETTINGS =============="
 input ulong  InpMagic      = 202401;  // Magic number
 input int    InpSlippage   = 10;      // Slippage (points)
 input double InpLotInitial = 0.05;    // Initial lot (largest)
@@ -111,7 +111,7 @@ input double InpLotAddon2  = 0.02;    // Add-on 2 lot
 input bool   InpUseSL      = true;    // Use stop loss (false = open trades with no SL)
 input double InpSlZoneBuffer = 1.5;   // SL buffer beyond zone edge (x ATR) – 1.5x gives breathing room
 
-input group "=== PYRAMID TRIGGERS ==="
+input group "============== PYRAMID TRIGGERS =============="
 input double InpAddon1TrigPips  = 1500; // Add-on 1 trigger (pips) – Gold: 1500 = $15 sustained move
 input double InpAddon2TrigPips  = 2500; // Add-on 2 trigger (pips) – Gold: 2500 = $25
 input double InpStopAddon1Pips  = 300;  // SL above entry after add-on 1 – Gold $3 (gap to addon=$12, > broker min)
@@ -120,13 +120,13 @@ input bool   InpTrailAfterFull  = true; // Trail after full pyramid
 input double InpTrailPips       = 200;  // Trail distance – Gold: 200 = $2
 input double InpTrailStepPips   = 200;  // Trail step – Gold: 200 = $2.00 (min move before SL advances)
 
-input group "=== ROLE FLIP RETESTS ==="
+input group "============== ROLE FLIP RETESTS =============="
 input bool   InpUseRetests       = true;  // Trade/signal role-flip retests
 input bool   InpRetestOnly       = true;  // Only trade retests (skip raw bounce signals)
 input int    InpRetestWindowBars = 80;    // Max bars after break to accept retest
 input double InpRetestSlBuffer   = 1.5;  // SL buffer beyond flipped zone (x ATR)
 
-input group "=== MANUAL TRADE MANAGER (SIGNAL MODE) ==="
+input group "============== MANUAL TRADE MANAGER =============="
 input bool   InpManageManual    = true;  // Manage manually opened trades
 input double InpManualBePips    = 20;    // Move SL to breakeven after (pips)
 input double InpManualBeBuffer  = 2;     // Breakeven buffer beyond entry (pips)
@@ -134,7 +134,7 @@ input bool   InpManualTrail     = true;  // Enable trailing stop on manual trade
 input double InpManualTrailPips = 15;    // Trail distance (pips)
 input double InpManualTrailStep = 5;     // Min pips to move trail
 
-input group "=== CANDLE CONFLUENCE (ZONE CONFIRMATION) ==="
+input group "============== ZONE CONFIRMATION =============="
 input bool   InpReqCandle       = true;  // Require at least one candle pattern at zone
 input bool   InpUseEngulf       = true;  // Engulfing candle (body fully engulfs prev bar)
 input bool   InpUseDoji         = true;  // Doji (body ≤ DojiBodyPct % of candle range)
@@ -142,7 +142,6 @@ input double InpDojiBodyPct     = 10.0;  // Doji max body % of total range (defa
 input bool   InpUseHammer       = true;  // Hammer / Shooting Star (wick 2x body, small opp wick)
 input double InpHammerWickMult  = 2.0;   // Hammer wick must be >= X * body size
 input double InpHammerOppWickPct= 30.0;  // Max opposite wick as % of body (default 30%)
-
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -220,15 +219,9 @@ void SaveState()
     FileWriteLong(fh, (long)TimeCurrent());
 
     // Structure state
-    FileWriteInteger(fh, structureBias);
-    FileWriteInteger(fh, (int)isRanging);
-    FileWriteDouble(fh,  rangeHigh);
-    FileWriteDouble(fh,  rangeLow);
-    FileWriteDouble(fh,  lastHL);
-    FileWriteDouble(fh,  lastLH);
-    FileWriteDouble(fh,  chochLevel);
-    FileWriteInteger(fh, (int)chochActive);
-    FileWriteDouble(fh,  lastBullBOS);
+    FileWriteInteger(fh, structureBias); FileWriteInteger(fh, (int)isRanging); FileWriteDouble(fh,  rangeHigh);
+    FileWriteDouble(fh,  rangeLow); FileWriteDouble(fh,  lastHL); FileWriteDouble(fh,  lastLH);
+    FileWriteDouble(fh,  chochLevel); FileWriteInteger(fh, (int)chochActive); FileWriteDouble(fh,  lastBullBOS);
     FileWriteDouble(fh,  lastBearBOS);
 
     // Broken zones (flipped S/R — needed for retest signals after restart)
@@ -288,15 +281,9 @@ void LoadState()
 
     // Structure scalars – only restore if file is recent (< 4 hours)
     int  s_bias    = FileReadInteger(fh);
-    bool s_ranging = (bool)FileReadInteger(fh);
-    double s_rangeHigh  = FileReadDouble(fh);
-    double s_rangeLow   = FileReadDouble(fh);
-    double s_lastHL     = FileReadDouble(fh);
-    double s_lastLH     = FileReadDouble(fh);
-    double s_chochLevel = FileReadDouble(fh);
-    bool   s_chochActive= (bool)FileReadInteger(fh);
-    double s_bullBOS    = FileReadDouble(fh);
-    double s_bearBOS    = FileReadDouble(fh);
+    bool s_ranging = (bool)FileReadInteger(fh);     double s_rangeHigh  = FileReadDouble(fh);     double s_rangeLow   = FileReadDouble(fh);
+    double s_lastHL     = FileReadDouble(fh);    double s_lastLH     = FileReadDouble(fh);     double s_chochLevel = FileReadDouble(fh);
+    bool   s_chochActive= (bool)FileReadInteger(fh);    double s_bullBOS    = FileReadDouble(fh);     double s_bearBOS    = FileReadDouble(fh);
 
     if(!stateOld)
     {
