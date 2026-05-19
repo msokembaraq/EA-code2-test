@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.23"
+#property version   "1.24"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -208,6 +208,198 @@ bool    chochActive      = false; // CHoCH detected, waiting for BOS confirmatio
 double  sigCenters[];
 datetime sigTimes[];
 int     sigCoolCount = 0;
+
+//+------------------------------------------------------------------+
+//| State persistence (survives restart and terminal shutdown)       |
+//+------------------------------------------------------------------+
+// Bump this number whenever SZone or SOrderBlock struct layout changes
+#define STATE_VERSION 1
+
+// File is per symbol+period so multiple charts don't clash
+string StateFileName()
+{
+    return StringFormat("SR_ZonesEA_%s_%s.bin", _Symbol, EnumToString(_Period));
+}
+
+void SaveState()
+{
+    int fh = FileOpen(StateFileName(), FILE_WRITE | FILE_BIN);
+    if(fh == INVALID_HANDLE)
+    {
+        PrintFormat("SR_Zones_EA: SaveState – cannot open file. Err=%d", GetLastError());
+        return;
+    }
+
+    FileWriteInteger(fh, STATE_VERSION);
+    FileWriteLong(fh, (long)TimeCurrent());
+
+    // Structure state
+    FileWriteInteger(fh, structureBias);
+    FileWriteInteger(fh, (int)isRanging);
+    FileWriteDouble(fh,  rangeHigh);
+    FileWriteDouble(fh,  rangeLow);
+    FileWriteDouble(fh,  lastHL);
+    FileWriteDouble(fh,  lastLH);
+    FileWriteDouble(fh,  chochLevel);
+    FileWriteInteger(fh, (int)chochActive);
+    FileWriteDouble(fh,  lastBullBOS);
+    FileWriteDouble(fh,  lastBearBOS);
+
+    // Broken zones (flipped S/R — needed for retest signals after restart)
+    FileWriteInteger(fh, brokenCount);
+    for(int i = 0; i < brokenCount; i++)
+        FileWriteStruct(fh, brokenZones[i]);
+
+    // Active OB zones
+    int activeOBs = 0;
+    for(int i = 0; i < obCount; i++)
+        if(obZones[i].active) activeOBs++;
+    FileWriteInteger(fh, activeOBs);
+    for(int i = 0; i < obCount; i++)
+        if(obZones[i].active) FileWriteStruct(fh, obZones[i]);
+
+    // Cooldowns (prevent same zone firing again on immediate restart)
+    FileWriteInteger(fh, sigCoolCount);
+    for(int i = 0; i < sigCoolCount; i++)
+    {
+        FileWriteDouble(fh, sigCenters[i]);
+        FileWriteLong(fh,   (long)sigTimes[i]);
+    }
+
+    FileClose(fh);
+    PrintFormat("SR_Zones_EA: State saved → %d broken zones, %d OBs, %d cooldowns",
+                brokenCount, activeOBs, sigCoolCount);
+}
+
+void LoadState()
+{
+    string fname = StateFileName();
+    if(!FileIsExist(fname))
+    {
+        Print("SR_Zones_EA: No saved state file found – starting fresh.");
+        return;
+    }
+
+    int fh = FileOpen(fname, FILE_READ | FILE_BIN);
+    if(fh == INVALID_HANDLE)
+    {
+        PrintFormat("SR_Zones_EA: LoadState – cannot open file. Err=%d", GetLastError());
+        return;
+    }
+
+    // Version check
+    int ver = FileReadInteger(fh);
+    if(ver != STATE_VERSION)
+    {
+        Print("SR_Zones_EA: State file version mismatch – skipping load. Will rebuild from scratch.");
+        FileClose(fh);
+        return;
+    }
+
+    datetime savedAt  = (datetime)FileReadLong(fh);
+    int      ageMin   = (int)((TimeCurrent() - savedAt) / 60);
+    bool     stateOld = (TimeCurrent() - savedAt > 14400); // > 4 hours: structure scalars may be stale
+
+    // Structure scalars – only restore if file is recent (< 4 hours)
+    int  s_bias    = FileReadInteger(fh);
+    bool s_ranging = (bool)FileReadInteger(fh);
+    double s_rangeHigh  = FileReadDouble(fh);
+    double s_rangeLow   = FileReadDouble(fh);
+    double s_lastHL     = FileReadDouble(fh);
+    double s_lastLH     = FileReadDouble(fh);
+    double s_chochLevel = FileReadDouble(fh);
+    bool   s_chochActive= (bool)FileReadInteger(fh);
+    double s_bullBOS    = FileReadDouble(fh);
+    double s_bearBOS    = FileReadDouble(fh);
+
+    if(!stateOld)
+    {
+        structureBias = s_bias;
+        isRanging     = s_ranging;
+        rangeHigh     = s_rangeHigh;
+        rangeLow      = s_rangeLow;
+        lastHL        = s_lastHL;
+        lastLH        = s_lastLH;
+        chochLevel    = s_chochLevel;
+        chochActive   = s_chochActive;
+        lastBullBOS   = s_bullBOS;
+        lastBearBOS   = s_bearBOS;
+    }
+
+    // Broken zones – always restore regardless of age (zone flips stay valid for days)
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    double atr = 0;
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0) atr = atrBuf[0];
+    double tol = (atr > 0) ? atr * clusterTol * 0.7 : SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 50;
+
+    int savedBroken = FileReadInteger(fh);
+    int mergedIn    = 0;
+    for(int i = 0; i < savedBroken; i++)
+    {
+        SZone z;
+        FileReadStruct(fh, z);
+        // Deduplicate against zones already built by RebuildAllZones
+        bool dup = false;
+        for(int j = 0; j < brokenCount; j++)
+            if(brokenZones[j].isResistance == z.isResistance &&
+               MathAbs(brokenZones[j].center - z.center) <= tol)
+                { dup = true; break; }
+        if(!dup)
+        {
+            if(brokenCount >= ArraySize(brokenZones)) ArrayResize(brokenZones, brokenCount + 10);
+            brokenZones[brokenCount++] = z;
+            mergedIn++;
+        }
+    }
+
+    // OB zones – restore if < 8 hours old
+    int savedOBs = FileReadInteger(fh);
+    int obMerged = 0;
+    if(TimeCurrent() - savedAt <= 28800)
+    {
+        for(int i = 0; i < savedOBs; i++)
+        {
+            SOrderBlock ob;
+            FileReadStruct(fh, ob);
+            if(obCount >= ArraySize(obZones)) ArrayResize(obZones, obCount + 10);
+            obZones[obCount++] = ob;
+            obMerged++;
+        }
+    }
+    else
+    {
+        // Skip OB data (file position must still be advanced)
+        for(int i = 0; i < savedOBs; i++) { SOrderBlock ob; FileReadStruct(fh, ob); }
+    }
+
+    // Cooldowns – restore only if still within cooldown window
+    int savedCools = FileReadInteger(fh);
+    for(int i = 0; i < savedCools; i++)
+    {
+        double ctr  = FileReadDouble(fh);
+        datetime ct = (datetime)FileReadLong(fh);
+        int elapsed = (int)(TimeCurrent() - ct);
+        if(elapsed < InpSigCooldownBars * (int)PeriodSeconds(_Period))
+        {
+            if(sigCoolCount >= ArraySize(sigCenters))
+            {
+                ArrayResize(sigCenters, sigCoolCount + 10);
+                ArrayResize(sigTimes,   sigCoolCount + 10);
+            }
+            sigCenters[sigCoolCount] = ctr;
+            sigTimes[sigCoolCount]   = ct;
+            sigCoolCount++;
+        }
+    }
+
+    FileClose(fh);
+    PrintFormat("SR_Zones_EA: State loaded (%d min old) | Bias=%s%s | +%d broken zones | +%d OBs | %d cooldowns active",
+                ageMin,
+                stateOld ? "STALE-skipped" : (structureBias > 0 ? "BULLISH" : structureBias < 0 ? "BEARISH" : isRanging ? "RANGING" : "UNCLEAR"),
+                stateOld ? "" : "",
+                mergedIn, obMerged, sigCoolCount);
+}
 
 //+------------------------------------------------------------------+
 //| Utility: safe volume guard                                       |
@@ -1524,8 +1716,11 @@ int OnInit()
     if(!RebuildAllZones())
         Print("SR_Zones_EA: Initial zone build incomplete – will retry on first bar.");
 
+    // Restore broken zones, OBs, structure state, and cooldowns from last session
+    LoadState();
+
     Print("SR_Zones_EA: Initialized. Mode=", (InpMode == EA_MODE ? "EA" : "SIGNAL"),
-          " Res=", resCount, " Sup=", supCount);
+          " Res=", resCount, " Sup=", supCount, " Broken=", brokenCount);
     return INIT_SUCCEEDED;
 }
 
@@ -1534,6 +1729,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    SaveState();
     IndicatorRelease(atrHandle);
     IndicatorRelease(atrZoneHandle);
     IndicatorRelease(trendMAHandle);
