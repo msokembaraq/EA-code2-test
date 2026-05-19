@@ -175,7 +175,6 @@ int     lastBreakCheckBar = -1;
 
 // Log throttle: only print zone details when counts change
 int     lastLogRes = -1, lastLogSup = -1, lastLogBroken = -1;
-int     lastLogStructure = 0;  // throttle structure bias log
 
 // Swing structure state
 // +1 = bullish BOS (HH+HL)  -1 = bearish BOS (LH+LL)  0 = ranging/unclear
@@ -209,7 +208,7 @@ int     sigCoolCount = 0;
 // File is per symbol+period so multiple charts don't clash
 string StateFileName()
 {
-    return StringFormat("SR_ZonesEA_%s_%s.bin", _Symbol, EnumToString(_Period));
+    return StringFormat("SR_ZonesEA_%s_%s_%d.bin", _Symbol, EnumToString(_Period), InpMagic);
 }
 
 void SaveState()
@@ -388,7 +387,7 @@ void LoadState()
     PrintFormat("SR_Zones_EA: State loaded (%d min old) | Bias=%s%s | +%d broken zones | +%d OBs | %d cooldowns active",
                 ageMin,
                 stateOld ? "STALE-skipped" : (structureBias > 0 ? "BULLISH" : structureBias < 0 ? "BEARISH" : isRanging ? "RANGING" : "UNCLEAR"),
-                stateOld ? "" : "",
+                (!stateOld && chochActive) ? " CHoCH" : "",
                 mergedIn, obMerged, sigCoolCount);
 }
 
@@ -1267,9 +1266,12 @@ bool HasBearishPattern()
 // Logic: HTF stochastic K must be in OB/OS zone AND K must cross D on the
 // last completed HTF bar (K[2] on opposite side of D[2], K[1] crossed over D[1])
 // StochDirection: momentum confluence filter.
-// Returns +1 on bullish K/D cross (any zone), -1 on bearish K/D cross, 0 if no cross on closed bar.
-// The cross is the signal — it confirms momentum turning at the area of interest.
-// OB/OS zones = extreme crosses; mid zone = pullback/continuation crosses. All are valid.
+// Returns +1 on bullish K/D cross, -1 on bearish K/D cross, 0 if no cross on closed bar.
+// The cross is the signal — confirms momentum turning at the area of interest.
+// Zone qualification makes InpStochOB/OS meaningful:
+//   Bull cross only valid when K < InpStochOB (crossing up from OS or mid, not already deep OB)
+//   Bear cross only valid when K > InpStochOS (crossing down from OB or mid, not already deep OS)
+// OB/OS zones = extreme reversal crosses; mid zone = pullback/continuation crosses.
 int StochDirection()
 {
     double kBuf[], dBuf[];
@@ -1281,9 +1283,9 @@ int StochDirection()
     double k1 = kBuf[1], k2 = kBuf[2]; // bar[1] = last closed bar
     double d1 = dBuf[1], d2 = dBuf[2];
 
-    if(k2 < d2 && k1 >= d1) return  1; // K crossed above D — bullish momentum
-    if(k2 > d2 && k1 <= d1) return -1; // K crossed below D — bearish momentum
-    return 0;                           // no cross — no confirmation
+    if(k2 < d2 && k1 >= d1 && k1 < InpStochOB) return  1; // K crossed above D, not in OB zone
+    if(k2 > d2 && k1 <= d1 && k1 > InpStochOS) return -1; // K crossed below D, not in OS zone
+    return 0;
 }
 
 
@@ -1524,7 +1526,6 @@ void ManageManualTrades()
     if(!InpManageManual) return;
 
     double pip      = GetPipSize(_Symbol);
-    double be_dist  = InpManualBePips    * pip;
     double be_buf   = InpManualBeBuffer  * pip;
     double tr_dist  = InpManualTrailPips * pip;
     double tr_step  = InpManualTrailStep * pip;
@@ -1968,9 +1969,8 @@ void OnTick()
     // Bullish sweep: wick below rangeLow, close back inside → accumulation → BUY
     if(bullManip && bullConf && CooldownOk(rangeLow, atr))
     {
-        double atrV = atr;
         entry       = iClose(_Symbol, _Period, 1);
-        sl          = NormalizeDouble(rangeLow - atrV * InpRetestSlBuffer, _Digits);
+        sl          = NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits);
         FindTpTargets(entry, 1, tp1, tp2, tp3);
         zoneCenter  = rangeLow;
         zoneType    = "Range Low Sweep";
@@ -1993,9 +1993,8 @@ void OnTick()
     // Bearish sweep: wick above rangeHigh, close back inside → distribution → SELL
     if(bearManip && bearConf && CooldownOk(rangeHigh, atr))
     {
-        double atrV = atr;
         entry       = iClose(_Symbol, _Period, 1);
-        sl          = NormalizeDouble(rangeHigh + atrV * InpRetestSlBuffer, _Digits);
+        sl          = NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits);
         FindTpTargets(entry, -1, tp1, tp2, tp3);
         zoneCenter  = rangeHigh;
         zoneType    = "Range High Sweep";
