@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.25"
+#property version   "1.28"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -117,7 +117,7 @@ input double InpStopAddon1Pips  = 300;  // SL above entry after add-on 1 – Gol
 input double InpStopAddon2Pips  = 1200; // SL above entry after add-on 2 – Gold $12 (must be > addon1 stop)
 input bool   InpTrailAfterFull  = true; // Trail after full pyramid
 input double InpTrailPips       = 200;  // Trail distance – Gold: 200 = $2
-input double InpTrailStepPips   = 50;   // Trail step – Gold: 50 = $0.50
+input double InpTrailStepPips   = 200;  // Trail step – Gold: 200 = $2.00 (min move before SL advances)
 
 input group "=== Role Flip Retests ==="
 input bool   InpUseRetests       = true;  // Trade/signal role-flip retests
@@ -746,30 +746,32 @@ void RecordCooldown(double center)
 //+------------------------------------------------------------------+
 //| Find up to 3 nearest zones above or below a price level          |
 //| direction=1 → targets above (for buys), direction=-1 → below    |
+//| minDist: zones closer than this to fromPrice are skipped         |
+//|          (pass 1*ATR to avoid microscopic/at-entry TPs)          |
 //+------------------------------------------------------------------+
-int FindTpTargets(double fromPrice, int direction, double &tp1, double &tp2, double &tp3)
+int FindTpTargets(double fromPrice, int direction, double &tp1, double &tp2, double &tp3,
+                  double minDist = 0)
 {
     double candidates[50];
     int    count = 0;
 
-    // Collect centers from opposite side
+    // Collect centers from opposite side, enforcing minimum distance
     if(direction == 1) // targets above → use resistance zone centers
     {
         for(int i = 0; i < resCount; i++)
-            if(resZones[i].diedBar < 0 && resZones[i].center > fromPrice)
+            if(resZones[i].diedBar < 0 && resZones[i].center > fromPrice + minDist)
                 if(count < 50) candidates[count++] = resZones[i].center;
-        // also include support zones that are above price (broken and acting as resistance)
         for(int i = 0; i < supCount; i++)
-            if(supZones[i].diedBar < 0 && supZones[i].center > fromPrice)
+            if(supZones[i].diedBar < 0 && supZones[i].center > fromPrice + minDist)
                 if(count < 50) candidates[count++] = supZones[i].center;
     }
     else // targets below → use support zone centers
     {
         for(int i = 0; i < supCount; i++)
-            if(supZones[i].diedBar < 0 && supZones[i].center < fromPrice)
+            if(supZones[i].diedBar < 0 && supZones[i].center < fromPrice - minDist)
                 if(count < 50) candidates[count++] = supZones[i].center;
         for(int i = 0; i < resCount; i++)
-            if(resZones[i].diedBar < 0 && resZones[i].center < fromPrice)
+            if(resZones[i].diedBar < 0 && resZones[i].center < fromPrice - minDist)
                 if(count < 50) candidates[count++] = resZones[i].center;
     }
 
@@ -1756,10 +1758,7 @@ void OnTick()
     }
 
     if(InpMode == EA_MODE && pyramid.IsActive())
-    {
-        Print("SR_Zones_EA: Pyramid active – skipping entry check.");
         return;
-    }
 
     // Evaluate candle pattern and stochastic cross — both required when stoch is enabled
     bool bullCandle  = HasBullishPattern();
@@ -1804,7 +1803,7 @@ void OnTick()
     if(hasBullOB && bullConf && CooldownOk(obBuyCenter, atr))
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
-        FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob);
+        FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob, atr);
         RecordCooldown(obBuyCenter);
         Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
               " Entry=", obBuyEntry, " SL=", obBuySL);
@@ -1825,7 +1824,7 @@ void OnTick()
     if(hasBearOB && bearConf && CooldownOk(obSelCenter, atr))
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
-        FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob);
+        FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob, atr);
         RecordCooldown(obSelCenter);
         Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
               " Entry=", obSelEntry, " SL=", obSelSL);
@@ -1848,7 +1847,7 @@ void OnTick()
     {
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
-        FindTpTargets(entry, 1, tp1, tp2, tp3);
+        FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
@@ -1875,7 +1874,7 @@ void OnTick()
     {
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
-        FindTpTargets(entry, -1, tp1, tp2, tp3);
+        FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
@@ -1902,7 +1901,7 @@ void OnTick()
     {
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
-        FindTpTargets(entry, 1, tp1, tp2, tp3);
+        FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
@@ -1929,7 +1928,7 @@ void OnTick()
     {
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
-        FindTpTargets(entry, -1, tp1, tp2, tp3);
+        FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
@@ -1956,7 +1955,7 @@ void OnTick()
     {
         entry       = iClose(_Symbol, _Period, 1);
         sl          = NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits);
-        FindTpTargets(entry, 1, tp1, tp2, tp3);
+        FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
         zoneCenter  = rangeLow;
         zoneType    = "Range Low Sweep";
         RecordCooldown(zoneCenter);
@@ -1980,7 +1979,7 @@ void OnTick()
     {
         entry       = iClose(_Symbol, _Period, 1);
         sl          = NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits);
-        FindTpTargets(entry, -1, tp1, tp2, tp3);
+        FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
         zoneCenter  = rangeHigh;
         zoneType    = "Range High Sweep";
         RecordCooldown(zoneCenter);

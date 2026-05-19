@@ -47,6 +47,7 @@ private:
     double          m_trail_step_pips;
     bool            m_initialized;
     bool            m_sl_needs_retry;   // retry SL modify when broker rejected on addon open
+    datetime        m_last_trail_bar;   // throttle: one trail update per bar
 
     void            ResetState();
     bool            ModifyAllStops(double new_stop);
@@ -77,6 +78,7 @@ CPyramidEngine::CPyramidEngine()
 {
     m_initialized    = false;
     m_sl_needs_retry = false;
+    m_last_trail_bar = 0;
     ResetState();
 }
 
@@ -398,35 +400,41 @@ void CPyramidEngine::Manage()
             Print("PyramidEngine: Addon2 failed. Err=", GetLastError());
     }
 
-    // Trailing stop after full pyramid
+    // Trailing stop after full pyramid — evaluated once per bar to avoid broker spam
     if(m_trail_after_full && m_state.addon1_open && m_state.addon2_open)
     {
-        double trail_dist = m_trail_pips      * pip;
-        double trail_step = m_trail_step_pips * pip;
-
-        if(m_state.direction == POSITION_TYPE_BUY)
+        datetime bar_time = iTime(_Symbol, _Period, 0);
+        if(bar_time != m_last_trail_bar)
         {
-            double candidate = NormalizeDouble(bid - trail_dist, _Digits);
-            if(candidate > m_state.unified_stop + trail_step)
+            m_last_trail_bar = bar_time;
+
+            double trail_dist = m_trail_pips      * pip;
+            double trail_step = m_trail_step_pips * pip;
+
+            if(m_state.direction == POSITION_TYPE_BUY)
             {
-                if(!ModifyAllStops(candidate))
+                double candidate = NormalizeDouble(bid - trail_dist, _Digits);
+                if(candidate > m_state.unified_stop + trail_step)
                 {
-                    m_state.unified_stop = candidate;
-                    m_sl_needs_retry     = true;
-                    Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
+                    if(!ModifyAllStops(candidate))
+                    {
+                        m_state.unified_stop = candidate;
+                        m_sl_needs_retry     = true;
+                        Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
+                    }
                 }
             }
-        }
-        else
-        {
-            double candidate = NormalizeDouble(ask + trail_dist, _Digits);
-            if(candidate < m_state.unified_stop - trail_step)
+            else
             {
-                if(!ModifyAllStops(candidate))
+                double candidate = NormalizeDouble(ask + trail_dist, _Digits);
+                if(candidate < m_state.unified_stop - trail_step)
                 {
-                    m_state.unified_stop = candidate;
-                    m_sl_needs_retry     = true;
-                    Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
+                    if(!ModifyAllStops(candidate))
+                    {
+                        m_state.unified_stop = candidate;
+                        m_sl_needs_retry     = true;
+                        Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
+                    }
                 }
             }
         }
