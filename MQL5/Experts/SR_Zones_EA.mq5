@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.31"
+#property version   "1.32"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -1492,7 +1492,6 @@ bool CheckRetestSell(double atr, double &outEntry, double &outSL,
 void ManageManualTrades()
 {
     if(!InpManageManual) return;
-    if(!InpUseSL)        return; // SL disabled — do not place breakeven or trailing stops on manual trades
 
     double pip      = GetPipSize(_Symbol);
     double be_buf   = InpManualBeBuffer  * pip;
