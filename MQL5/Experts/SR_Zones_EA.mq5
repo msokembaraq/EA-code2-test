@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.15"
+#property version   "1.16"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -68,12 +68,14 @@ input int    InpZoneCount  = 6;     // Active zones per side
 input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter)
 input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
-input group "=== Swing Structure (BOS/CHoCH) ==="
-input bool   InpUseStructure    = true;  // Block trades against confirmed swing structure
-input int    InpStructureLookback = 3;   // Number of recent swing highs/lows to compare (2-4)
+input group "=== Swing Structure (BOS / Ranging / Manipulation) ==="
+input bool   InpUseStructure      = true;  // Use market structure as primary directional filter
+input int    InpStructureLookback = 3;     // Pivot highs/lows to compare for BOS (2-4)
+input double InpEqualTolerance    = 0.4;   // Equal high/low tolerance (x ATR) – range detection
+input bool   InpTradeManipulation = true;  // Trade wick sweep reversals at range boundaries
 
-input group "=== Trend Filter (HTF MA) ==="
-input bool             InpUseTrendFilter = true;          // Only trade in trend direction (MA on HTF)
+input group "=== Trend Filter (HTF MA – optional, disabled by default) ==="
+input bool             InpUseTrendFilter = false;         // HTF MA filter (structure is primary)
 input ENUM_TIMEFRAMES  InpTrendTF        = PERIOD_H1;     // Higher timeframe for trend MA
 input int              InpTrendMAPeriod  = 200;           // Trend MA period
 input ENUM_MA_METHOD   InpTrendMAMethod  = MODE_EMA;      // Trend MA method
@@ -164,9 +166,13 @@ int     lastLogTrend = 0;
 int     lastLogStructure = 0;  // throttle structure bias log
 
 // Swing structure state
-int     structureBias    = 0;  // +1 bull, -1 bear, 0 unclear
-double  lastBullBOS      = 0;  // price level of last bullish BOS
-double  lastBearBOS      = 0;  // price level of last bearish BOS
+// +1 = bullish BOS (HH+HL)  -1 = bearish BOS (LH+LL)  0 = ranging/unclear
+int     structureBias    = 0;
+double  lastBullBOS      = 0;
+double  lastBearBOS      = 0;
+bool    isRanging        = false;
+double  rangeHigh        = 0;   // top of detected consolidation range
+double  rangeLow         = 0;   // bottom of detected consolidation range
 
 // Signal cooldown tracking per zone center
 double  sigCenters[];
@@ -601,58 +607,101 @@ int TrendDirection()
 }
 
 //+------------------------------------------------------------------+
-//| Swing structure bias: +1 bull (HH+HL), -1 bear (LH+LL), 0 mixed |
-//| Uses the same pivot arrays built by RebuildAllZones each bar.    |
-//| BOS = most recent swing broke prior swing in same direction.     |
+//| Swing structure: BOS, ranging, manipulation                      |
+//|  +1 = bullish BOS (HH+HL) → buys only                           |
+//|  -1 = bearish BOS (LH+LL) → sells only                          |
+//|   0 = ranging (equal HH + equal LL within ATR tolerance)        |
+//|       → buy at range low, sell at range high                     |
 //+------------------------------------------------------------------+
 void UpdateStructureBias()
 {
-    if(!InpUseStructure) { structureBias = 0; return; }
+    if(!InpUseStructure) { structureBias = 0; isRanging = false; return; }
 
-    int need = InpStructureLookback;
-    if(highPivotCount < need || lowPivotCount < need)
+    if(highPivotCount < 2 || lowPivotCount < 2)
     {
-        structureBias = 0;
-        return;
+        structureBias = 0; isRanging = false; return;
     }
 
-    // Read last N pivot highs (most recent = highest index)
-    // highPivots are stored oldest→newest, so [count-1] is most recent
     int hTop = highPivotCount - 1;
     int lTop = lowPivotCount  - 1;
 
-    // Compare most recent two pivot highs
-    bool higherHigh = (highPivots[hTop].price > highPivots[hTop-1].price);
-    bool lowerHigh  = (highPivots[hTop].price < highPivots[hTop-1].price);
+    double atr = 0;
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0) atr = atrBuf[0];
+    double tol = (atr > 0) ? atr * InpEqualTolerance : 0;
 
-    // Compare most recent two pivot lows
-    bool higherLow  = (lowPivots[lTop].price  > lowPivots[lTop-1].price);
-    bool lowerLow   = (lowPivots[lTop].price  < lowPivots[lTop-1].price);
+    double highDiff = MathAbs(highPivots[hTop].price - highPivots[hTop-1].price);
+    double lowDiff  = MathAbs(lowPivots[lTop].price  - lowPivots[lTop-1].price);
 
-    int prevBias = structureBias;
+    bool higherHigh  = (highPivots[hTop].price > highPivots[hTop-1].price + tol);
+    bool lowerHigh   = (highPivots[hTop].price < highPivots[hTop-1].price - tol);
+    bool equalHigh   = (highDiff <= tol);
+
+    bool higherLow   = (lowPivots[lTop].price  > lowPivots[lTop-1].price  + tol);
+    bool lowerLow    = (lowPivots[lTop].price  < lowPivots[lTop-1].price  - tol);
+    bool equalLow    = (lowDiff <= tol);
+
+    int    prevBias    = structureBias;
+    bool   prevRanging = isRanging;
 
     if(higherHigh && higherLow)
     {
-        // Classic uptrend: HH + HL = bullish BOS confirmed
-        if(structureBias != 1)
-            lastBullBOS = highPivots[hTop].price;
+        if(structureBias != 1) lastBullBOS = highPivots[hTop].price;
         structureBias = 1;
+        isRanging     = false;
     }
     else if(lowerHigh && lowerLow)
     {
-        // Classic downtrend: LH + LL = bearish BOS confirmed
-        if(structureBias != -1)
-            lastBearBOS = lowPivots[lTop].price;
+        if(structureBias != -1) lastBearBOS = lowPivots[lTop].price;
         structureBias = -1;
+        isRanging     = false;
     }
-    // Mixed (HH+LL or LH+HL) = no confirmed structure, keep previous bias
-
-    if(structureBias != prevBias && structureBias != 0)
+    else if(equalHigh && equalLow)
     {
-        PrintFormat("SR_Zones_EA: Structure BOS → %s | BullBOS=%.2f BearBOS=%.2f",
-                    structureBias > 0 ? "BULLISH" : "BEARISH",
-                    lastBullBOS, lastBearBOS);
+        // Consolidation: equal highs + equal lows
+        rangeHigh     = MathMax(highPivots[hTop].price, highPivots[hTop-1].price);
+        rangeLow      = MathMin(lowPivots[lTop].price,  lowPivots[lTop-1].price);
+        structureBias = 0;
+        isRanging     = true;
     }
+    // Mixed (HH+LL or LH+HL) → hold previous state
+
+    if(structureBias != prevBias || isRanging != prevRanging)
+    {
+        if(isRanging)
+            PrintFormat("SR_Zones_EA: Structure → RANGING | High=%.2f Low=%.2f",
+                        rangeHigh, rangeLow);
+        else
+            PrintFormat("SR_Zones_EA: Structure BOS → %s | Level=%.2f",
+                        structureBias > 0 ? "BULLISH" : "BEARISH",
+                        structureBias > 0 ? lastBullBOS : lastBearBOS);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Manipulation (wick sweep reversal at range boundary)             |
+//| Bearish: wick above rangeHigh, close back inside = distribution  |
+//| Bullish: wick below rangeLow,  close back inside = accumulation  |
+//+------------------------------------------------------------------+
+bool IsBullManipulation()
+{
+    if(!isRanging || !InpTradeManipulation || rangeLow <= 0) return false;
+    double l1 = iLow(_Symbol,_Period,1);
+    double c1 = iClose(_Symbol,_Period,1);
+    double o1 = iOpen(_Symbol,_Period,1);
+    // Wick below rangeLow, close back above it, bullish close
+    return (l1 < rangeLow && c1 > rangeLow && c1 > o1);
+}
+
+bool IsBearManipulation()
+{
+    if(!isRanging || !InpTradeManipulation || rangeHigh <= 0) return false;
+    double h1 = iHigh(_Symbol,_Period,1);
+    double c1 = iClose(_Symbol,_Period,1);
+    double o1 = iOpen(_Symbol,_Period,1);
+    // Wick above rangeHigh, close back below it, bearish close
+    return (h1 > rangeHigh && c1 < rangeHigh && c1 < o1);
 }
 
 //+------------------------------------------------------------------+
@@ -1255,10 +1304,16 @@ void OnTick()
     bool bullConf = bullCandle && (InpUseStoch ? (stochConf == 1)  : true);
     bool bearConf = bearCandle && (InpUseStoch ? (stochConf == -1) : true);
 
-    // Structure gate: structureBias=0 means unclear → allow both directions
-    // +1 (HH+HL confirmed) → block sells | -1 (LH+LL confirmed) → block buys
+    // Structure gate
+    // +1 bullish BOS → buys only
+    // -1 bearish BOS → sells only
+    //  0 ranging/unclear → both allowed (zone logic decides direction)
     bool structAllowBuy  = (structureBias >= 0);
     bool structAllowSell = (structureBias <= 0);
+
+    // Manipulation signals (override zone signals when in ranging state)
+    bool bullManip = IsBullManipulation();
+    bool bearManip = IsBearManipulation();
 
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
@@ -1370,6 +1425,57 @@ void OnTick()
             else
                 PrintFormat("SR_Zones_EA: SELL RETEST SL too close. SL=%.5f Bid=%.5f",
                             sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
+        }
+    }
+
+    // --- Manipulation signals (ranging market only) ---
+    // Bullish sweep: wick below rangeLow, close back inside → accumulation → BUY
+    if(bullManip && bullConf)
+    {
+        double pip  = GetPipSize(_Symbol);
+        double atrV = atr;
+        entry       = iClose(_Symbol, _Period, 1);
+        sl          = NormalizeDouble(rangeLow - atrV * InpRetestSlBuffer, _Digits);
+        FindTpTargets(entry, 1, tp1, tp2, tp3);
+        zoneCenter  = rangeLow;
+        zoneType    = "Range Low Sweep";
+        RecordCooldown(zoneCenter);
+        Print("SR_Zones_EA: BULL MANIPULATION | RangeLow=", rangeLow,
+              " Entry=", entry, " SL=", sl);
+
+        if(InpMode == SIGNAL_MODE)
+            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+        else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
+        {
+            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                Print("SR_Zones_EA: BUY SWEEP OpenInitial returned false.");
+            else
+                SendTradeAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, InpLotInitial);
+        }
+        return;
+    }
+
+    // Bearish sweep: wick above rangeHigh, close back inside → distribution → SELL
+    if(bearManip && bearConf)
+    {
+        double atrV = atr;
+        entry       = iClose(_Symbol, _Period, 1);
+        sl          = NormalizeDouble(rangeHigh + atrV * InpRetestSlBuffer, _Digits);
+        FindTpTargets(entry, -1, tp1, tp2, tp3);
+        zoneCenter  = rangeHigh;
+        zoneType    = "Range High Sweep";
+        RecordCooldown(zoneCenter);
+        Print("SR_Zones_EA: BEAR MANIPULATION | RangeHigh=", rangeHigh,
+              " Entry=", entry, " SL=", sl);
+
+        if(InpMode == SIGNAL_MODE)
+            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+        else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
+        {
+            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                Print("SR_Zones_EA: SELL SWEEP OpenInitial returned false.");
+            else
+                SendTradeAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, InpLotInitial);
         }
     }
 }
