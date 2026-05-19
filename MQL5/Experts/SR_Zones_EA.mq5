@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.28"
+#property version   "1.29"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -108,6 +108,7 @@ input int    InpSlippage   = 10;      // Slippage (points)
 input double InpLotInitial = 0.05;    // Initial lot (largest)
 input double InpLotAddon1  = 0.03;    // Add-on 1 lot
 input double InpLotAddon2  = 0.02;    // Add-on 2 lot
+input bool   InpUseSL      = true;    // Use stop loss (false = open trades with no SL)
 input double InpSlZoneBuffer = 1.5;   // SL buffer beyond zone edge (x ATR) – 1.5x gives breathing room
 
 input group "=== Pyramid Triggers ==="
@@ -1292,6 +1293,11 @@ int StochDirection()
 
 
 //+------------------------------------------------------------------+
+// Apply InpUseSL toggle: returns 0 when SL is disabled, sl otherwise
+//+------------------------------------------------------------------+
+double ApplySLToggle(double sl) { return InpUseSL ? sl : 0.0; }
+
+//+------------------------------------------------------------------+
 //| Send push notification helper                                    |
 //+------------------------------------------------------------------+
 void SendAlert(string msg)
@@ -1804,6 +1810,7 @@ void OnTick()
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob, atr);
+        obBuySL = ApplySLToggle(obBuySL);
         RecordCooldown(obBuyCenter);
         Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
               " Entry=", obBuyEntry, " SL=", obBuySL);
@@ -1825,6 +1832,7 @@ void OnTick()
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob, atr);
+        obSelSL = ApplySLToggle(obSelSL);
         RecordCooldown(obSelCenter);
         Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
               " Entry=", obSelEntry, " SL=", obSelSL);
@@ -1845,6 +1853,7 @@ void OnTick()
     if(structAllowBuy && bullConf &&
        CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
+        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
@@ -1872,6 +1881,7 @@ void OnTick()
     if(structAllowSell && bearConf &&
        CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
+        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
@@ -1899,6 +1909,7 @@ void OnTick()
     if(!InpRetestOnly && structAllowBuy && bullConf &&
        CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
+        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
@@ -1926,6 +1937,7 @@ void OnTick()
     if(!InpRetestOnly && structAllowSell && bearConf &&
        CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
+        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
@@ -1954,7 +1966,7 @@ void OnTick()
     if(bullManip && bullConf && CooldownOk(rangeLow, atr))
     {
         entry       = iClose(_Symbol, _Period, 1);
-        sl          = NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits);
+        sl          = ApplySLToggle(NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits));
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
         zoneCenter  = rangeLow;
         zoneType    = "Range Low Sweep";
@@ -1978,7 +1990,7 @@ void OnTick()
     if(bearManip && bearConf && CooldownOk(rangeHigh, atr))
     {
         entry       = iClose(_Symbol, _Period, 1);
-        sl          = NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits);
+        sl          = ApplySLToggle(NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits));
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
         zoneCenter  = rangeHigh;
         zoneType    = "Range High Sweep";

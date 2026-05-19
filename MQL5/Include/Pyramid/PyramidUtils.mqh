@@ -34,6 +34,8 @@ double GetPipValue(string symbol, double lot_size)
 //+------------------------------------------------------------------+
 bool IsStopLevelValid(string symbol, double sl_price, ENUM_ORDER_TYPE order_type)
 {
+    if(sl_price == 0.0) return true; // 0 = no SL — broker always accepts this
+
     double ask       = SymbolInfoDouble(symbol, SYMBOL_ASK);
     double bid       = SymbolInfoDouble(symbol, SYMBOL_BID);
     int    stop_lvl  = (int)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
