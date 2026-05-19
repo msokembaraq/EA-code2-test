@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.14"
+#property version   "1.15"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -68,7 +68,11 @@ input int    InpZoneCount  = 6;     // Active zones per side
 input int    InpMinTouches = 2;     // Minimum touches (2=more zones, 3=stricter)
 input int    InpHistBars   = 1000;  // Bars of history for zone detection
 
-input group "=== Trend Filter ==="
+input group "=== Swing Structure (BOS/CHoCH) ==="
+input bool   InpUseStructure    = true;  // Block trades against confirmed swing structure
+input int    InpStructureLookback = 3;   // Number of recent swing highs/lows to compare (2-4)
+
+input group "=== Trend Filter (HTF MA) ==="
 input bool             InpUseTrendFilter = true;          // Only trade in trend direction (MA on HTF)
 input ENUM_TIMEFRAMES  InpTrendTF        = PERIOD_H1;     // Higher timeframe for trend MA
 input int              InpTrendMAPeriod  = 200;           // Trend MA period
@@ -157,6 +161,12 @@ int     lastBreakCheckBar = -1;
 // Log throttle: only print zone details when counts change
 int     lastLogRes = -1, lastLogSup = -1, lastLogBroken = -1;
 int     lastLogTrend = 0;
+int     lastLogStructure = 0;  // throttle structure bias log
+
+// Swing structure state
+int     structureBias    = 0;  // +1 bull, -1 bear, 0 unclear
+double  lastBullBOS      = 0;  // price level of last bullish BOS
+double  lastBearBOS      = 0;  // price level of last bearish BOS
 
 // Signal cooldown tracking per zone center
 double  sigCenters[];
@@ -588,6 +598,61 @@ int TrendDirection()
 
     double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     return (price > maBuf[0]) ? 1 : -1;
+}
+
+//+------------------------------------------------------------------+
+//| Swing structure bias: +1 bull (HH+HL), -1 bear (LH+LL), 0 mixed |
+//| Uses the same pivot arrays built by RebuildAllZones each bar.    |
+//| BOS = most recent swing broke prior swing in same direction.     |
+//+------------------------------------------------------------------+
+void UpdateStructureBias()
+{
+    if(!InpUseStructure) { structureBias = 0; return; }
+
+    int need = InpStructureLookback;
+    if(highPivotCount < need || lowPivotCount < need)
+    {
+        structureBias = 0;
+        return;
+    }
+
+    // Read last N pivot highs (most recent = highest index)
+    // highPivots are stored oldest→newest, so [count-1] is most recent
+    int hTop = highPivotCount - 1;
+    int lTop = lowPivotCount  - 1;
+
+    // Compare most recent two pivot highs
+    bool higherHigh = (highPivots[hTop].price > highPivots[hTop-1].price);
+    bool lowerHigh  = (highPivots[hTop].price < highPivots[hTop-1].price);
+
+    // Compare most recent two pivot lows
+    bool higherLow  = (lowPivots[lTop].price  > lowPivots[lTop-1].price);
+    bool lowerLow   = (lowPivots[lTop].price  < lowPivots[lTop-1].price);
+
+    int prevBias = structureBias;
+
+    if(higherHigh && higherLow)
+    {
+        // Classic uptrend: HH + HL = bullish BOS confirmed
+        if(structureBias != 1)
+            lastBullBOS = highPivots[hTop].price;
+        structureBias = 1;
+    }
+    else if(lowerHigh && lowerLow)
+    {
+        // Classic downtrend: LH + LL = bearish BOS confirmed
+        if(structureBias != -1)
+            lastBearBOS = lowPivots[lTop].price;
+        structureBias = -1;
+    }
+    // Mixed (HH+LL or LH+HL) = no confirmed structure, keep previous bias
+
+    if(structureBias != prevBias && structureBias != 0)
+    {
+        PrintFormat("SR_Zones_EA: Structure BOS → %s | BullBOS=%.2f BearBOS=%.2f",
+                    structureBias > 0 ? "BULLISH" : "BEARISH",
+                    lastBullBOS, lastBearBOS);
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -1125,8 +1190,9 @@ void OnTick()
         DetectBreaks(closeBuf[1], atr, barIdx);
     }
 
-    // Rebuild alive zones
+    // Rebuild alive zones then update swing structure bias
     RebuildAllZones();
+    UpdateStructureBias();
 
     // Only log when zone counts change to avoid spam
     bool zonesChanged = (resCount != lastLogRes || supCount != lastLogSup || brokenCount != lastLogBroken);
@@ -1189,6 +1255,11 @@ void OnTick()
     bool bullConf = bullCandle && (InpUseStoch ? (stochConf == 1)  : true);
     bool bearConf = bearCandle && (InpUseStoch ? (stochConf == -1) : true);
 
+    // Structure gate: structureBias=0 means unclear → allow both directions
+    // +1 (HH+HL confirmed) → block sells | -1 (LH+LL confirmed) → block buys
+    bool structAllowBuy  = (structureBias >= 0);
+    bool structAllowSell = (structureBias <= 0);
+
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
     string zoneType = "";
@@ -1196,7 +1267,7 @@ void OnTick()
     int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
 
     // --- Check BUY (support bounce) ---
-    if(!InpRetestOnly && (trendDir >= 0) && bullConf &&
+    if(!InpRetestOnly && (trendDir >= 0) && structAllowBuy && bullConf &&
        CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1223,7 +1294,7 @@ void OnTick()
     }
 
     // --- Check SELL (resistance reject) ---
-    if(!InpRetestOnly && (trendDir <= 0) && bearConf &&
+    if(!InpRetestOnly && (trendDir <= 0) && structAllowSell && bearConf &&
        CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1250,7 +1321,7 @@ void OnTick()
     }
 
     // --- Check BUY retest (broken resistance → flipped support) ---
-    if((trendDir >= 0) && bullConf &&
+    if((trendDir >= 0) && structAllowBuy && bullConf &&
        CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1277,7 +1348,7 @@ void OnTick()
     }
 
     // --- Check SELL retest (broken support → flipped resistance) ---
-    if((trendDir <= 0) && bearConf &&
+    if((trendDir <= 0) && structAllowSell && bearConf &&
        CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
