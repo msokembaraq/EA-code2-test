@@ -71,6 +71,7 @@ public:
     void            RecoverState();
     bool            IsActive()   { return m_state.active; }
     SPyramidState   GetState()   { return m_state; }
+    void            ClosePyramid();
 };
 
 //+------------------------------------------------------------------+
@@ -460,6 +461,20 @@ void CPyramidEngine::HandleTransaction(const MqlTradeTransaction &trans)
             m_trade.PositionClose(m_state.ticket_addon2);
         ResetState();
     }
+}
+
+//+------------------------------------------------------------------+
+void CPyramidEngine::ClosePyramid()
+{
+    if(!m_state.active) return;
+    if(PositionStillOpen(m_state.ticket_initial))
+        m_trade.PositionClose(m_state.ticket_initial);
+    if(m_state.addon1_open && PositionStillOpen(m_state.ticket_addon1))
+        m_trade.PositionClose(m_state.ticket_addon1);
+    if(m_state.addon2_open && PositionStillOpen(m_state.ticket_addon2))
+        m_trade.PositionClose(m_state.ticket_addon2);
+    Print("PyramidEngine: ClosePyramid – all positions closed.");
+    ResetState();
 }
 
 //+------------------------------------------------------------------+
