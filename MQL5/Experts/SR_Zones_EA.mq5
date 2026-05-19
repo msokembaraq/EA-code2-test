@@ -1266,13 +1266,10 @@ bool HasBearishPattern()
 // +1 = bullish stoch confirmation, -1 = bearish, 0 = no confirmation
 // Logic: HTF stochastic K must be in OB/OS zone AND K must cross D on the
 // last completed HTF bar (K[2] on opposite side of D[2], K[1] crossed over D[1])
-// StochDirection: directional confluence reader (not a hard gate).
-// Returns: +1 bullish, -1 bearish, 0 neutral/unavailable.
-// Zone logic (based on closed bar [1] K vs D):
-//   OB zone (K >= InpStochOB, default 70): K > D = bullish continuation; K crossed below D = bearish
-//   OS zone (K <= InpStochOS, default 20): K < D = bearish continuation; K crossed above D = bullish
-//   Mid zone (InpStochOS < K < InpStochOB): K > D = bullish; K < D = bearish
-// Cross FROM OB downward is the primary bearish signal; cross FROM OS upward is the primary bullish signal.
+// StochDirection: momentum confluence filter.
+// Returns +1 on bullish K/D cross (any zone), -1 on bearish K/D cross, 0 if no cross on closed bar.
+// The cross is the signal — it confirms momentum turning at the area of interest.
+// OB/OS zones = extreme crosses; mid zone = pullback/continuation crosses. All are valid.
 int StochDirection()
 {
     double kBuf[], dBuf[];
@@ -1281,24 +1278,12 @@ int StochDirection()
     if(CopyBuffer(stochHandle, 0, 0, 3, kBuf) < 3) return 0;
     if(CopyBuffer(stochHandle, 1, 0, 3, dBuf) < 3) return 0;
 
-    double k1 = kBuf[1], k2 = kBuf[2]; // closed bar
+    double k1 = kBuf[1], k2 = kBuf[2]; // bar[1] = last closed bar
     double d1 = dBuf[1], d2 = dBuf[2];
 
-    bool crossedUp   = (k2 < d2 && k1 >= d1); // K crossed above D
-    bool crossedDown = (k2 > d2 && k1 <= d1); // K crossed below D
-    bool kAboveD     = (k1 > d1);
-    bool kBelowD     = (k1 < d1);
-
-    // OB zone (≥ InpStochOB): crossed down = bearish; K still above D = bullish continuation
-    if(k1 >= InpStochOB)
-        return crossedDown ? -1 : (kAboveD ? 1 : 0);
-
-    // OS zone (≤ InpStochOS): crossed up = bullish; K still below D = bearish continuation
-    if(k1 <= InpStochOS)
-        return crossedUp ? 1 : (kBelowD ? -1 : 0);
-
-    // Mid zone (InpStochOS < K < InpStochOB): direction by K vs D
-    return kAboveD ? 1 : (kBelowD ? -1 : 0);
+    if(k2 < d2 && k1 >= d1) return  1; // K crossed above D — bullish momentum
+    if(k2 > d2 && k1 <= d1) return -1; // K crossed below D — bearish momentum
+    return 0;                           // no cross — no confirmation
 }
 
 
@@ -1790,13 +1775,14 @@ void OnTick()
         return;
     }
 
-    // Evaluate candle confluence (primary gate) and stochastic direction (context only)
+    // Evaluate candle pattern and stochastic cross — both required when stoch is enabled
     bool bullCandle  = HasBullishPattern();
     bool bearCandle  = HasBearishPattern();
+    int  stochDir    = InpUseStoch ? StochDirection() : 0;
 
-    // Candle pattern is the sole entry gate
-    bool bullConf = bullCandle;
-    bool bearConf = bearCandle;
+    // bullConf/bearConf: candle pattern at zone + stoch K/D cross in same direction
+    bool bullConf = bullCandle && (InpUseStoch ? (stochDir ==  1) : true);
+    bool bearConf = bearCandle && (InpUseStoch ? (stochDir == -1) : true);
 
     // Structure gate
     // +1 bullish BOS → buys only
