@@ -68,7 +68,7 @@ struct SZone
 //+------------------------------------------------------------------+
 input group "=== Operation ==="
 input ENUM_OPERATION_MODE InpMode       = EA_MODE;         // Operation mode
-input string              InpMetaID     = "";              // MetaTrader ID (push notifications) — MUST set your own device ID
+input string              InpMetaID     = "407DBF6E";              // MetaTrader ID (push notifications) — MUST set your own device ID
 
 input group "=== Zone Detection ==="
 input ENUM_STRENGTH_PRESET_EA InpPreset = SWING_EA;        // Strength preset
