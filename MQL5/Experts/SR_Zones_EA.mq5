@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.17"
+#property version   "1.18"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -34,8 +34,18 @@ struct SPivot
     double wick;
 };
 
-struct SZone
+struct SOrderBlock
 {
+    double bodyHigh;    // max(open, close) of OB candle
+    double bodyLow;     // min(open, close) of OB candle
+    double wickHigh;    // candle high (for SL reference)
+    double wickLow;     // candle low  (for SL reference)
+    double mid;         // 50% of body
+    bool   isBullOB;    // true = buy signal (last red candle before bull move)
+    int    formedBar;   // bar index at formation
+    bool   active;      // false = invalidated (price closed through body)
+    bool   fromChoch;   // true = formed on CHoCH, false = BOS
+};
     double top;
     double bot;
     double center;
@@ -76,6 +86,12 @@ input bool   InpTradeManipulation   = true;  // Trade wick sweep reversals at ra
 input bool   InpDetectChoch         = true;  // Detect CHoCH (early trend flip signal)
 input double InpChochDisplacement   = 0.5;   // CHoCH break candle body must be >= X * ATR
 input bool   InpChochZoneConfluence = true;  // Require CHoCH swing high/low at known S/R zone
+
+input group "=== Order Blocks ==="
+input bool   InpUseOB           = true;  // Detect and trade Order Block retests
+input int    InpOBLookback      = 10;    // Bars to scan back for OB candle after BOS/CHoCH
+input int    InpMaxOBZones      = 6;     // Max active OBs to track per side
+input double InpOBSlBuffer      = 1.0;   // SL buffer beyond OB wick (x ATR)
 
 input group "=== Trend Filter (HTF MA – optional, disabled by default) ==="
 input bool             InpUseTrendFilter = false;         // HTF MA filter (structure is primary)
@@ -176,6 +192,10 @@ double  lastBearBOS      = 0;
 bool    isRanging        = false;
 double  rangeHigh        = 0;
 double  rangeLow         = 0;
+// Order Blocks
+SOrderBlock obZones[];
+int         obCount = 0;
+
 // CHoCH tracking
 double  lastHL           = 0;   // last confirmed higher low (bullish trend)
 double  lastLH           = 0;   // last confirmed lower high (bearish trend)
@@ -622,6 +642,161 @@ int TrendDirection()
 //|       → buy at range low, sell at range high                     |
 //+------------------------------------------------------------------+
 // Returns true if price is within any zone of the given array
+//+------------------------------------------------------------------+
+//| Order Block helpers                                              |
+//+------------------------------------------------------------------+
+
+// Scan back from bar startBar to find last opposing candle before move
+// isBullMove=true → look for last red candle (bearish OB for bull entry)
+void FindAndMarkOB(bool isBullMove, int startBar, bool fromChoch)
+{
+    if(!InpUseOB) return;
+
+    // Resize if needed
+    if(obCount >= ArraySize(obZones)) ArrayResize(obZones, obCount + 10);
+
+    int maxLookback = MathMin(InpOBLookback, startBar);
+    for(int i = startBar; i <= startBar + maxLookback; i++)
+    {
+        double o = iOpen(_Symbol,  _Period, i);
+        double c = iClose(_Symbol, _Period, i);
+        double h = iHigh(_Symbol,  _Period, i);
+        double l = iLow(_Symbol,   _Period, i);
+
+        bool isBearCandle = (c < o); // red candle
+        bool isBullCandle = (c > o); // green candle
+
+        if(isBullMove && isBearCandle)
+        {
+            SOrderBlock ob;
+            ob.bodyHigh  = o;                    // red candle: open is top of body
+            ob.bodyLow   = c;                    // close is bottom
+            ob.wickHigh  = h;
+            ob.wickLow   = l;
+            ob.mid       = (o + c) / 2.0;
+            ob.isBullOB  = true;
+            ob.formedBar = i;
+            ob.active    = true;
+            ob.fromChoch = fromChoch;
+
+            // Enforce max OBs: remove oldest if at limit
+            int bullCount = 0;
+            for(int j = 0; j < obCount; j++)
+                if(obZones[j].isBullOB && obZones[j].active) bullCount++;
+            if(bullCount >= InpMaxOBZones)
+            {
+                for(int j = 0; j < obCount; j++)
+                    if(obZones[j].isBullOB && obZones[j].active)
+                        { obZones[j].active = false; break; }
+            }
+
+            obZones[obCount++] = ob;
+            PrintFormat("SR_Zones_EA: Bullish OB marked | Body=%.2f-%.2f | Bar=%d | %s",
+                        ob.bodyLow, ob.bodyHigh, i, fromChoch ? "CHoCH" : "BOS");
+            return;
+        }
+        else if(!isBullMove && isBullCandle)
+        {
+            SOrderBlock ob;
+            ob.bodyHigh  = c;                    // green candle: close is top of body
+            ob.bodyLow   = o;                    // open is bottom
+            ob.wickHigh  = h;
+            ob.wickLow   = l;
+            ob.mid       = (o + c) / 2.0;
+            ob.isBullOB  = false;
+            ob.formedBar = i;
+            ob.active    = true;
+            ob.fromChoch = fromChoch;
+
+            int bearCount = 0;
+            for(int j = 0; j < obCount; j++)
+                if(!obZones[j].isBullOB && obZones[j].active) bearCount++;
+            if(bearCount >= InpMaxOBZones)
+            {
+                for(int j = 0; j < obCount; j++)
+                    if(!obZones[j].isBullOB && obZones[j].active)
+                        { obZones[j].active = false; break; }
+            }
+
+            obZones[obCount++] = ob;
+            PrintFormat("SR_Zones_EA: Bearish OB marked | Body=%.2f-%.2f | Bar=%d | %s",
+                        ob.bodyLow, ob.bodyHigh, i, fromChoch ? "CHoCH" : "BOS");
+            return;
+        }
+    }
+}
+
+// Invalidate OBs that price has fully closed through
+void InvalidateOBs()
+{
+    if(!InpUseOB) return;
+    double close1 = iClose(_Symbol, _Period, 1);
+    for(int i = 0; i < obCount; i++)
+    {
+        if(!obZones[i].active) continue;
+        // Bull OB invalidated if price closes below its body low
+        if(obZones[i].isBullOB  && close1 < obZones[i].bodyLow)
+            obZones[i].active = false;
+        // Bear OB invalidated if price closes above its body high
+        if(!obZones[i].isBullOB && close1 > obZones[i].bodyHigh)
+            obZones[i].active = false;
+    }
+}
+
+// Check if bar[1] has returned into a bullish OB — returns best match
+bool CheckOBBuySignal(double atr, double &outEntry, double &outSL,
+                      double &outCenter, string &outType)
+{
+    if(!InpUseOB) return false;
+    double low1  = iLow(_Symbol,  _Period, 1);
+    double close1= iClose(_Symbol,_Period, 1);
+    double open1 = iOpen(_Symbol, _Period, 1);
+    double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    for(int i = 0; i < obCount; i++)
+    {
+        SOrderBlock ob = obZones[i];
+        if(!ob.active || !ob.isBullOB) continue;
+        // Price dipped into OB body, closed bullish above body low
+        if(low1 <= ob.bodyHigh && close1 >= ob.bodyLow && close1 >= open1)
+        {
+            outEntry  = ask;
+            outSL     = NormalizeDouble(ob.wickLow - atr * InpOBSlBuffer, _Digits);
+            outCenter = ob.mid;
+            outType   = ob.fromChoch ? "OB (CHoCH)" : "OB (BOS)";
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if bar[1] has returned into a bearish OB
+bool CheckOBSellSignal(double atr, double &outEntry, double &outSL,
+                       double &outCenter, string &outType)
+{
+    if(!InpUseOB) return false;
+    double high1 = iHigh(_Symbol,  _Period, 1);
+    double close1= iClose(_Symbol, _Period, 1);
+    double open1 = iOpen(_Symbol,  _Period, 1);
+    double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    for(int i = 0; i < obCount; i++)
+    {
+        SOrderBlock ob = obZones[i];
+        if(!ob.active || ob.isBullOB) continue;
+        // Price rallied into OB body, closed bearish below body high
+        if(high1 >= ob.bodyLow && close1 <= ob.bodyHigh && close1 <= open1)
+        {
+            outEntry  = bid;
+            outSL     = NormalizeDouble(ob.wickHigh + atr * InpOBSlBuffer, _Digits);
+            outCenter = ob.mid;
+            outType   = ob.fromChoch ? "OB (CHoCH)" : "OB (BOS)";
+            return true;
+        }
+    }
+    return false;
+}
+
 bool IsAtKnownZone(double price, const SZone &zones[], int count)
 {
     for(int i = 0; i < count; i++)
@@ -708,6 +883,7 @@ void UpdateStructureBias()
                 structureBias = -1;
                 isRanging     = false;
                 lastBearBOS   = lastHL;
+                FindAndMarkOB(false, 2, true); // bearish move → look for last green candle
                 PrintFormat("SR_Zones_EA: CHoCH BEARISH | Broke HL=%.2f | SwingHigh=%.2f at ResZone=%s",
                             lastHL, highPivots[hTop].price,
                             zoneConf ? "YES" : "NO");
@@ -730,6 +906,7 @@ void UpdateStructureBias()
                 structureBias = 1;
                 isRanging     = false;
                 lastBullBOS   = lastLH;
+                FindAndMarkOB(true, 2, true); // bullish move → look for last red candle
                 PrintFormat("SR_Zones_EA: CHoCH BULLISH | Broke LH=%.2f | SwingLow=%.2f at SupZone=%s",
                             lastLH, lowPivots[lTop].price,
                             zoneConf ? "YES" : "NO");
@@ -740,14 +917,22 @@ void UpdateStructureBias()
     // ── BOS detection ─────────────────────────────────────────────────
     if(higherHigh && higherLow)
     {
-        if(structureBias != 1) lastBullBOS = highPivots[hTop].price;
+        if(structureBias != 1)
+        {
+            lastBullBOS = highPivots[hTop].price;
+            FindAndMarkOB(true, 2, false); // BOS bull → mark last red candle as bull OB
+        }
         structureBias = 1;
         isRanging     = false;
-        chochActive   = false; // full BOS confirmed, CHoCH phase over
+        chochActive   = false;
     }
     else if(lowerHigh && lowerLow)
     {
-        if(structureBias != -1) lastBearBOS = lowPivots[lTop].price;
+        if(structureBias != -1)
+        {
+            lastBearBOS = lowPivots[lTop].price;
+            FindAndMarkOB(false, 2, false); // BOS bear → mark last green candle as bear OB
+        }
         structureBias = -1;
         isRanging     = false;
         chochActive   = false;
@@ -1271,6 +1456,9 @@ int OnInit()
     brokenCount        = 0;
     lastBreakCheckBar  = -1;
 
+    ArrayResize(obZones, 40);
+    obCount = 0;
+
     if(InpMode == EA_MODE)
     {
         if(!pyramid.Init(InpMagic, InpSlippage,
@@ -1335,9 +1523,10 @@ void OnTick()
         DetectBreaks(closeBuf[1], atr, barIdx);
     }
 
-    // Rebuild alive zones then update swing structure bias
+    // Rebuild alive zones then update swing structure bias and OBs
     RebuildAllZones();
     UpdateStructureBias();
+    InvalidateOBs();
 
     // Only log when zone counts change to avoid spam
     bool zonesChanged = (resCount != lastLogRes || supCount != lastLogSup || brokenCount != lastLogBroken);
@@ -1410,6 +1599,12 @@ void OnTick()
     // Manipulation signals (override zone signals when in ranging state)
     bool bullManip = IsBullManipulation();
     bool bearManip = IsBearManipulation();
+
+    // OB signal check (evaluated once, used in dispatch below)
+    double obEntry = 0, obSL = 0, obCenter = 0;
+    string obType  = "";
+    bool   hasBullOB = structAllowBuy  && CheckOBBuySignal (atr, obEntry, obSL, obCenter, obType);
+    bool   hasBearOB = structAllowSell && CheckOBSellSignal(atr, obEntry, obSL, obCenter, obType);
 
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
@@ -1522,6 +1717,47 @@ void OnTick()
                 PrintFormat("SR_Zones_EA: SELL RETEST SL too close. SL=%.5f Bid=%.5f",
                             sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
+    }
+
+    // --- Order Block signals (BUY OB / SELL OB) ---
+    if(hasBullOB && bullConf)
+    {
+        double tp1ob = 0, tp2ob = 0, tp3ob = 0;
+        FindTpTargets(obEntry, 1, tp1ob, tp2ob, tp3ob);
+        RecordCooldown(obCenter);
+        Print("SR_Zones_EA: BUY OB | Type=", obType, " Center=", obCenter,
+              " Entry=", obEntry, " SL=", obSL);
+
+        if(InpMode == SIGNAL_MODE)
+            SendSignalAlert("BUY OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, obType, obCenter);
+        else if(IsStopLevelValid(_Symbol, obSL, ORDER_TYPE_BUY))
+        {
+            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obEntry, obSL, InpLotInitial))
+                Print("SR_Zones_EA: BUY OB OpenInitial failed.");
+            else
+                SendTradeAlert("BUY OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+        }
+        return;
+    }
+
+    if(hasBearOB && bearConf)
+    {
+        double tp1ob = 0, tp2ob = 0, tp3ob = 0;
+        FindTpTargets(obEntry, -1, tp1ob, tp2ob, tp3ob);
+        RecordCooldown(obCenter);
+        Print("SR_Zones_EA: SELL OB | Type=", obType, " Center=", obCenter,
+              " Entry=", obEntry, " SL=", obSL);
+
+        if(InpMode == SIGNAL_MODE)
+            SendSignalAlert("SELL OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, obType, obCenter);
+        else if(IsStopLevelValid(_Symbol, obSL, ORDER_TYPE_SELL))
+        {
+            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obEntry, obSL, InpLotInitial))
+                Print("SR_Zones_EA: SELL OB OpenInitial failed.");
+            else
+                SendTradeAlert("SELL OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+        }
+        return;
     }
 
     // --- Manipulation signals (ranging market only) ---
