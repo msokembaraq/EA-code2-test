@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.18"
+#property version   "1.19"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -46,6 +46,9 @@ struct SOrderBlock
     bool   active;      // false = invalidated (price closed through body)
     bool   fromChoch;   // true = formed on CHoCH, false = BOS
 };
+
+struct SZone
+{
     double top;
     double bot;
     double center;
@@ -655,8 +658,9 @@ void FindAndMarkOB(bool isBullMove, int startBar, bool fromChoch)
     // Resize if needed
     if(obCount >= ArraySize(obZones)) ArrayResize(obZones, obCount + 10);
 
-    int maxLookback = MathMin(InpOBLookback, startBar);
-    for(int i = startBar; i <= startBar + maxLookback; i++)
+    int maxLookback = InpOBLookback;
+    int barLimit    = (int)Bars(_Symbol, _Period);
+    for(int i = startBar; i < startBar + maxLookback && i < barLimit; i++)
     {
         double o = iOpen(_Symbol,  _Period, i);
         double c = iClose(_Symbol, _Period, i);
@@ -726,7 +730,7 @@ void FindAndMarkOB(bool isBullMove, int startBar, bool fromChoch)
     }
 }
 
-// Invalidate OBs that price has fully closed through
+// Invalidate OBs that price has fully closed through, then compact the array
 void InvalidateOBs()
 {
     if(!InpUseOB) return;
@@ -741,6 +745,11 @@ void InvalidateOBs()
         if(!obZones[i].isBullOB && close1 > obZones[i].bodyHigh)
             obZones[i].active = false;
     }
+    // Compact: shift active entries to front, reclaim slots of dead entries
+    int newCount = 0;
+    for(int i = 0; i < obCount; i++)
+        if(obZones[i].active) obZones[newCount++] = obZones[i];
+    obCount = newCount;
 }
 
 // Check if bar[1] has returned into a bullish OB — returns best match
@@ -807,6 +816,11 @@ bool IsAtKnownZone(double price, const SZone &zones[], int count)
 // Adds a CHoCH level as a synthetic broken zone for retest tracking
 void AddChochZone(double level, double atr, bool wasResistance)
 {
+    // Dedup: skip if a zone with this center already exists in brokenZones
+    double dedup_tol = (atr > 0) ? atr * 0.3 : SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+    for(int i = 0; i < brokenCount; i++)
+        if(MathAbs(brokenZones[i].center - level) <= dedup_tol) return;
+
     if(brokenCount >= ArraySize(brokenZones)) ArrayResize(brokenZones, brokenCount + 10);
     SZone z;
     z.top          = NormalizeDouble(level + atr * 0.3, _Digits);
@@ -840,7 +854,8 @@ void UpdateStructureBias()
     double atrBuf[];
     ArraySetAsSeries(atrBuf, true);
     if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0) atr = atrBuf[0];
-    double tol = (atr > 0) ? atr * InpEqualTolerance : 0;
+    if(atr <= 0) return; // ATR not ready — hold previous state
+    double tol = atr * InpEqualTolerance;
 
     double highDiff = MathAbs(highPivots[hTop].price - highPivots[hTop-1].price);
     double lowDiff  = MathAbs(lowPivots[lTop].price  - lowPivots[lTop-1].price);
@@ -883,7 +898,7 @@ void UpdateStructureBias()
                 structureBias = -1;
                 isRanging     = false;
                 lastBearBOS   = lastHL;
-                FindAndMarkOB(false, 2, true); // bearish move → look for last green candle
+                FindAndMarkOB(false, 1, true); // bearish move → look for last green candle
                 PrintFormat("SR_Zones_EA: CHoCH BEARISH | Broke HL=%.2f | SwingHigh=%.2f at ResZone=%s",
                             lastHL, highPivots[hTop].price,
                             zoneConf ? "YES" : "NO");
@@ -906,7 +921,7 @@ void UpdateStructureBias()
                 structureBias = 1;
                 isRanging     = false;
                 lastBullBOS   = lastLH;
-                FindAndMarkOB(true, 2, true); // bullish move → look for last red candle
+                FindAndMarkOB(true, 1, true); // bullish move → look for last red candle
                 PrintFormat("SR_Zones_EA: CHoCH BULLISH | Broke LH=%.2f | SwingLow=%.2f at SupZone=%s",
                             lastLH, lowPivots[lTop].price,
                             zoneConf ? "YES" : "NO");
@@ -920,7 +935,7 @@ void UpdateStructureBias()
         if(structureBias != 1)
         {
             lastBullBOS = highPivots[hTop].price;
-            FindAndMarkOB(true, 2, false); // BOS bull → mark last red candle as bull OB
+            FindAndMarkOB(true, 1, false); // BOS bull → mark last red candle as bull OB
         }
         structureBias = 1;
         isRanging     = false;
@@ -931,7 +946,7 @@ void UpdateStructureBias()
         if(structureBias != -1)
         {
             lastBearBOS = lowPivots[lTop].price;
-            FindAndMarkOB(false, 2, false); // BOS bear → mark last green candle as bear OB
+            FindAndMarkOB(false, 1, false); // BOS bear → mark last green candle as bear OB
         }
         structureBias = -1;
         isRanging     = false;
@@ -944,6 +959,8 @@ void UpdateStructureBias()
         structureBias = 0;
         isRanging     = true;
         chochActive   = false;
+        lastHL        = 0; // reset stale swing references when entering range
+        lastLH        = 0;
     }
     // Mixed → hold previous state
 
@@ -1358,8 +1375,8 @@ void ManageManualTrades()
             if(profit_pips >= InpManualBePips && current_sl < be_target)
                 new_sl = be_target;
 
-            // Phase 2: trail (only once BE is set)
-            if(InpManualTrail && current_sl >= open_p)
+            // Phase 2: trail (only once BE is set — SL must be strictly above entry)
+            if(InpManualTrail && current_sl > open_p)
             {
                 double trail_candidate = bid - tr_dist;
                 if(trail_candidate > current_sl + tr_step)
@@ -1601,10 +1618,11 @@ void OnTick()
     bool bearManip = IsBearManipulation();
 
     // OB signal check (evaluated once, used in dispatch below)
-    double obEntry = 0, obSL = 0, obCenter = 0;
-    string obType  = "";
-    bool   hasBullOB = structAllowBuy  && CheckOBBuySignal (atr, obEntry, obSL, obCenter, obType);
-    bool   hasBearOB = structAllowSell && CheckOBSellSignal(atr, obEntry, obSL, obCenter, obType);
+    // Use separate output variables so bear OB cannot overwrite bull OB data
+    double obBuyEntry = 0, obBuySL = 0, obBuyCenter = 0; string obBuyType = "";
+    double obSelEntry = 0, obSelSL = 0, obSelCenter = 0; string obSelType = "";
+    bool   hasBullOB = structAllowBuy  && CheckOBBuySignal (atr, obBuyEntry, obBuySL, obBuyCenter, obBuyType);
+    bool   hasBearOB = structAllowSell && CheckOBSellSignal(atr, obSelEntry, obSelSL, obSelCenter, obSelType);
 
     double entry = 0, sl = 0, zoneCenter = 0;
     double tp1 = 0, tp2 = 0, tp3 = 0;
@@ -1717,25 +1735,26 @@ void OnTick()
                 PrintFormat("SR_Zones_EA: SELL RETEST SL too close. SL=%.5f Bid=%.5f",
                             sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
+        return;
     }
 
     // --- Order Block signals (BUY OB / SELL OB) ---
     if(hasBullOB && bullConf)
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
-        FindTpTargets(obEntry, 1, tp1ob, tp2ob, tp3ob);
-        RecordCooldown(obCenter);
-        Print("SR_Zones_EA: BUY OB | Type=", obType, " Center=", obCenter,
-              " Entry=", obEntry, " SL=", obSL);
+        FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob);
+        RecordCooldown(obBuyCenter);
+        Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
+              " Entry=", obBuyEntry, " SL=", obBuySL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, obType, obCenter);
-        else if(IsStopLevelValid(_Symbol, obSL, ORDER_TYPE_BUY))
+            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
+        else if(IsStopLevelValid(_Symbol, obBuySL, ORDER_TYPE_BUY))
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obEntry, obSL, InpLotInitial))
+            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, obBuySL, InpLotInitial))
                 Print("SR_Zones_EA: BUY OB OpenInitial failed.");
             else
-                SendTradeAlert("BUY OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+                SendTradeAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, InpLotInitial);
         }
         return;
     }
@@ -1743,19 +1762,19 @@ void OnTick()
     if(hasBearOB && bearConf)
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
-        FindTpTargets(obEntry, -1, tp1ob, tp2ob, tp3ob);
-        RecordCooldown(obCenter);
-        Print("SR_Zones_EA: SELL OB | Type=", obType, " Center=", obCenter,
-              " Entry=", obEntry, " SL=", obSL);
+        FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob);
+        RecordCooldown(obSelCenter);
+        Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
+              " Entry=", obSelEntry, " SL=", obSelSL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, obType, obCenter);
-        else if(IsStopLevelValid(_Symbol, obSL, ORDER_TYPE_SELL))
+            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
+        else if(IsStopLevelValid(_Symbol, obSelSL, ORDER_TYPE_SELL))
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obEntry, obSL, InpLotInitial))
+            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, obSelSL, InpLotInitial))
                 Print("SR_Zones_EA: SELL OB OpenInitial failed.");
             else
-                SendTradeAlert("SELL OB", obEntry, obSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+                SendTradeAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
         }
         return;
     }

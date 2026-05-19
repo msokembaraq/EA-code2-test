@@ -163,7 +163,6 @@ bool CPyramidEngine::OpenInitial(ENUM_POSITION_TYPE direction, double price,
         return false;
     }
 
-    Sleep(100);
     ulong ticket = GetTicketFromLastDeal();
     if(ticket == 0)
     {
@@ -258,6 +257,10 @@ void CPyramidEngine::Manage()
     bool addon1_alive = m_state.addon1_open && PositionStillOpen(m_state.ticket_addon1);
     bool addon2_alive = m_state.addon2_open && PositionStillOpen(m_state.ticket_addon2);
 
+    // Sync open flags in case addons were closed externally (manual close / margin call)
+    if(m_state.addon1_open && !addon1_alive) m_state.addon1_open = false;
+    if(m_state.addon2_open && !addon2_alive) m_state.addon2_open = false;
+
     if(!init_alive && !addon1_alive && !addon2_alive)
     {
         Print("PyramidEngine: All positions closed. Resetting.");
@@ -335,7 +338,6 @@ void CPyramidEngine::Manage()
 
         if(opened)
         {
-            Sleep(100);
             ulong ticket = GetTicketFromLastDeal();
             if(ticket > 0)
             {
@@ -377,7 +379,6 @@ void CPyramidEngine::Manage()
 
         if(opened)
         {
-            Sleep(100);
             ulong ticket = GetTicketFromLastDeal();
             if(ticket > 0)
             {
@@ -407,13 +408,27 @@ void CPyramidEngine::Manage()
         {
             double candidate = NormalizeDouble(bid - trail_dist, _Digits);
             if(candidate > m_state.unified_stop + trail_step)
-                ModifyAllStops(candidate); // validation inside ModifyAllStops
+            {
+                if(!ModifyAllStops(candidate))
+                {
+                    m_state.unified_stop = candidate;
+                    m_sl_needs_retry     = true;
+                    Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
+                }
+            }
         }
         else
         {
             double candidate = NormalizeDouble(ask + trail_dist, _Digits);
             if(candidate < m_state.unified_stop - trail_step)
-                ModifyAllStops(candidate);
+            {
+                if(!ModifyAllStops(candidate))
+                {
+                    m_state.unified_stop = candidate;
+                    m_sl_needs_retry     = true;
+                    Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
+                }
+            }
         }
     }
 }
@@ -473,7 +488,13 @@ void CPyramidEngine::RecoverState()
             m_state.direction      = dir;
         }
 
-        m_state.unified_stop = sl;
+        // Use the most advanced (tightest) SL across all recovered positions
+        if(!m_state.active)
+            m_state.unified_stop = sl; // first position: take as-is
+        else if(dir == POSITION_TYPE_BUY)
+            m_state.unified_stop = MathMax(m_state.unified_stop, sl); // buy: highest SL locks most profit
+        else
+            m_state.unified_stop = MathMin(m_state.unified_stop, sl); // sell: lowest SL locks most profit
         m_state.active       = true;
     }
 
