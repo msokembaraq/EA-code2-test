@@ -1301,17 +1301,6 @@ int StochDirection()
     return kAboveD ? 1 : (kBelowD ? -1 : 0);
 }
 
-// StochZoneLabel: returns human-readable zone for notification context
-string StochZoneLabel()
-{
-    double kBuf[];
-    ArraySetAsSeries(kBuf, true);
-    if(CopyBuffer(stochHandle, 0, 0, 2, kBuf) < 2) return "N/A";
-    double k1 = kBuf[1];
-    if(k1 >= InpStochOB) return "OB";
-    if(k1 <= InpStochOS) return "OS";
-    return "MID";
-}
 
 //+------------------------------------------------------------------+
 //| Send push notification helper                                    |
@@ -1333,8 +1322,7 @@ void SendAlert(string msg)
 //+------------------------------------------------------------------+
 void SendSignalAlert(string direction, double entry, double sl,
                      double tp1, double tp2, double tp3,
-                     string zoneType, double zoneCenter,
-                     string stochCtx = "")
+                     string zoneType, double zoneCenter)
 {
     string sym = _Symbol;
     int    dg  = _Digits;
@@ -1349,7 +1337,6 @@ void SendSignalAlert(string direction, double entry, double sl,
         "[%s] %s SIGNAL\n"
         "Zone: %s @ %s\n"
         "Bias: %s\n"
-        "Stoch: %s\n"
         "Entry: %s\n"
         "SL: %s\n"
         "TP1: %s\n"
@@ -1359,7 +1346,6 @@ void SendSignalAlert(string direction, double entry, double sl,
         sym, direction,
         zoneType, DoubleToString(zoneCenter, dg),
         biasStr,
-        stochCtx,
         DoubleToString(entry, dg),
         DoubleToString(sl, dg),
         tp1 > 0 ? DoubleToString(tp1, dg) : "-",
@@ -1808,14 +1794,7 @@ void OnTick()
     bool bullCandle  = HasBullishPattern();
     bool bearCandle  = HasBearishPattern();
 
-    // Stoch: directional reader — shown in notification, NOT a gate
-    int    stochDir  = InpUseStoch ? StochDirection() : 0; // +1 bull, -1 bear, 0 neutral
-    string stochZone = InpUseStoch ? StochZoneLabel() : "OFF";
-    string stochCtx  = StringFormat("%s %s",
-                           stochDir > 0 ? "BULL" : (stochDir < 0 ? "BEAR" : "NEUT"),
-                           stochZone);
-
-    // Candle pattern is the sole entry gate; stoch provides context only
+    // Candle pattern is the sole entry gate
     bool bullConf = bullCandle;
     bool bearConf = bearCandle;
 
@@ -1859,7 +1838,7 @@ void OnTick()
               " Entry=", obBuyEntry, " SL=", obBuySL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter, stochCtx);
+            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
         else if(IsStopLevelValid(_Symbol, obBuySL, ORDER_TYPE_BUY))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, obBuySL, InpLotInitial))
@@ -1880,7 +1859,7 @@ void OnTick()
               " Entry=", obSelEntry, " SL=", obSelSL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter, stochCtx);
+            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
         else if(IsStopLevelValid(_Symbol, obSelSL, ORDER_TYPE_SELL))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, obSelSL, InpLotInitial))
@@ -1901,7 +1880,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
+            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
@@ -1928,7 +1907,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
+            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
@@ -1955,7 +1934,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
+            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
@@ -1982,7 +1961,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
+            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
@@ -2014,7 +1993,7 @@ void OnTick()
               " Entry=", entry, " SL=", sl);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
+            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
@@ -2039,7 +2018,7 @@ void OnTick()
               " Entry=", entry, " SL=", sl);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
+            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
