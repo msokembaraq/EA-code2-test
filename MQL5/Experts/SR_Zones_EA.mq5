@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.22"
+#property version   "1.23"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -1152,9 +1152,16 @@ void SendSignalAlert(string direction, double entry, double sl,
     string sym = _Symbol;
     int    dg  = _Digits;
 
+    string biasStr;
+    if(structureBias > 0)      biasStr = "BULLISH";
+    else if(structureBias < 0) biasStr = "BEARISH";
+    else if(isRanging)         biasStr = "RANGING";
+    else                       biasStr = "UNCLEAR";
+
     string msg = StringFormat(
         "[%s] %s SIGNAL\n"
         "Zone: %s @ %s\n"
+        "Bias: %s\n"
         "Entry: %s\n"
         "SL: %s\n"
         "TP1: %s\n"
@@ -1163,6 +1170,7 @@ void SendSignalAlert(string direction, double entry, double sl,
         "TF: %s",
         sym, direction,
         zoneType, DoubleToString(zoneCenter, dg),
+        biasStr,
         DoubleToString(entry, dg),
         DoubleToString(sl, dg),
         tp1 > 0 ? DoubleToString(tp1, dg) : "-",
@@ -1654,61 +1662,55 @@ void OnTick()
 
     int barIdx2 = (int)SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) - 1;
 
-    // --- Check BUY (support bounce) ---
-    if(!InpRetestOnly && (trendDir >= 0) && structAllowBuy && bullConf &&
-       CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
+    // Signal dispatch priority (highest quality first):
+    //   1. OB (CHoCH/BOS) — single-candle precision, tightest SL
+    //   2. Retest         — flipped zone, strong structural confluence
+    //   3. Raw bounce     — live zone touch (only when InpRetestOnly=false)
+    //   4. Sweep          — ranging manipulation / stop hunt reversal
+
+    // --- 1a. BUY Order Block ---
+    if(hasBullOB && bullConf)
     {
-        Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
-              " Entry=", entry, " SL=", sl);
-        FindTpTargets(entry, 1, tp1, tp2, tp3);
-        RecordCooldown(zoneCenter);
+        double tp1ob = 0, tp2ob = 0, tp3ob = 0;
+        FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob);
+        RecordCooldown(obBuyCenter);
+        Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
+              " Entry=", obBuyEntry, " SL=", obBuySL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
-        else
+            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
+        else if(IsStopLevelValid(_Symbol, obBuySL, ORDER_TYPE_BUY))
         {
-            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
-            {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
-                    Print("SR_Zones_EA: BUY OpenInitial returned false.");
-                else
-                    SendTradeAlert("BUY", entry, sl, tp1, tp2, tp3, InpLotInitial);
-            }
+            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, obBuySL, InpLotInitial))
+                Print("SR_Zones_EA: BUY OB OpenInitial failed.");
             else
-                PrintFormat("SR_Zones_EA: BUY SL too close to market. SL=%.5f Ask=%.5f",
-                            sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+                SendTradeAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, InpLotInitial);
         }
         return;
     }
 
-    // --- Check SELL (resistance reject) ---
-    if(!InpRetestOnly && (trendDir <= 0) && structAllowSell && bearConf &&
-       CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
+    // --- 1b. SELL Order Block ---
+    if(hasBearOB && bearConf)
     {
-        Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
-              " Entry=", entry, " SL=", sl);
-        FindTpTargets(entry, -1, tp1, tp2, tp3);
-        RecordCooldown(zoneCenter);
+        double tp1ob = 0, tp2ob = 0, tp3ob = 0;
+        FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob);
+        RecordCooldown(obSelCenter);
+        Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
+              " Entry=", obSelEntry, " SL=", obSelSL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
-        else
+            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
+        else if(IsStopLevelValid(_Symbol, obSelSL, ORDER_TYPE_SELL))
         {
-            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
-            {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
-                    Print("SR_Zones_EA: SELL OpenInitial returned false.");
-                else
-                    SendTradeAlert("SELL", entry, sl, tp1, tp2, tp3, InpLotInitial);
-            }
+            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, obSelSL, InpLotInitial))
+                Print("SR_Zones_EA: SELL OB OpenInitial failed.");
             else
-                PrintFormat("SR_Zones_EA: SELL SL too close to market. SL=%.5f Bid=%.5f",
-                            sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
+                SendTradeAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
         }
         return;
     }
 
-    // --- Check BUY retest (broken resistance → flipped support) ---
+    // --- 2a. BUY retest (broken resistance → flipped support) ---
     if((trendDir >= 0) && structAllowBuy && bullConf &&
        CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
@@ -1735,7 +1737,7 @@ void OnTick()
         return;
     }
 
-    // --- Check SELL retest (broken support → flipped resistance) ---
+    // --- 2b. SELL retest (broken support → flipped resistance) ---
     if((trendDir <= 0) && structAllowSell && bearConf &&
        CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
@@ -1762,43 +1764,56 @@ void OnTick()
         return;
     }
 
-    // --- Order Block signals (BUY OB / SELL OB) ---
-    if(hasBullOB && bullConf)
+    // --- 3a. BUY raw bounce (live support touch) ---
+    if(!InpRetestOnly && (trendDir >= 0) && structAllowBuy && bullConf &&
+       CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
-        double tp1ob = 0, tp2ob = 0, tp3ob = 0;
-        FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob);
-        RecordCooldown(obBuyCenter);
-        Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
-              " Entry=", obBuyEntry, " SL=", obBuySL);
+        Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
+              " Entry=", entry, " SL=", sl);
+        FindTpTargets(entry, 1, tp1, tp2, tp3);
+        RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
-        else if(IsStopLevelValid(_Symbol, obBuySL, ORDER_TYPE_BUY))
+            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+        else
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, obBuySL, InpLotInitial))
-                Print("SR_Zones_EA: BUY OB OpenInitial failed.");
+            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
+            {
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                    Print("SR_Zones_EA: BUY OpenInitial returned false.");
+                else
+                    SendTradeAlert("BUY", entry, sl, tp1, tp2, tp3, InpLotInitial);
+            }
             else
-                SendTradeAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+                PrintFormat("SR_Zones_EA: BUY SL too close to market. SL=%.5f Ask=%.5f",
+                            sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
         }
         return;
     }
 
-    if(hasBearOB && bearConf)
+    // --- 3b. SELL raw bounce (live resistance touch) ---
+    if(!InpRetestOnly && (trendDir <= 0) && structAllowSell && bearConf &&
+       CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
-        double tp1ob = 0, tp2ob = 0, tp3ob = 0;
-        FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob);
-        RecordCooldown(obSelCenter);
-        Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
-              " Entry=", obSelEntry, " SL=", obSelSL);
+        Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
+              " Entry=", entry, " SL=", sl);
+        FindTpTargets(entry, -1, tp1, tp2, tp3);
+        RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
-        else if(IsStopLevelValid(_Symbol, obSelSL, ORDER_TYPE_SELL))
+            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+        else
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, obSelSL, InpLotInitial))
-                Print("SR_Zones_EA: SELL OB OpenInitial failed.");
+            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
+            {
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                    Print("SR_Zones_EA: SELL OpenInitial returned false.");
+                else
+                    SendTradeAlert("SELL", entry, sl, tp1, tp2, tp3, InpLotInitial);
+            }
             else
-                SendTradeAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+                PrintFormat("SR_Zones_EA: SELL SL too close to market. SL=%.5f Bid=%.5f",
+                            sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
         return;
     }
