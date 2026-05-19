@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.24"
+#property version   "1.25"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -95,13 +95,6 @@ input int    InpOBLookback      = 10;    // Bars to scan back for OB candle afte
 input int    InpMaxOBZones      = 6;     // Max active OBs to track per side
 input double InpOBSlBuffer      = 1.0;   // SL buffer beyond OB wick (x ATR)
 
-input group "=== Trend Filter (HTF MA – optional, disabled by default) ==="
-input bool             InpUseTrendFilter = false;         // HTF MA filter (structure is primary)
-input ENUM_TIMEFRAMES  InpTrendTF        = PERIOD_H1;     // Higher timeframe for trend MA
-input int              InpTrendMAPeriod  = 200;           // Trend MA period
-input ENUM_MA_METHOD   InpTrendMAMethod  = MODE_EMA;      // Trend MA method
-input int              InpTrendMAShift   = 0;             // Trend MA shift
-
 input group "=== Entry Filter ==="
 input int    InpSigCooldownBars = 20;    // Bars between signals on same zone (M5: 20 bars = 100 min)
 input bool   InpUseVolFilter    = false; // Enable ATR volatility filter (disable for Gold/indices)
@@ -155,7 +148,7 @@ input ENUM_TIMEFRAMES InpStochTF      = PERIOD_M12;   // Stochastic timeframe (M
 input int             InpStochK       = 10;           // Stochastic %K period
 input int             InpStochD       = 4;            // Stochastic %D period
 input int             InpStochSlowing = 3;            // Stochastic slowing
-input double          InpStochOB      = 85.0;         // Overbought level – sell zone (85-100)
+input double          InpStochOB      = 70.0;         // Overbought level – sell zone (70-100)
 input double          InpStochOS      = 20.0;         // Oversold level  – buy zone  (0-20)
 
 //+------------------------------------------------------------------+
@@ -164,7 +157,6 @@ input double          InpStochOS      = 20.0;         // Oversold level  – buy
 CPyramidEngine  pyramid;
 int             atrHandle;
 int             atrZoneHandle;   // persistent ATR(50) for zone weight calculation
-int             trendMAHandle;
 int             stochHandle;
 int             pivLeft, pivRight;
 double          clusterTol;
@@ -183,7 +175,6 @@ int     lastBreakCheckBar = -1;
 
 // Log throttle: only print zone details when counts change
 int     lastLogRes = -1, lastLogSup = -1, lastLogBroken = -1;
-int     lastLogTrend = 0;
 int     lastLogStructure = 0;  // throttle structure bias log
 
 // Swing structure state
@@ -813,21 +804,6 @@ int FindTpTargets(double fromPrice, int direction, double &tp1, double &tp2, dou
 }
 
 //+------------------------------------------------------------------+
-//| Trend direction: +1 = bullish, -1 = bearish, 0 = filter off     |
-//+------------------------------------------------------------------+
-int TrendDirection()
-{
-    if(!InpUseTrendFilter) return 0;
-
-    double maBuf[];
-    ArraySetAsSeries(maBuf, true);
-    if(CopyBuffer(trendMAHandle, 0, 0, 1, maBuf) <= 0) return 0;
-
-    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    return (price > maBuf[0]) ? 1 : -1;
-}
-
-//+------------------------------------------------------------------+
 //| Swing structure: BOS, ranging, manipulation                      |
 //|  +1 = bullish BOS (HH+HL) → buys only                           |
 //|  -1 = bearish BOS (LH+LL) → sells only                          |
@@ -1290,33 +1266,51 @@ bool HasBearishPattern()
 // +1 = bullish stoch confirmation, -1 = bearish, 0 = no confirmation
 // Logic: HTF stochastic K must be in OB/OS zone AND K must cross D on the
 // last completed HTF bar (K[2] on opposite side of D[2], K[1] crossed over D[1])
-int StochConfluence()
+// StochDirection: directional confluence reader (not a hard gate).
+// Returns: +1 bullish, -1 bearish, 0 neutral/unavailable.
+// Zone logic (based on closed bar [1] K vs D):
+//   OB zone (K >= InpStochOB, default 70): K > D = bullish continuation; K crossed below D = bearish
+//   OS zone (K <= InpStochOS, default 20): K < D = bearish continuation; K crossed above D = bullish
+//   Mid zone (InpStochOS < K < InpStochOB): K > D = bullish; K < D = bearish
+// Cross FROM OB downward is the primary bearish signal; cross FROM OS upward is the primary bullish signal.
+int StochDirection()
 {
-    if(!InpUseStoch) return 0;
-
     double kBuf[], dBuf[];
     ArraySetAsSeries(kBuf, true);
     ArraySetAsSeries(dBuf, true);
     if(CopyBuffer(stochHandle, 0, 0, 3, kBuf) < 3) return 0;
     if(CopyBuffer(stochHandle, 1, 0, 3, dBuf) < 3) return 0;
 
-    double k1 = kBuf[1], k2 = kBuf[2];
+    double k1 = kBuf[1], k2 = kBuf[2]; // closed bar
     double d1 = dBuf[1], d2 = dBuf[2];
 
-    // Bullish: K in oversold zone (0-20) AND K crossed above D
-    // Cross: previous bar K was below D, current bar K is above D
-    bool kInOS        = (k1 <= InpStochOS);
-    bool kCrossedUpD  = (k2 < d2 && k1 > d1);
-    bool bullish      = kInOS && kCrossedUpD;
+    bool crossedUp   = (k2 < d2 && k1 >= d1); // K crossed above D
+    bool crossedDown = (k2 > d2 && k1 <= d1); // K crossed below D
+    bool kAboveD     = (k1 > d1);
+    bool kBelowD     = (k1 < d1);
 
-    // Bearish: K in overbought zone (85-100) AND K crossed below D
-    bool kInOB        = (k1 >= InpStochOB);
-    bool kCrossedDnD  = (k2 > d2 && k1 < d1);
-    bool bearish      = kInOB && kCrossedDnD;
+    // OB zone (≥ InpStochOB): crossed down = bearish; K still above D = bullish continuation
+    if(k1 >= InpStochOB)
+        return crossedDown ? -1 : (kAboveD ? 1 : 0);
 
-    if(bullish) return  1;
-    if(bearish) return -1;
-    return 0;
+    // OS zone (≤ InpStochOS): crossed up = bullish; K still below D = bearish continuation
+    if(k1 <= InpStochOS)
+        return crossedUp ? 1 : (kBelowD ? -1 : 0);
+
+    // Mid zone (InpStochOS < K < InpStochOB): direction by K vs D
+    return kAboveD ? 1 : (kBelowD ? -1 : 0);
+}
+
+// StochZoneLabel: returns human-readable zone for notification context
+string StochZoneLabel()
+{
+    double kBuf[];
+    ArraySetAsSeries(kBuf, true);
+    if(CopyBuffer(stochHandle, 0, 0, 2, kBuf) < 2) return "N/A";
+    double k1 = kBuf[1];
+    if(k1 >= InpStochOB) return "OB";
+    if(k1 <= InpStochOS) return "OS";
+    return "MID";
 }
 
 //+------------------------------------------------------------------+
@@ -1339,7 +1333,8 @@ void SendAlert(string msg)
 //+------------------------------------------------------------------+
 void SendSignalAlert(string direction, double entry, double sl,
                      double tp1, double tp2, double tp3,
-                     string zoneType, double zoneCenter)
+                     string zoneType, double zoneCenter,
+                     string stochCtx = "")
 {
     string sym = _Symbol;
     int    dg  = _Digits;
@@ -1354,6 +1349,7 @@ void SendSignalAlert(string direction, double entry, double sl,
         "[%s] %s SIGNAL\n"
         "Zone: %s @ %s\n"
         "Bias: %s\n"
+        "Stoch: %s\n"
         "Entry: %s\n"
         "SL: %s\n"
         "TP1: %s\n"
@@ -1363,6 +1359,7 @@ void SendSignalAlert(string direction, double entry, double sl,
         sym, direction,
         zoneType, DoubleToString(zoneCenter, dg),
         biasStr,
+        stochCtx,
         DoubleToString(entry, dg),
         DoubleToString(sl, dg),
         tp1 > 0 ? DoubleToString(tp1, dg) : "-",
@@ -1669,14 +1666,6 @@ int OnInit()
         return INIT_FAILED;
     }
 
-    trendMAHandle = iMA(_Symbol, InpTrendTF, InpTrendMAPeriod, InpTrendMAShift,
-                        InpTrendMAMethod, PRICE_CLOSE);
-    if(trendMAHandle == INVALID_HANDLE)
-    {
-        Print("SR_Zones_EA: Failed to create trend MA handle.");
-        return INIT_FAILED;
-    }
-
     stochHandle = iStochastic(_Symbol, InpStochTF, InpStochK, InpStochD, InpStochSlowing,
                               MODE_SMA, STO_LOWHIGH);
     if(stochHandle == INVALID_HANDLE)
@@ -1732,7 +1721,6 @@ void OnDeinit(const int reason)
     SaveState();
     IndicatorRelease(atrHandle);
     IndicatorRelease(atrZoneHandle);
-    IndicatorRelease(trendMAHandle);
     IndicatorRelease(stochHandle);
 }
 
@@ -1816,23 +1804,20 @@ void OnTick()
         return;
     }
 
-    int trendDir = TrendDirection(); // +1 bull, -1 bear, 0 filter off
-    if(InpUseTrendFilter && trendDir != lastLogTrend)
-    {
-        PrintFormat("SR_Zones_EA: Trend changed → %s (HTF %s EMA%d)",
-                    trendDir > 0 ? "BULL" : "BEAR",
-                    EnumToString(InpTrendTF), InpTrendMAPeriod);
-        lastLogTrend = trendDir;
-    }
-
-    // Evaluate candle and stochastic confluence once per bar (shared by all signal types)
+    // Evaluate candle confluence (primary gate) and stochastic direction (context only)
     bool bullCandle  = HasBullishPattern();
     bool bearCandle  = HasBearishPattern();
-    int  stochConf   = StochConfluence(); // +1 bull, -1 bear, 0 = no conf / filter off
 
-    // When stoch enabled: require explicit +1/-1 confirmation (cross in OB/OS zone)
-    bool bullConf = bullCandle && (InpUseStoch ? (stochConf == 1)  : true);
-    bool bearConf = bearCandle && (InpUseStoch ? (stochConf == -1) : true);
+    // Stoch: directional reader — shown in notification, NOT a gate
+    int    stochDir  = InpUseStoch ? StochDirection() : 0; // +1 bull, -1 bear, 0 neutral
+    string stochZone = InpUseStoch ? StochZoneLabel() : "OFF";
+    string stochCtx  = StringFormat("%s %s",
+                           stochDir > 0 ? "BULL" : (stochDir < 0 ? "BEAR" : "NEUT"),
+                           stochZone);
+
+    // Candle pattern is the sole entry gate; stoch provides context only
+    bool bullConf = bullCandle;
+    bool bearConf = bearCandle;
 
     // Structure gate
     // +1 bullish BOS → buys only
@@ -1874,7 +1859,7 @@ void OnTick()
               " Entry=", obBuyEntry, " SL=", obBuySL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
+            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter, stochCtx);
         else if(IsStopLevelValid(_Symbol, obBuySL, ORDER_TYPE_BUY))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, obBuySL, InpLotInitial))
@@ -1895,7 +1880,7 @@ void OnTick()
               " Entry=", obSelEntry, " SL=", obSelSL);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
+            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter, stochCtx);
         else if(IsStopLevelValid(_Symbol, obSelSL, ORDER_TYPE_SELL))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, obSelSL, InpLotInitial))
@@ -1907,7 +1892,7 @@ void OnTick()
     }
 
     // --- 2a. BUY retest (broken resistance → flipped support) ---
-    if((trendDir >= 0) && structAllowBuy && bullConf &&
+    if(structAllowBuy && bullConf &&
        CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1916,7 +1901,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
@@ -1934,7 +1919,7 @@ void OnTick()
     }
 
     // --- 2b. SELL retest (broken support → flipped resistance) ---
-    if((trendDir <= 0) && structAllowSell && bearConf &&
+    if(structAllowSell && bearConf &&
        CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1943,7 +1928,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
@@ -1961,7 +1946,7 @@ void OnTick()
     }
 
     // --- 3a. BUY raw bounce (live support touch) ---
-    if(!InpRetestOnly && (trendDir >= 0) && structAllowBuy && bullConf &&
+    if(!InpRetestOnly && structAllowBuy && bullConf &&
        CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1970,7 +1955,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
@@ -1988,7 +1973,7 @@ void OnTick()
     }
 
     // --- 3b. SELL raw bounce (live resistance touch) ---
-    if(!InpRetestOnly && (trendDir <= 0) && structAllowSell && bearConf &&
+    if(!InpRetestOnly && structAllowSell && bearConf &&
        CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
@@ -1997,7 +1982,7 @@ void OnTick()
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
         else
         {
             if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
@@ -2029,7 +2014,7 @@ void OnTick()
               " Entry=", entry, " SL=", sl);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
         else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
@@ -2054,7 +2039,7 @@ void OnTick()
               " Entry=", entry, " SL=", sl);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, stochCtx);
         else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
         {
             if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
