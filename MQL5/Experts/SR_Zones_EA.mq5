@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.29"
+#property version   "1.30"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -1532,6 +1532,7 @@ bool CheckRetestSell(double atr, double &outEntry, double &outSL,
 void ManageManualTrades()
 {
     if(!InpManageManual) return;
+    if(!InpUseSL)        return; // SL disabled — do not place breakeven or trailing stops on manual trades
 
     double pip      = GetPipSize(_Symbol);
     double be_buf   = InpManualBeBuffer  * pip;
@@ -1810,19 +1811,22 @@ void OnTick()
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob, atr);
-        obBuySL = ApplySLToggle(obBuySL);
         RecordCooldown(obBuyCenter);
         Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
               " Entry=", obBuyEntry, " SL=", obBuySL);
 
         if(InpMode == SIGNAL_MODE)
             SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
-        else if(IsStopLevelValid(_Symbol, obBuySL, ORDER_TYPE_BUY))
+        else
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, obBuySL, InpLotInitial))
-                Print("SR_Zones_EA: BUY OB OpenInitial failed.");
-            else
-                SendTradeAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+            double tradeSL = ApplySLToggle(obBuySL);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
+            {
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, tradeSL, InpLotInitial))
+                    Print("SR_Zones_EA: BUY OB OpenInitial failed.");
+                else
+                    SendTradeAlert("BUY OB", obBuyEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+            }
         }
         return;
     }
@@ -1832,19 +1836,22 @@ void OnTick()
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob, atr);
-        obSelSL = ApplySLToggle(obSelSL);
         RecordCooldown(obSelCenter);
         Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
               " Entry=", obSelEntry, " SL=", obSelSL);
 
         if(InpMode == SIGNAL_MODE)
             SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
-        else if(IsStopLevelValid(_Symbol, obSelSL, ORDER_TYPE_SELL))
+        else
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, obSelSL, InpLotInitial))
-                Print("SR_Zones_EA: SELL OB OpenInitial failed.");
-            else
-                SendTradeAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+            double tradeSL = ApplySLToggle(obSelSL);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
+            {
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, tradeSL, InpLotInitial))
+                    Print("SR_Zones_EA: SELL OB OpenInitial failed.");
+                else
+                    SendTradeAlert("SELL OB", obSelEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+            }
         }
         return;
     }
@@ -1853,7 +1860,6 @@ void OnTick()
     if(structAllowBuy && bullConf &&
        CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
-        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
@@ -1863,16 +1869,17 @@ void OnTick()
             SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
-            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
+            double tradeSL = ApplySLToggle(sl);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
                     Print("SR_Zones_EA: BUY RETEST OpenInitial returned false.");
                 else
-                    SendTradeAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("BUY RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
             }
             else
                 PrintFormat("SR_Zones_EA: BUY RETEST SL too close. SL=%.5f Ask=%.5f",
-                            sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+                            tradeSL, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
         }
         return;
     }
@@ -1881,7 +1888,6 @@ void OnTick()
     if(structAllowSell && bearConf &&
        CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx2))
     {
-        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
@@ -1891,16 +1897,17 @@ void OnTick()
             SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
-            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
+            double tradeSL = ApplySLToggle(sl);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
                     Print("SR_Zones_EA: SELL RETEST OpenInitial returned false.");
                 else
-                    SendTradeAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("SELL RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
             }
             else
                 PrintFormat("SR_Zones_EA: SELL RETEST SL too close. SL=%.5f Bid=%.5f",
-                            sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
+                            tradeSL, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
         return;
     }
@@ -1909,7 +1916,6 @@ void OnTick()
     if(!InpRetestOnly && structAllowBuy && bullConf &&
        CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
-        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
@@ -1919,16 +1925,17 @@ void OnTick()
             SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
-            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
+            double tradeSL = ApplySLToggle(sl);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
                     Print("SR_Zones_EA: BUY OpenInitial returned false.");
                 else
-                    SendTradeAlert("BUY", entry, sl, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("BUY", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
             }
             else
                 PrintFormat("SR_Zones_EA: BUY SL too close to market. SL=%.5f Ask=%.5f",
-                            sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+                            tradeSL, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
         }
         return;
     }
@@ -1937,7 +1944,6 @@ void OnTick()
     if(!InpRetestOnly && structAllowSell && bearConf &&
        CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
-        sl = ApplySLToggle(sl);
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
               " Entry=", entry, " SL=", sl);
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
@@ -1947,16 +1953,17 @@ void OnTick()
             SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
         else
         {
-            if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
+            double tradeSL = ApplySLToggle(sl);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
                     Print("SR_Zones_EA: SELL OpenInitial returned false.");
                 else
-                    SendTradeAlert("SELL", entry, sl, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("SELL", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
             }
             else
                 PrintFormat("SR_Zones_EA: SELL SL too close to market. SL=%.5f Bid=%.5f",
-                            sl, SymbolInfoDouble(_Symbol, SYMBOL_BID));
+                            tradeSL, SymbolInfoDouble(_Symbol, SYMBOL_BID));
         }
         return;
     }
@@ -1965,23 +1972,27 @@ void OnTick()
     // Bullish sweep: wick below rangeLow, close back inside → accumulation → BUY
     if(bullManip && bullConf && CooldownOk(rangeLow, atr))
     {
-        entry       = iClose(_Symbol, _Period, 1);
-        sl          = ApplySLToggle(NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits));
+        entry      = iClose(_Symbol, _Period, 1);
+        sl         = NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits);
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
-        zoneCenter  = rangeLow;
-        zoneType    = "Range Low Sweep";
+        zoneCenter = rangeLow;
+        zoneType   = "Range Low Sweep";
         RecordCooldown(zoneCenter);
         Print("SR_Zones_EA: BULL MANIPULATION | RangeLow=", rangeLow,
               " Entry=", entry, " SL=", sl);
 
         if(InpMode == SIGNAL_MODE)
             SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
-        else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_BUY))
+        else
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, sl, InpLotInitial))
-                Print("SR_Zones_EA: BUY SWEEP OpenInitial returned false.");
-            else
-                SendTradeAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, InpLotInitial);
+            double tradeSL = ApplySLToggle(sl);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
+            {
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
+                    Print("SR_Zones_EA: BUY SWEEP OpenInitial returned false.");
+                else
+                    SendTradeAlert("BUY SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+            }
         }
         return;
     }
@@ -1989,23 +2000,27 @@ void OnTick()
     // Bearish sweep: wick above rangeHigh, close back inside → distribution → SELL
     if(bearManip && bearConf && CooldownOk(rangeHigh, atr))
     {
-        entry       = iClose(_Symbol, _Period, 1);
-        sl          = ApplySLToggle(NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits));
+        entry      = iClose(_Symbol, _Period, 1);
+        sl         = NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits);
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
-        zoneCenter  = rangeHigh;
-        zoneType    = "Range High Sweep";
+        zoneCenter = rangeHigh;
+        zoneType   = "Range High Sweep";
         RecordCooldown(zoneCenter);
         Print("SR_Zones_EA: BEAR MANIPULATION | RangeHigh=", rangeHigh,
               " Entry=", entry, " SL=", sl);
 
         if(InpMode == SIGNAL_MODE)
             SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
-        else if(IsStopLevelValid(_Symbol, sl, ORDER_TYPE_SELL))
+        else
         {
-            if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, sl, InpLotInitial))
-                Print("SR_Zones_EA: SELL SWEEP OpenInitial returned false.");
-            else
-                SendTradeAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, InpLotInitial);
+            double tradeSL = ApplySLToggle(sl);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
+            {
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
+                    Print("SR_Zones_EA: SELL SWEEP OpenInitial returned false.");
+                else
+                    SendTradeAlert("SELL SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+            }
         }
     }
 }
