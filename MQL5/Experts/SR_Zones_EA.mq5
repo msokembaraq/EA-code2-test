@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.19"
+#property version   "1.20"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -164,6 +164,7 @@ input double          InpStochOS      = 20.0;         // Oversold level  – buy
 //+------------------------------------------------------------------+
 CPyramidEngine  pyramid;
 int             atrHandle;
+int             atrZoneHandle;   // persistent ATR(50) for zone weight calculation
 int             trendMAHandle;
 int             stochHandle;
 int             pivLeft, pivRight;
@@ -443,17 +444,16 @@ bool RebuildAllZones()
     int copied = CopyRates(_Symbol, _Period, 0, InpHistBars, rates);
     if(copied <= 0) return false;
 
-    // ATR on the copied window
+    // ATR on the copied window — uses persistent atrZoneHandle (created in OnInit, period=50)
     double atrBuf[];
     ArrayResize(atrBuf, copied);
     {
-        int h = iATR(_Symbol, _Period, 50);
-        if(h == INVALID_HANDLE) return false;
+        if(atrZoneHandle == INVALID_HANDLE) return false;
         double tmp[];
         ArraySetAsSeries(tmp, false);
-        CopyBuffer(h, 0, 0, copied, tmp);
-        IndicatorRelease(h);
-        for(int i = 0; i < copied; i++) atrBuf[i] = tmp[i];
+        int got = CopyBuffer(atrZoneHandle, 0, 0, copied, tmp);
+        if(got <= 0) return false;
+        for(int i = 0; i < got; i++) atrBuf[i] = tmp[i];
     }
 
     // Volume SMA (50)
@@ -885,7 +885,12 @@ void UpdateStructureBias()
 
         // Bearish CHoCH: bullish trend, price closes below last HL
         // Confluence: the swing high that formed LH is at a known resistance zone
-        if(structureBias == 1 && lastHL > 0 && close1 < lastHL && displaced)
+        // Guard: do not flip against an active long pyramid — wait for it to close first
+        bool pyrLong  = (InpMode == EA_MODE && pyramid.IsActive() &&
+                         pyramid.GetState().direction == POSITION_TYPE_BUY);
+        bool pyrShort = (InpMode == EA_MODE && pyramid.IsActive() &&
+                         pyramid.GetState().direction == POSITION_TYPE_SELL);
+        if(!pyrLong && structureBias == 1 && lastHL > 0 && close1 < lastHL && displaced)
         {
             bool zoneConf = !InpChochZoneConfluence ||
                             IsAtKnownZone(highPivots[hTop].price, resZones, resCount);
@@ -908,7 +913,7 @@ void UpdateStructureBias()
 
         // Bullish CHoCH: bearish trend, price closes above last LH
         // Confluence: the swing low that formed HL is at a known support zone
-        if(structureBias == -1 && lastLH > 0 && close1 > lastLH && displaced)
+        if(!pyrShort && structureBias == -1 && lastLH > 0 && close1 > lastLH && displaced)
         {
             bool zoneConf = !InpChochZoneConfluence ||
                             IsAtKnownZone(lowPivots[lTop].price, supZones, supCount);
@@ -1449,6 +1454,13 @@ int OnInit()
         return INIT_FAILED;
     }
 
+    atrZoneHandle = iATR(_Symbol, _Period, 50);
+    if(atrZoneHandle == INVALID_HANDLE)
+    {
+        Print("SR_Zones_EA: Failed to create zone ATR handle.");
+        return INIT_FAILED;
+    }
+
     trendMAHandle = iMA(_Symbol, InpTrendTF, InpTrendMAPeriod, InpTrendMAShift,
                         InpTrendMAMethod, PRICE_CLOSE);
     if(trendMAHandle == INVALID_HANDLE)
@@ -1504,6 +1516,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     IndicatorRelease(atrHandle);
+    IndicatorRelease(atrZoneHandle);
     IndicatorRelease(trendMAHandle);
     IndicatorRelease(stochHandle);
 }
@@ -1781,7 +1794,7 @@ void OnTick()
 
     // --- Manipulation signals (ranging market only) ---
     // Bullish sweep: wick below rangeLow, close back inside → accumulation → BUY
-    if(bullManip && bullConf)
+    if(bullManip && bullConf && CooldownOk(rangeLow, atr))
     {
         double pip  = GetPipSize(_Symbol);
         double atrV = atr;
@@ -1807,7 +1820,7 @@ void OnTick()
     }
 
     // Bearish sweep: wick above rangeHigh, close back inside → distribution → SELL
-    if(bearManip && bearConf)
+    if(bearManip && bearConf && CooldownOk(rangeHigh, atr))
     {
         double atrV = atr;
         entry       = iClose(_Symbol, _Period, 1);
