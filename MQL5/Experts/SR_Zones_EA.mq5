@@ -1816,7 +1816,7 @@ void OnTick()
     //   4. Sweep          — ranging manipulation / stop hunt reversal
 
     // --- 1a. BUY Order Block ---
-    if(hasBullOB && bullConf)
+    if(hasBullOB && bullConf && CooldownOk(obBuyCenter, atr))
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob);
@@ -1837,7 +1837,7 @@ void OnTick()
     }
 
     // --- 1b. SELL Order Block ---
-    if(hasBearOB && bearConf)
+    if(hasBearOB && bearConf && CooldownOk(obSelCenter, atr))
     {
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob);
