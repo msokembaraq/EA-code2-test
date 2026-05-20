@@ -1397,7 +1397,7 @@ void SendSignalAlert(string direction, double entry, double sl,
     if(InpUseH1Filter && h1Bias != 0)
     {
         bool aligned = (isBuy && h1Bias > 0) || (!isBuy && h1Bias < 0);
-        h1Str += aligned ? " SAFE" : " RISKY";
+        h1Str += aligned ? " (SAFE)" : " (RISKY)";
     }
 
     string tagStr = (tag != "") ? StringFormat(" [%s]", tag) : "";
