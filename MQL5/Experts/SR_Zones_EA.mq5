@@ -104,7 +104,7 @@ input double InpMaxAtrPips      = 2000;  // Max ATR pips (forex: ~80) / points (
 input int    InpAtrPeriod       = 14;    // ATR period
 
 input group "============== H1 STRUCTURE & SWEEP =============="
-input bool InpUseH1Filter   = true; // Show H1 bias on signals; tag counter-trend entries with [!]
+input bool InpUseH1Filter   = true; // Show H1 bias on signals; counter-trend entries tagged (RISKY)
 input bool InpH1SweepAlert  = true; // Push notification on confirmed H1 liquidity sweep
 input int  InpH1SweepExpiry = 8;    // H1 sweep tag expires after N H1 bars if no M5 signal fires
 
