@@ -1,31 +1,35 @@
 //+------------------------------------------------------------------+
 //|                                              PyramidEngine.mqh  |
-//|                 CPyramidEngine – safe pyramiding into winners    |
+//|          CPyramidEngine – backward-layering zone entry          |
+//|                                                                  |
+//| Layer 1 (probe, smallest lot) opens at zone edge on signal.     |
+//| Layer 2 and 3 open when price moves DEEPER into the zone,       |
+//| giving better entry prices and improving average cost.          |
+//| All layers share one unified SL at zone bottom.                 |
+//| SL hit = zone failed → main EA marks zone dead.                 |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.00"
+#property version   "2.00"
 
 #include <Trade\Trade.mqh>
 #include <Pyramid\PyramidUtils.mqh>
 
-//+------------------------------------------------------------------+
-//| Pyramid state (all positions in one pyramid)                     |
 //+------------------------------------------------------------------+
 struct SPyramidState
 {
     ulong   ticket_initial;
     ulong   ticket_addon1;
     ulong   ticket_addon2;
-    double  entry_price;
-    double  unified_stop;
-    long    direction;        // POSITION_TYPE_BUY or POSITION_TYPE_SELL
+    double  entry_price;       // layer 1 fill price
+    double  unified_stop;      // zone-bottom SL, shared by all layers
+    double  addon1_price;      // absolute price trigger for layer 2 (0 = disabled)
+    double  addon2_price;      // absolute price trigger for layer 3 (0 = disabled)
+    long    direction;
     bool    addon1_open;
     bool    addon2_open;
     bool    active;
 };
 
-//+------------------------------------------------------------------+
-//| CPyramidEngine                                                   |
 //+------------------------------------------------------------------+
 class CPyramidEngine
 {
@@ -35,19 +39,16 @@ private:
 
     ulong           m_magic;
     int             m_slippage;
-    double          m_lot_initial;
-    double          m_lot_addon1;
-    double          m_lot_addon2;
-    double          m_addon1_trigger_pips;
-    double          m_addon2_trigger_pips;
-    double          m_stop_after_addon1_pips;
-    double          m_stop_after_addon2_pips;
+    double          m_lot_initial;   // probe (smallest) — enters at zone edge
+    double          m_lot_addon1;    // mid lot
+    double          m_lot_addon2;    // largest lot — best price, deepest in zone
     bool            m_trail_after_full;
     double          m_trail_pips;
     double          m_trail_step_pips;
     bool            m_initialized;
-    bool            m_sl_needs_retry;   // retry SL modify when broker rejected on addon open
-    datetime        m_last_trail_bar;   // throttle: one trail update per bar
+    bool            m_sl_needs_retry;
+    datetime        m_last_trail_bar;
+    bool            m_closed_by_sl;  // true when last pyramid closed via SL hit
 
     void            ResetState();
     bool            ModifyAllStops(double new_stop);
@@ -60,18 +61,23 @@ public:
 
     bool            Init(ulong magic, int slippage,
                          double lot_initial, double lot_addon1, double lot_addon2,
-                         double addon1_trigger_pips, double addon2_trigger_pips,
-                         double stop_after_addon1_pips, double stop_after_addon2_pips,
                          bool trail_after_full, double trail_pips, double trail_step_pips);
 
-    bool            OpenInitial(ENUM_POSITION_TYPE direction, double price,
-                                double stop_loss, double lot, string comment = "SR_Pyramid");
+    // addon1_price / addon2_price: absolute price levels computed by main EA
+    // using zone width × depth %. Pass 0 to disable a layer (zone too narrow).
+    bool            OpenInitial(ENUM_POSITION_TYPE direction,
+                                double stop_loss,
+                                double addon1_price, double addon2_price,
+                                string comment = "SR_L1");
+
     void            Manage();
     void            HandleTransaction(const MqlTradeTransaction &trans);
     void            RecoverState();
-    bool            IsActive()   { return m_state.active; }
-    SPyramidState   GetState()   { return m_state; }
+    bool            IsActive()        { return m_state.active; }
+    SPyramidState   GetState()        { return m_state; }
     void            ClosePyramid();
+    bool            WasClosedBySL()   { return m_closed_by_sl; }
+    void            ClearSLFlag()     { m_closed_by_sl = false; }
 };
 
 //+------------------------------------------------------------------+
@@ -80,6 +86,7 @@ CPyramidEngine::CPyramidEngine()
     m_initialized    = false;
     m_sl_needs_retry = false;
     m_last_trail_bar = 0;
+    m_closed_by_sl   = false;
     ResetState();
 }
 
@@ -91,6 +98,8 @@ void CPyramidEngine::ResetState()
     m_state.ticket_addon2  = 0;
     m_state.entry_price    = 0.0;
     m_state.unified_stop   = 0.0;
+    m_state.addon1_price   = 0.0;
+    m_state.addon2_price   = 0.0;
     m_state.direction      = -1;
     m_state.addon1_open    = false;
     m_state.addon2_open    = false;
@@ -101,8 +110,6 @@ void CPyramidEngine::ResetState()
 //+------------------------------------------------------------------+
 bool CPyramidEngine::Init(ulong magic, int slippage,
                            double lot_initial, double lot_addon1, double lot_addon2,
-                           double addon1_trigger_pips, double addon2_trigger_pips,
-                           double stop_after_addon1_pips, double stop_after_addon2_pips,
                            bool trail_after_full, double trail_pips, double trail_step_pips)
 {
     if(!IsHedgingAccount())
@@ -110,38 +117,22 @@ bool CPyramidEngine::Init(ulong magic, int slippage,
         Print("PyramidEngine: Requires a retail hedging account.");
         return false;
     }
-
-    if(lot_initial <= lot_addon1 || lot_addon1 <= lot_addon2)
+    if(lot_initial <= 0 || lot_addon1 <= 0 || lot_addon2 <= 0)
     {
-        Print("PyramidEngine: Lots must be strictly decreasing (initial > addon1 > addon2).");
+        Print("PyramidEngine: All lot sizes must be > 0.");
         return false;
     }
 
-    if(addon1_trigger_pips >= addon2_trigger_pips)
-    {
-        Print("PyramidEngine: Addon2 trigger must exceed Addon1 trigger.");
-        return false;
-    }
-
-    if(stop_after_addon1_pips >= stop_after_addon2_pips)
-    {
-        Print("PyramidEngine: stop_after_addon2 must exceed stop_after_addon1 (SL must lock in more profit as pyramid grows).");
-        return false;
-    }
-
-    m_sl_needs_retry = false;
-    m_magic                  = magic;
-    m_slippage               = slippage;
-    m_lot_initial            = lot_initial;
-    m_lot_addon1             = lot_addon1;
-    m_lot_addon2             = lot_addon2;
-    m_addon1_trigger_pips    = addon1_trigger_pips;
-    m_addon2_trigger_pips    = addon2_trigger_pips;
-    m_stop_after_addon1_pips = stop_after_addon1_pips;
-    m_stop_after_addon2_pips = stop_after_addon2_pips;
-    m_trail_after_full       = trail_after_full;
-    m_trail_pips             = trail_pips;
-    m_trail_step_pips        = trail_step_pips;
+    m_magic             = magic;
+    m_slippage          = slippage;
+    m_lot_initial       = lot_initial;
+    m_lot_addon1        = lot_addon1;
+    m_lot_addon2        = lot_addon2;
+    m_trail_after_full  = trail_after_full;
+    m_trail_pips        = trail_pips;
+    m_trail_step_pips   = trail_step_pips;
+    m_sl_needs_retry    = false;
+    m_closed_by_sl      = false;
 
     m_trade.SetExpertMagicNumber(magic);
     m_trade.SetDeviationInPoints(slippage);
@@ -151,14 +142,20 @@ bool CPyramidEngine::Init(ulong magic, int slippage,
 }
 
 //+------------------------------------------------------------------+
-bool CPyramidEngine::OpenInitial(ENUM_POSITION_TYPE direction, double price,
-                                  double stop_loss, double lot, string comment)
+bool CPyramidEngine::OpenInitial(ENUM_POSITION_TYPE direction,
+                                  double stop_loss,
+                                  double addon1_price, double addon2_price,
+                                  string comment)
 {
     if(!m_initialized || m_state.active) return false;
 
+    double price = (direction == POSITION_TYPE_BUY)
+                   ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                   : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
     bool res = (direction == POSITION_TYPE_BUY)
-               ? m_trade.Buy(lot, _Symbol, price, stop_loss, 0, comment)
-               : m_trade.Sell(lot, _Symbol, price, stop_loss, 0, comment);
+               ? m_trade.Buy (m_lot_initial, _Symbol, price, stop_loss, 0, comment)
+               : m_trade.Sell(m_lot_initial, _Symbol, price, stop_loss, 0, comment);
 
     if(!res)
     {
@@ -176,14 +173,20 @@ bool CPyramidEngine::OpenInitial(ENUM_POSITION_TYPE direction, double price,
     m_state.ticket_initial = ticket;
     m_state.entry_price    = price;
     m_state.unified_stop   = stop_loss;
+    m_state.addon1_price   = addon1_price;
+    m_state.addon2_price   = addon2_price;
     m_state.direction      = (long)direction;
     m_state.addon1_open    = false;
     m_state.addon2_open    = false;
     m_state.active         = true;
+    m_closed_by_sl         = false;
 
-    Print("PyramidEngine: Initial opened. Ticket=", ticket,
-          " Dir=", (direction == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-          " SL=", stop_loss);
+    PrintFormat("PyramidEngine: L1 opened. Ticket=%I64u Dir=%s SL=%.5f L2@%.5f L3@%.5f",
+                ticket,
+                direction == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                stop_loss,
+                addon1_price > 0 ? addon1_price : 0.0,
+                addon2_price > 0 ? addon2_price : 0.0);
     return true;
 }
 
@@ -197,13 +200,11 @@ ulong CPyramidEngine::GetTicketFromLastDeal()
         return 0;
     }
 
-    // Load recent history so HistoryDealSelect can find the deal
     HistorySelect(TimeCurrent() - 60, TimeCurrent() + 1);
 
     if(!HistoryDealSelect(deal))
     {
         Print("PyramidEngine: HistoryDealSelect failed for deal=", deal);
-        // Fallback: scan open positions for our magic number
         for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
             ulong ticket = PositionGetTicket(i);
@@ -227,7 +228,6 @@ bool CPyramidEngine::PositionStillOpen(ulong ticket)
 //+------------------------------------------------------------------+
 bool CPyramidEngine::ModifyAllStops(double new_stop)
 {
-    // Validate against broker minimum stop distance before sending any request
     ENUM_ORDER_TYPE chk = (m_state.direction == POSITION_TYPE_BUY)
                           ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
     if(!IsStopLevelValid(_Symbol, new_stop, chk))
@@ -260,7 +260,6 @@ void CPyramidEngine::Manage()
     bool addon1_alive = m_state.addon1_open && PositionStillOpen(m_state.ticket_addon1);
     bool addon2_alive = m_state.addon2_open && PositionStillOpen(m_state.ticket_addon2);
 
-    // Sync open flags in case addons were closed externally (manual close / margin call)
     if(m_state.addon1_open && !addon1_alive) m_state.addon1_open = false;
     if(m_state.addon2_open && !addon2_alive) m_state.addon2_open = false;
 
@@ -271,35 +270,26 @@ void CPyramidEngine::Manage()
         return;
     }
 
-    // Retry SL modification for any position whose actual SL doesn't match unified_stop
+    // SL sync retry
     if(m_sl_needs_retry && m_state.unified_stop > 0)
     {
-        bool retry_ok = true;
         ENUM_ORDER_TYPE chk = (m_state.direction == POSITION_TYPE_BUY)
                               ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
         if(IsStopLevelValid(_Symbol, m_state.unified_stop, chk))
         {
-            if(init_alive)
-            {
-                if(PositionSelectByTicket(m_state.ticket_initial) &&
-                   MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
-                    if(!m_trade.PositionModify(m_state.ticket_initial, m_state.unified_stop, 0))
-                        retry_ok = false;
-            }
-            if(addon1_alive)
-            {
-                if(PositionSelectByTicket(m_state.ticket_addon1) &&
-                   MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
-                    if(!m_trade.PositionModify(m_state.ticket_addon1, m_state.unified_stop, 0))
-                        retry_ok = false;
-            }
-            if(addon2_alive)
-            {
-                if(PositionSelectByTicket(m_state.ticket_addon2) &&
-                   MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
-                    if(!m_trade.PositionModify(m_state.ticket_addon2, m_state.unified_stop, 0))
-                        retry_ok = false;
-            }
+            bool retry_ok = true;
+            if(init_alive && PositionSelectByTicket(m_state.ticket_initial) &&
+               MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
+                if(!m_trade.PositionModify(m_state.ticket_initial, m_state.unified_stop, 0))
+                    retry_ok = false;
+            if(addon1_alive && PositionSelectByTicket(m_state.ticket_addon1) &&
+               MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
+                if(!m_trade.PositionModify(m_state.ticket_addon1, m_state.unified_stop, 0))
+                    retry_ok = false;
+            if(addon2_alive && PositionSelectByTicket(m_state.ticket_addon2) &&
+               MathAbs(PositionGetDouble(POSITION_SL) - m_state.unified_stop) > _Point)
+                if(!m_trade.PositionModify(m_state.ticket_addon2, m_state.unified_stop, 0))
+                    retry_ok = false;
             if(retry_ok)
             {
                 Print("PyramidEngine: SL retry succeeded. UnifiedSL=", m_state.unified_stop);
@@ -308,101 +298,80 @@ void CPyramidEngine::Manage()
         }
     }
 
-    double pip     = GetPipSize(_Symbol);
-    double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double current = (m_state.direction == POSITION_TYPE_BUY) ? bid : ask;
+    double pip = GetPipSize(_Symbol);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    bool   isBuy = (m_state.direction == POSITION_TYPE_BUY);
 
-    double pips_gained = (m_state.direction == POSITION_TYPE_BUY)
-                         ? (current - m_state.entry_price) / pip
-                         : (m_state.entry_price - current) / pip;
-
-    ENUM_ORDER_TYPE order_type = (m_state.direction == POSITION_TYPE_BUY)
-                                 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-
-    // Addon 1 trigger
-    if(!m_state.addon1_open && pips_gained >= m_addon1_trigger_pips)
+    // Layer 2 trigger: price moves deeper into zone (lower for buy, higher for sell)
+    if(!m_state.addon1_open && m_state.addon1_price > 0)
     {
-        double price    = (m_state.direction == POSITION_TYPE_BUY) ? ask : bid;
-        double new_stop = (m_state.direction == POSITION_TYPE_BUY)
-                          ? m_state.entry_price + m_stop_after_addon1_pips * pip
-                          : m_state.entry_price - m_stop_after_addon1_pips * pip;
-        new_stop = NormalizeDouble(new_stop, _Digits);
-
-        if(!IsStopLevelValid(_Symbol, new_stop, order_type))
+        bool triggered = isBuy ? (bid <= m_state.addon1_price)
+                                : (ask >= m_state.addon1_price);
+        if(triggered)
         {
-            Print("PyramidEngine: Addon1 new SL too close to market – waiting.");
-            return;
-        }
-
-        bool opened = (m_state.direction == POSITION_TYPE_BUY)
-                      ? m_trade.Buy(m_lot_addon1, _Symbol, price, new_stop, 0, "SR_Addon1")
-                      : m_trade.Sell(m_lot_addon1, _Symbol, price, new_stop, 0, "SR_Addon1");
-
-        if(opened)
-        {
-            ulong ticket = GetTicketFromLastDeal();
-            if(ticket > 0)
+            double fillPrice = isBuy ? ask : bid;
+            string cmt       = "SR_L2";
+            bool opened = isBuy ? m_trade.Buy (m_lot_addon1, _Symbol, fillPrice, m_state.unified_stop, 0, cmt)
+                                : m_trade.Sell(m_lot_addon1, _Symbol, fillPrice, m_state.unified_stop, 0, cmt);
+            if(opened)
             {
-                m_state.ticket_addon1 = ticket;
-                m_state.addon1_open   = true;
-                if(!ModifyAllStops(new_stop))
+                ulong ticket = GetTicketFromLastDeal();
+                if(ticket > 0)
                 {
-                    m_state.unified_stop = new_stop; // store target even if modify partial-failed
-                    m_sl_needs_retry     = true;
-                    Print("PyramidEngine: Addon1 SL partial-fail – retry queued. TargetSL=", new_stop);
+                    m_state.ticket_addon1 = ticket;
+                    m_state.addon1_open   = true;
+                    // SL is already set correctly at open — sync all to be safe
+                    if(!ModifyAllStops(m_state.unified_stop))
+                        m_sl_needs_retry = true;
+                    else
+                        Print("PyramidEngine: L2 opened. Ticket=", ticket,
+                              " Entry=", fillPrice, " SL=", m_state.unified_stop);
+                    return;
                 }
-                else
-                    Print("PyramidEngine: Addon1 opened. Ticket=", ticket, " NewSL=", new_stop);
-                return; // gap-bar protection
             }
+            else
+                Print("PyramidEngine: L2 open failed. Err=", GetLastError());
         }
-        else
-            Print("PyramidEngine: Addon1 failed. Err=", GetLastError());
     }
 
-    // Addon 2 trigger
-    if(m_state.addon1_open && !m_state.addon2_open && pips_gained >= m_addon2_trigger_pips)
+    // Layer 3 trigger: requires layer 2 to be open first
+    if(m_state.addon1_open && !m_state.addon2_open && m_state.addon2_price > 0)
     {
-        double price    = (m_state.direction == POSITION_TYPE_BUY) ? ask : bid;
-        double new_stop = (m_state.direction == POSITION_TYPE_BUY)
-                          ? m_state.entry_price + m_stop_after_addon2_pips * pip
-                          : m_state.entry_price - m_stop_after_addon2_pips * pip;
-        new_stop = NormalizeDouble(new_stop, _Digits);
-
-        if(!IsStopLevelValid(_Symbol, new_stop, order_type))
+        bool triggered = isBuy ? (bid <= m_state.addon2_price)
+                                : (ask >= m_state.addon2_price);
+        if(triggered)
         {
-            Print("PyramidEngine: Addon2 new SL too close to market – waiting.");
-            return;
-        }
-
-        bool opened = (m_state.direction == POSITION_TYPE_BUY)
-                      ? m_trade.Buy(m_lot_addon2, _Symbol, price, new_stop, 0, "SR_Addon2")
-                      : m_trade.Sell(m_lot_addon2, _Symbol, price, new_stop, 0, "SR_Addon2");
-
-        if(opened)
-        {
-            ulong ticket = GetTicketFromLastDeal();
-            if(ticket > 0)
+            double fillPrice = isBuy ? ask : bid;
+            string cmt       = "SR_L3";
+            bool opened = isBuy ? m_trade.Buy (m_lot_addon2, _Symbol, fillPrice, m_state.unified_stop, 0, cmt)
+                                : m_trade.Sell(m_lot_addon2, _Symbol, fillPrice, m_state.unified_stop, 0, cmt);
+            if(opened)
             {
-                m_state.ticket_addon2 = ticket;
-                m_state.addon2_open   = true;
-                if(!ModifyAllStops(new_stop))
+                ulong ticket = GetTicketFromLastDeal();
+                if(ticket > 0)
                 {
-                    m_state.unified_stop = new_stop;
-                    m_sl_needs_retry     = true;
-                    Print("PyramidEngine: Addon2 SL partial-fail – retry queued. TargetSL=", new_stop);
+                    m_state.ticket_addon2 = ticket;
+                    m_state.addon2_open   = true;
+                    if(!ModifyAllStops(m_state.unified_stop))
+                        m_sl_needs_retry = true;
+                    else
+                        Print("PyramidEngine: L3 opened. Ticket=", ticket,
+                              " Entry=", fillPrice, " SL=", m_state.unified_stop);
                 }
-                else
-                    Print("PyramidEngine: Addon2 opened. Ticket=", ticket, " NewSL=", new_stop);
             }
+            else
+                Print("PyramidEngine: L3 open failed. Err=", GetLastError());
         }
-        else
-            Print("PyramidEngine: Addon2 failed. Err=", GetLastError());
     }
 
-    // Trailing stop after full pyramid — evaluated once per bar to avoid broker spam
-    if(m_trail_after_full && m_state.addon1_open && m_state.addon2_open)
+    // Trailing — starts when all available layers are filled
+    // If addon2_price=0 (layer 3 disabled): trail after layer 2 fills
+    // If both valid: trail after layer 3 fills
+    bool allLayersFilled = m_state.addon1_open &&
+                           (m_state.addon2_price <= 0 || m_state.addon2_open);
+
+    if(m_trail_after_full && allLayersFilled)
     {
         datetime bar_time = iTime(_Symbol, _Period, 0);
         if(bar_time != m_last_trail_bar)
@@ -412,7 +381,7 @@ void CPyramidEngine::Manage()
             double trail_dist = m_trail_pips      * pip;
             double trail_step = m_trail_step_pips * pip;
 
-            if(m_state.direction == POSITION_TYPE_BUY)
+            if(isBuy)
             {
                 double candidate = NormalizeDouble(bid - trail_dist, _Digits);
                 if(candidate > m_state.unified_stop + trail_step)
@@ -421,7 +390,6 @@ void CPyramidEngine::Manage()
                     {
                         m_state.unified_stop = candidate;
                         m_sl_needs_retry     = true;
-                        Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
                     }
                 }
             }
@@ -434,7 +402,6 @@ void CPyramidEngine::Manage()
                     {
                         m_state.unified_stop = candidate;
                         m_sl_needs_retry     = true;
-                        Print("PyramidEngine: Trail SL modify failed – retry queued. TargetSL=", candidate);
                     }
                 }
             }
@@ -448,11 +415,27 @@ void CPyramidEngine::HandleTransaction(const MqlTradeTransaction &trans)
     if(!m_state.active) return;
     if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
 
-    bool is_initial_close =
-        (trans.position == m_state.ticket_initial) &&
-        ((trans.deal_type == DEAL_TYPE_SELL && m_state.direction == POSITION_TYPE_BUY) ||
-         (trans.deal_type == DEAL_TYPE_BUY  && m_state.direction == POSITION_TYPE_SELL));
+    // Detect SL close for any layer in this pyramid
+    bool ours = (trans.position == m_state.ticket_initial) ||
+                (m_state.addon1_open && trans.position == m_state.ticket_addon1) ||
+                (m_state.addon2_open && trans.position == m_state.ticket_addon2);
+    bool isClose = (m_state.direction == POSITION_TYPE_BUY)
+                   ? (trans.deal_type == DEAL_TYPE_SELL)
+                   : (trans.deal_type == DEAL_TYPE_BUY);
 
+    if(ours && isClose)
+    {
+        HistorySelect(TimeCurrent() - 30, TimeCurrent() + 1);
+        if(HistoryDealSelect(trans.deal))
+        {
+            ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
+            if(reason == DEAL_REASON_SL)
+                m_closed_by_sl = true;
+        }
+    }
+
+    // If initial position closed, cascade-close any open layers
+    bool is_initial_close = (trans.position == m_state.ticket_initial) && isClose;
     if(is_initial_close)
     {
         if(m_state.addon1_open && PositionStillOpen(m_state.ticket_addon1))
@@ -489,17 +472,17 @@ void CPyramidEngine::RecoverState()
         if(PositionGetInteger(POSITION_MAGIC)  != (long)m_magic)  continue;
         if(PositionGetString(POSITION_SYMBOL)  != _Symbol)        continue;
 
-        string comment  = PositionGetString(POSITION_COMMENT);
-        long   dir      = PositionGetInteger(POSITION_TYPE);
-        double sl       = PositionGetDouble(POSITION_SL);
-        double open_p   = PositionGetDouble(POSITION_PRICE_OPEN);
+        string comment = PositionGetString(POSITION_COMMENT);
+        long   dir     = PositionGetInteger(POSITION_TYPE);
+        double sl      = PositionGetDouble(POSITION_SL);
+        double open_p  = PositionGetDouble(POSITION_PRICE_OPEN);
 
-        if(StringFind(comment, "Addon2") >= 0)
+        if(StringFind(comment, "L3") >= 0 || StringFind(comment, "Addon2") >= 0)
         {
             m_state.ticket_addon2 = ticket;
             m_state.addon2_open   = true;
         }
-        else if(StringFind(comment, "Addon1") >= 0)
+        else if(StringFind(comment, "L2") >= 0 || StringFind(comment, "Addon1") >= 0)
         {
             m_state.ticket_addon1 = ticket;
             m_state.addon1_open   = true;
@@ -511,17 +494,15 @@ void CPyramidEngine::RecoverState()
             m_state.direction      = dir;
         }
 
-        // Use the most advanced (tightest) SL across all recovered positions
         if(!m_state.active)
-            m_state.unified_stop = sl; // first position: take as-is
+            m_state.unified_stop = sl;
         else if(dir == POSITION_TYPE_BUY)
-            m_state.unified_stop = MathMax(m_state.unified_stop, sl); // buy: highest SL locks most profit
+            m_state.unified_stop = MathMax(m_state.unified_stop, sl);
         else
-            m_state.unified_stop = MathMin(m_state.unified_stop, sl); // sell: lowest SL locks most profit
-        m_state.active       = true;
+            m_state.unified_stop = MathMin(m_state.unified_stop, sl);
+        m_state.active = true;
     }
 
     if(m_state.active)
-        Print("PyramidEngine: Recovered. Addon1=", m_state.addon1_open,
-              " Addon2=", m_state.addon2_open);
+        Print("PyramidEngine: Recovered. L2=", m_state.addon1_open, " L3=", m_state.addon2_open);
 }

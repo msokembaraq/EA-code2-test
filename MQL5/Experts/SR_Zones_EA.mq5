@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.36"
+#property version   "2.00"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -111,20 +111,19 @@ input int  InpH1SweepExpiry = 8;    // H1 sweep tag expires after N H1 bars if n
 input group "============== TRADE SETTINGS =============="
 input ulong  InpMagic      = 202401;  // Magic number
 input int    InpSlippage   = 10;      // Slippage (points)
-input double InpLotInitial = 0.05;    // Initial lot (largest)
-input double InpLotAddon1  = 0.03;    // Add-on 1 lot
-input double InpLotAddon2  = 0.02;    // Add-on 2 lot
+input double InpLotInitial = 0.02;    // Layer 1 lot — probe (smallest, fires at zone edge)
+input double InpLotAddon1  = 0.03;    // Layer 2 lot — mid
+input double InpLotAddon2  = 0.05;    // Layer 3 lot — largest (best price, deepest in zone)
 input bool   InpUseSL      = true;    // Use stop loss (false = open trades with no SL)
-input double InpSlZoneBuffer = 1.5;   // SL buffer beyond zone edge (x ATR) – 1.5x gives breathing room
+input double InpSlZoneBuffer = 1.5;   // SL buffer beyond zone edge (x ATR)
 
-input group "============== PYRAMID TRIGGERS =============="
-input double InpAddon1TrigPips  = 1500; // Add-on 1 trigger (pips) – Gold: 1500 = $15 sustained move
-input double InpAddon2TrigPips  = 2500; // Add-on 2 trigger (pips) – Gold: 2500 = $25
-input double InpStopAddon1Pips  = 300;  // SL above entry after add-on 1 – Gold $3 (gap to addon=$12, > broker min)
-input double InpStopAddon2Pips  = 1200; // SL above entry after add-on 2 – Gold $12 (must be > addon1 stop)
-input bool   InpTrailAfterFull  = true; // Trail after full pyramid
-input double InpTrailPips       = 200;  // Trail distance – Gold: 200 = $2
-input double InpTrailStepPips   = 200;  // Trail step – Gold: 200 = $2.00 (min move before SL advances)
+input group "============== LAYERING =============="
+input double InpLayer1DepthPct  = 0.35;  // Layer 2 trigger: % of zone height from entry toward SL
+input double InpLayer2DepthPct  = 0.70;  // Layer 3 trigger: % of zone height (must be > Layer1)
+input int    InpLayerJitterPips = 4;     // Random ± pip offset on each layer trigger (anti-pattern)
+input bool   InpTrailAfterFull  = true;  // Trail after all available layers filled
+input double InpTrailPips       = 200;   // Trail distance – Gold: $2
+input double InpTrailStepPips   = 200;   // Trail step – Gold: $2
 
 input group "============== ROLE FLIP RETESTS =============="
 input bool   InpUseRetests       = true;  // Trade/signal role-flip retests
@@ -199,6 +198,9 @@ int     sigCoolCount = 0;
 // Virtual SL: ATR-computed level stored at trade open when InpUseSL=false.
 // Monitored every tick as a backstop; cleared when pyramid resets.
 double  virtualSL = 0;
+
+// Zone fail tracking: when SL hits, the traded zone is marked dead
+double  lastTradedZoneCenter = 0;
 
 // H1 structure bias and sweep tracking
 int      h1Bias          = 0;     // +1 bullish, -1 bearish, 0 unclear
@@ -1262,6 +1264,62 @@ bool HasBearishPattern()
 //+------------------------------------------------------------------+
 double ApplySLToggle(double sl) { return InpUseSL ? sl : 0.0; }
 
+// Compute backward-layer trigger prices relative to zone height (entry → SL distance).
+// Triggers are the prices at which Layer 2 and Layer 3 open as price moves deeper into zone.
+// Each trigger gets a small random jitter so fills are never at identical round levels.
+void ComputeLayerPrices(double entry, double rawSL, bool isBuy,
+                        double &a1, double &a2)
+{
+    double pip      = GetPipSize(_Symbol);
+    double minDist  = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)
+                      * SymbolInfoDouble(_Symbol, SYMBOL_POINT) + pip * 3;
+    double height   = MathAbs(entry - rawSL);  // entry-to-SL spans zone + ATR buffer
+
+    double j1 = (MathRand() % (2 * InpLayerJitterPips + 1) - InpLayerJitterPips) * pip;
+    double j2 = (MathRand() % (2 * InpLayerJitterPips + 1) - InpLayerJitterPips) * pip;
+
+    if(isBuy)
+    {
+        a1 = NormalizeDouble(entry - height * InpLayer1DepthPct + j1, _Digits);
+        a2 = NormalizeDouble(entry - height * InpLayer2DepthPct + j2, _Digits);
+        if(a1 <= rawSL + minDist) a1 = 0;  // zone too narrow for this layer
+        if(a2 <= rawSL + minDist) a2 = 0;
+    }
+    else
+    {
+        a1 = NormalizeDouble(entry + height * InpLayer1DepthPct + j1, _Digits);
+        a2 = NormalizeDouble(entry + height * InpLayer2DepthPct + j2, _Digits);
+        if(a1 >= rawSL - minDist) a1 = 0;
+        if(a2 >= rawSL - minDist) a2 = 0;
+    }
+}
+
+// Mark zone as SL-failed: price broke through — skip future signals on this zone.
+// Searches all zone arrays: live res/sup, broken zones, and OBs.
+void MarkZoneSLFailed(double center)
+{
+    if(center <= 0) return;
+    double tol = GetPipSize(_Symbol) * 30;
+    int bar    = iBarShift(_Symbol, _Period, TimeCurrent());
+    for(int i = 0; i < resCount; i++)
+        if(resZones[i].diedBar < 0 && MathAbs(resZones[i].center - center) <= tol)
+        { resZones[i].diedBar = bar; resZones[i].wasBroken = true;
+          PrintFormat("SR_Zones_EA: Res zone SL-failed — center=%.5f dead", center); return; }
+    for(int i = 0; i < supCount; i++)
+        if(supZones[i].diedBar < 0 && MathAbs(supZones[i].center - center) <= tol)
+        { supZones[i].diedBar = bar; supZones[i].wasBroken = true;
+          PrintFormat("SR_Zones_EA: Sup zone SL-failed — center=%.5f dead", center); return; }
+    for(int i = 0; i < brokenCount; i++)
+        if(MathAbs(brokenZones[i].center - center) <= tol)
+        { brokenZones[i].diedBar = bar;
+          PrintFormat("SR_Zones_EA: Broken zone SL-failed — center=%.5f dead", center); return; }
+    for(int i = 0; i < obCount; i++)
+        if(obZones[i].active && MathAbs(obZones[i].mid - center) <= tol)
+        { obZones[i].active = false;
+          PrintFormat("SR_Zones_EA: OB SL-failed — mid=%.5f deactivated", center); return; }
+    PrintFormat("SR_Zones_EA: SL-failed but no zone matched center=%.5f (tol=%.5f)", center, tol);
+}
+
 //+------------------------------------------------------------------+
 //| Consume H1 sweep tag — one-shot, direction-matched               |
 //| Arms on H1 sweep; consumed by the next matching M5 signal        |
@@ -1779,11 +1837,18 @@ void CheckFlipSignal(double atr, int barIdx)
             RecordCooldown(obSelCenter);
             double tradeSL = ApplySLToggle(obSelSL);
             FindTpTargets(obSelEntry, -1, tp1, tp2, tp3, atr);
-            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL) &&
-               pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, tradeSL, InpLotInitial))
+            double l1f, l2f;
+            ComputeLayerPrices(obSelEntry, obSelSL, false, l1f, l2f);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!InpUseSL) virtualSL = obSelSL;
-                SendTradeAlert("SELL OB (FLIP)", obSelEntry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, tradeSL, l1f, l2f))
+                    Print("SR_Zones_EA: FLIP SELL OB OpenInitial failed.");
+                else
+                {
+                    if(!InpUseSL) virtualSL = obSelSL;
+                    lastTradedZoneCenter = obSelCenter;
+                    SendTradeAlert("SELL OB (FLIP)", obSelEntry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                }
             }
             return;
         }
@@ -1799,11 +1864,18 @@ void CheckFlipSignal(double atr, int barIdx)
             RecordCooldown(zoneCenter);
             double tradeSL = ApplySLToggle(sl);
             FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
-            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL) &&
-               pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
+            double l1f, l2f;
+            ComputeLayerPrices(entry, sl, false, l1f, l2f);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!InpUseSL) virtualSL = sl;
-                SendTradeAlert("SELL RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, tradeSL, l1f, l2f))
+                    Print("SR_Zones_EA: FLIP SELL RETEST OpenInitial failed.");
+                else
+                {
+                    if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = zoneCenter;
+                    SendTradeAlert("SELL RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                }
             }
             return;
         }
@@ -1824,11 +1896,18 @@ void CheckFlipSignal(double atr, int barIdx)
             RecordCooldown(obBuyCenter);
             double tradeSL = ApplySLToggle(obBuySL);
             FindTpTargets(obBuyEntry, 1, tp1, tp2, tp3, atr);
-            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY) &&
-               pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, tradeSL, InpLotInitial))
+            double l1f, l2f;
+            ComputeLayerPrices(obBuyEntry, obBuySL, true, l1f, l2f);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!InpUseSL) virtualSL = obBuySL;
-                SendTradeAlert("BUY OB (FLIP)", obBuyEntry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, tradeSL, l1f, l2f))
+                    Print("SR_Zones_EA: FLIP BUY OB OpenInitial failed.");
+                else
+                {
+                    if(!InpUseSL) virtualSL = obBuySL;
+                    lastTradedZoneCenter = obBuyCenter;
+                    SendTradeAlert("BUY OB (FLIP)", obBuyEntry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                }
             }
             return;
         }
@@ -1844,11 +1923,18 @@ void CheckFlipSignal(double atr, int barIdx)
             RecordCooldown(zoneCenter);
             double tradeSL = ApplySLToggle(sl);
             FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
-            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY) &&
-               pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
+            double l1f, l2f;
+            ComputeLayerPrices(entry, sl, true, l1f, l2f);
+            if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!InpUseSL) virtualSL = sl;
-                SendTradeAlert("BUY RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, tradeSL, l1f, l2f))
+                    Print("SR_Zones_EA: FLIP BUY RETEST OpenInitial failed.");
+                else
+                {
+                    if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = zoneCenter;
+                    SendTradeAlert("BUY RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
+                }
             }
             return;
         }
@@ -1911,8 +1997,6 @@ int OnInit()
     {
         if(!pyramid.Init(InpMagic, InpSlippage,
                          InpLotInitial, InpLotAddon1, InpLotAddon2,
-                         InpAddon1TrigPips, InpAddon2TrigPips,
-                         InpStopAddon1Pips, InpStopAddon2Pips,
                          InpTrailAfterFull, InpTrailPips, InpTrailStepPips))
         {
             Print("SR_Zones_EA: Pyramid engine Init failed.");
@@ -1954,7 +2038,18 @@ void OnTick()
     if(InpMode == EA_MODE)
     {
         pyramid.Manage();
-        if(!pyramid.IsActive() && virtualSL != 0) virtualSL = 0; // clear when pyramid closes naturally
+        if(!pyramid.IsActive())
+        {
+            if(pyramid.WasClosedBySL() && lastTradedZoneCenter > 0)
+            {
+                MarkZoneSLFailed(lastTradedZoneCenter);
+                lastTradedZoneCenter = 0;
+                pyramid.ClearSLFlag();
+            }
+            else if(lastTradedZoneCenter > 0)
+                lastTradedZoneCenter = 0;  // closed by TP/manual — zone still valid
+            if(virtualSL != 0) virtualSL = 0;
+        }
         if(!InpUseSL) CheckVirtualSL();                          // backstop: close if virtual SL hit
     }
 
@@ -2061,14 +2156,17 @@ void OnTick()
             SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter, swpTag);
         else
         {
+            double l1ob_b, l2ob_b;
+            ComputeLayerPrices(obBuyEntry, obBuySL, true, l1ob_b, l2ob_b);
             double tradeSL = ApplySLToggle(obBuySL);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, tradeSL, l1ob_b, l2ob_b))
                     Print("SR_Zones_EA: BUY OB OpenInitial failed.");
                 else
                 {
                     if(!InpUseSL) virtualSL = obBuySL;
+                    lastTradedZoneCenter = obBuyCenter;
                     SendTradeAlert("BUY OB", obBuyEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial, swpTag);
                 }
             }
@@ -2090,14 +2188,17 @@ void OnTick()
             SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter, swpTag);
         else
         {
+            double l1ob_s, l2ob_s;
+            ComputeLayerPrices(obSelEntry, obSelSL, false, l1ob_s, l2ob_s);
             double tradeSL = ApplySLToggle(obSelSL);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, tradeSL, l1ob_s, l2ob_s))
                     Print("SR_Zones_EA: SELL OB OpenInitial failed.");
                 else
                 {
                     if(!InpUseSL) virtualSL = obSelSL;
+                    lastTradedZoneCenter = obSelCenter;
                     SendTradeAlert("SELL OB", obSelEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial, swpTag);
                 }
             }
@@ -2119,14 +2220,17 @@ void OnTick()
             SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
+            double l1r_b, l2r_b;
+            ComputeLayerPrices(entry, sl, true, l1r_b, l2r_b);
             double tradeSL = ApplySLToggle(sl);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, tradeSL, l1r_b, l2r_b))
                     Print("SR_Zones_EA: BUY RETEST OpenInitial returned false.");
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = zoneCenter;
                     SendTradeAlert("BUY RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
@@ -2151,14 +2255,17 @@ void OnTick()
             SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
+            double l1r_s, l2r_s;
+            ComputeLayerPrices(entry, sl, false, l1r_s, l2r_s);
             double tradeSL = ApplySLToggle(sl);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, tradeSL, l1r_s, l2r_s))
                     Print("SR_Zones_EA: SELL RETEST OpenInitial returned false.");
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = zoneCenter;
                     SendTradeAlert("SELL RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
@@ -2183,14 +2290,17 @@ void OnTick()
             SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
+            double l1b, l2b;
+            ComputeLayerPrices(entry, sl, true, l1b, l2b);
             double tradeSL = ApplySLToggle(sl);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, tradeSL, l1b, l2b))
                     Print("SR_Zones_EA: BUY OpenInitial returned false.");
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = zoneCenter;
                     SendTradeAlert("BUY", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
@@ -2215,14 +2325,17 @@ void OnTick()
             SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
+            double l1s, l2s;
+            ComputeLayerPrices(entry, sl, false, l1s, l2s);
             double tradeSL = ApplySLToggle(sl);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, tradeSL, l1s, l2s))
                     Print("SR_Zones_EA: SELL OpenInitial returned false.");
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = zoneCenter;
                     SendTradeAlert("SELL", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
@@ -2251,14 +2364,17 @@ void OnTick()
             SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
+            double l1sw_b, l2sw_b;
+            ComputeLayerPrices(entry, sl, true, l1sw_b, l2sw_b);
             double tradeSL = ApplySLToggle(sl);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_BUY))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_BUY, tradeSL, l1sw_b, l2sw_b))
                     Print("SR_Zones_EA: BUY SWEEP OpenInitial returned false.");
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = 0; // sweep: no persistent zone to mark on SL
                     SendTradeAlert("BUY SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
@@ -2283,14 +2399,17 @@ void OnTick()
             SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
+            double l1sw_s, l2sw_s;
+            ComputeLayerPrices(entry, sl, false, l1sw_s, l2sw_s);
             double tradeSL = ApplySLToggle(sl);
             if(IsStopLevelValid(_Symbol, tradeSL, ORDER_TYPE_SELL))
             {
-                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
+                if(!pyramid.OpenInitial(POSITION_TYPE_SELL, tradeSL, l1sw_s, l2sw_s))
                     Print("SR_Zones_EA: SELL SWEEP OpenInitial returned false.");
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
+                    lastTradedZoneCenter = 0;
                     SendTradeAlert("SELL SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
