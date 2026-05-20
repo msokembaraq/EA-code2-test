@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.34"
+#property version   "1.35"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -97,6 +97,7 @@ input double InpOBSlBuffer      = 1.0;   // SL buffer beyond OB wick (x ATR)
 
 input group "============== ENTRY FILTER =============="
 input int    InpSigCooldownBars = 20;    // Bars between signals on same zone (M5: 20 bars = 100 min)
+input bool   InpRequireSweep    = true;  // Raw bounce: require wick to sweep fully through zone edge
 input bool   InpUseVolFilter    = false; // Enable ATR volatility filter (disable for Gold/indices)
 input double InpMinAtrPips      = 5;     // Min ATR pips (forex) / points (Gold: ~100)
 input double InpMaxAtrPips      = 2000;  // Max ATR pips (forex: ~80) / points (Gold: ~2000)
@@ -1325,7 +1326,30 @@ void SendTradeAlert(string direction, double entry, double sl,
 }
 
 //+------------------------------------------------------------------+
-//| Check for a support bounce signal on the last closed bar         |
+//| Count pivots clustered near a price level (equal highs/lows)     |
+//+------------------------------------------------------------------+
+int CountPivotsNear(double level, double atr, bool isLow)
+{
+    double tol   = atr * clusterTol;
+    int    count = 0;
+    if(isLow)
+    {
+        for(int i = 0; i < lowPivotCount; i++)
+            if(MathAbs(lowPivots[i].price - level) <= tol) count++;
+    }
+    else
+    {
+        for(int i = 0; i < highPivotCount; i++)
+            if(MathAbs(highPivots[i].price - level) <= tol) count++;
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check for a support bounce / liquidity sweep on the last bar     |
+//| InpRequireSweep=true : wick must pass fully through zone bottom  |
+//|   (equal lows = 2+ pivots near level → "Equal Lows Sweep")       |
+//| InpRequireSweep=false: original pierce-and-hold behaviour        |
 //+------------------------------------------------------------------+
 bool CheckBuySignal(double atr, double &outEntry, double &outSL,
                     double &outZoneCenter, string &outZoneType)
@@ -1338,27 +1362,37 @@ bool CheckBuySignal(double atr, double &outEntry, double &outSL,
     CopyLow(_Symbol,   _Period, 0, 2, rates_low);
     CopyHigh(_Symbol,  _Period, 0, 2, rates_high);
 
-    // bar 1 = last closed bar
-    double o = rates_open[1], h = rates_high[1], l = rates_low[1], c = rates_close[1];
+    double o = rates_open[1], l = rates_low[1], c = rates_close[1];
 
     for(int i = 0; i < supCount; i++)
     {
         if(supZones[i].diedBar >= 0) continue;
-        bool pierced = (l <= supZones[i].top);
-        bool heldUp  = (c >= supZones[i].bot && c >= o);
-        if(pierced && heldUp && CooldownOk(supZones[i].center, atr))
+
+        // Sweep mode: wick must fully pass through zone bottom (stop-hunt confirmed)
+        // Normal mode: wick just enters zone from top
+        bool triggered = InpRequireSweep ? (l < supZones[i].bot)
+                                         : (l <= supZones[i].top);
+        bool heldUp    = (c >= supZones[i].bot && c >= o);
+
+        if(triggered && heldUp && CooldownOk(supZones[i].center, atr))
         {
             outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             outSL         = supZones[i].bot - atr * InpSlZoneBuffer;
-            if(outSL >= outEntry) continue; // inverted SL — zone too thin or ATR too small
+            if(outSL >= outEntry) continue;
             outZoneCenter = supZones[i].center;
-            outZoneType   = "Support";
+            int pivots    = CountPivotsNear(supZones[i].center, atr, true);
+            outZoneType   = InpRequireSweep
+                            ? (pivots >= 2 ? "Equal Lows Sweep" : "Support Sweep")
+                            : "Support";
             return true;
         }
     }
     return false;
 }
 
+//+------------------------------------------------------------------+
+//| Check for a resistance bounce / liquidity sweep on the last bar  |
+//+------------------------------------------------------------------+
 bool CheckSellSignal(double atr, double &outEntry, double &outSL,
                      double &outZoneCenter, string &outZoneType)
 {
@@ -1370,20 +1404,26 @@ bool CheckSellSignal(double atr, double &outEntry, double &outSL,
     CopyLow(_Symbol,   _Period, 0, 2, rates_low);
     CopyHigh(_Symbol,  _Period, 0, 2, rates_high);
 
-    double o = rates_open[1], h = rates_high[1], l = rates_low[1], c = rates_close[1];
+    double o = rates_open[1], h = rates_high[1], c = rates_close[1];
 
     for(int i = 0; i < resCount; i++)
     {
         if(resZones[i].diedBar >= 0) continue;
-        bool pierced = (h >= resZones[i].bot);
-        bool heldDn  = (c <= resZones[i].top && c <= o);
-        if(pierced && heldDn && CooldownOk(resZones[i].center, atr))
+
+        bool triggered = InpRequireSweep ? (h > resZones[i].top)
+                                         : (h >= resZones[i].bot);
+        bool heldDn    = (c <= resZones[i].top && c <= o);
+
+        if(triggered && heldDn && CooldownOk(resZones[i].center, atr))
         {
             outEntry      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             outSL         = resZones[i].top + atr * InpSlZoneBuffer;
-            if(outSL <= outEntry) continue; // inverted SL — zone too thin or ATR too small
+            if(outSL <= outEntry) continue;
             outZoneCenter = resZones[i].center;
-            outZoneType   = "Resistance";
+            int pivots    = CountPivotsNear(resZones[i].center, atr, false);
+            outZoneType   = InpRequireSweep
+                            ? (pivots >= 2 ? "Equal Highs Sweep" : "Resistance Sweep")
+                            : "Resistance";
             return true;
         }
     }
