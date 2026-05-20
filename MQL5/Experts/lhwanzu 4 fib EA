@@ -191,7 +191,7 @@ input double          Fib_ReversalBuffer   = 30.0;
 input int             Fib_MaxWatchBars     = 60;
 input int             Fib_Loopback         = 1000;
 input bool            Fib_WatchEnabled     = true;
-input int             Fib_MaxHLGapBars     = 30;
+input int             Fib_MaxHLGapBars     = 50;
 input double          Fib_WatchProximityPts = 50.0; // extra pts above 0.25 (BUY) or below 0.75 (SELL) that still trigger watch
 input int             Fib_MaxZoneTouches    = 3;    // max times same zone can arm watch — 4th touch ignored (zone exhausted)
 
@@ -944,9 +944,17 @@ void Fib_BackfillAnchor()
            if(iLow(_Symbol,Fib_HTF,bar-k)<=l||iLow(_Symbol,Fib_HTF,bar+k)<=l)pl=false;}
          if(pl&&bar!=bHb){bL=l;bLb=bar;break;}}}
      if(bHb<0||bLb<0||bH<=bL)
-     { Print("⚠️ Fib Backfill: H/L gap too wide — no anchor set");
-       Notify(StringFormat("⚠️ FIB NO ANCHOR|%s|H/L gap too wide",_Symbol)); return;}}
-   double pip=ScaledPip(), cl=iClose(_Symbol,PERIOD_CURRENT,1);
+     { // Adjustment failed — fall back to raw range high/low of scan window
+       double fbH=0; double fbL=DBL_MAX;
+       for(int bar=0;bar<=sr;bar++)
+       { double h=iHigh(_Symbol,Fib_HTF,bar); if(h>fbH) fbH=h;
+         double l=iLow (_Symbol,Fib_HTF,bar); if(l<fbL) fbL=l; }
+       if(fbH>fbL && fbH>0 && fbL<DBL_MAX)
+       { bH=fbH; bL=fbL;
+         Print(StringFormat("💾 Fib Backfill: gap adjustment fallback — using raw range H=%.5f L=%.5f",bH,bL)); }
+       else
+       { Print("⚠️ Fib Backfill: H/L gap too wide — no anchor set");
+         Notify(StringFormat("⚠️ FIB NO ANCHOR|%s|H/L gap too wide",_Symbol)); return; }}}   double pip=ScaledPip(), cl=iClose(_Symbol,PERIOD_CURRENT,1);
    Fib_SetAnchor(bL,bH,true);
    if(cl>g_fibLevel1+Fib_BreakBuffer*pip)
    { g_fib.state=FIB_TREND_UP;
