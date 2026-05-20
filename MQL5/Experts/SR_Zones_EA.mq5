@@ -4,7 +4,7 @@
 //|                           Modes: EA_MODE | SIGNAL_MODE           |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.35"
+#property version   "1.36"
 #property strict
 
 #include <Pyramid\PyramidEngine.mqh>
@@ -103,6 +103,11 @@ input double InpMinAtrPips      = 5;     // Min ATR pips (forex) / points (Gold:
 input double InpMaxAtrPips      = 2000;  // Max ATR pips (forex: ~80) / points (Gold: ~2000)
 input int    InpAtrPeriod       = 14;    // ATR period
 
+input group "============== H1 STRUCTURE & SWEEP =============="
+input bool InpUseH1Filter   = true; // Show H1 bias on signals; tag counter-trend entries with [!]
+input bool InpH1SweepAlert  = true; // Push notification on confirmed H1 liquidity sweep
+input int  InpH1SweepExpiry = 8;    // H1 sweep tag expires after N H1 bars if no M5 signal fires
+
 input group "============== TRADE SETTINGS =============="
 input ulong  InpMagic      = 202401;  // Magic number
 input int    InpSlippage   = 10;      // Slippage (points)
@@ -194,6 +199,14 @@ int     sigCoolCount = 0;
 // Virtual SL: ATR-computed level stored at trade open when InpUseSL=false.
 // Monitored every tick as a backstop; cleared when pyramid resets.
 double  virtualSL = 0;
+
+// H1 structure bias and sweep tracking
+int      h1Bias          = 0;     // +1 bullish, -1 bearish, 0 unclear
+bool     h1SweepBull     = false; // armed: next M5 buy signal gets [Liq. SWP] tag
+bool     h1SweepBear     = false; // armed: next M5 sell signal gets [Liq. SWP] tag
+datetime h1SweepBullTime = 0;
+datetime h1SweepBearTime = 0;
+datetime lastH1Bar       = 0;
 
 //+------------------------------------------------------------------+
 //| State persistence (survives restart and terminal shutdown)       |
@@ -1250,6 +1263,102 @@ bool HasBearishPattern()
 double ApplySLToggle(double sl) { return InpUseSL ? sl : 0.0; }
 
 //+------------------------------------------------------------------+
+//| Consume H1 sweep tag — one-shot, direction-matched               |
+//| Arms on H1 sweep; consumed by the next matching M5 signal        |
+//+------------------------------------------------------------------+
+string ConsumeSweepTag(bool isBuy)
+{
+    if( isBuy && h1SweepBull) { h1SweepBull = false; return "Liq. SWP"; }
+    if(!isBuy && h1SweepBear) { h1SweepBear = false; return "Liq. SWP"; }
+    return "";
+}
+
+//+------------------------------------------------------------------+
+//| H1 structure bias + liquidity sweep detection                    |
+//| Self-gated: runs once per H1 bar regardless of call frequency    |
+//+------------------------------------------------------------------+
+void UpdateH1Bias()
+{
+    datetime h1Times[];
+    ArraySetAsSeries(h1Times, true);
+    if(CopyTime(_Symbol, PERIOD_H1, 0, 1, h1Times) <= 0) return;
+    if(h1Times[0] == lastH1Bar) return;
+    lastH1Bar = h1Times[0];
+
+    const int n      = 50;
+    const int pivWin = 3;
+    double h1H[], h1L[], h1C[];
+    ArraySetAsSeries(h1H, true); ArraySetAsSeries(h1L, true); ArraySetAsSeries(h1C, true);
+    if(CopyHigh (_Symbol, PERIOD_H1, 1, n, h1H) < n) return;
+    if(CopyLow  (_Symbol, PERIOD_H1, 1, n, h1L) < n) return;
+    if(CopyClose(_Symbol, PERIOD_H1, 1, n, h1C) < n) return;
+
+    // Find last 2 confirmed swing highs and lows
+    // ArraySetAsSeries=true: index 0 = most recent closed H1 bar
+    // Pivot window starts at pivWin to ensure left-side bounds are valid
+    double swH[2], swL[2];
+    int    nH = 0, nL = 0;
+    for(int i = pivWin; i < n - pivWin && (nH < 2 || nL < 2); i++)
+    {
+        if(nH < 2)
+        {
+            bool ph = true;
+            for(int j = 1; j <= pivWin && ph; j++)
+                if(h1H[i-j] >= h1H[i] || h1H[i+j] >= h1H[i]) ph = false;
+            if(ph) swH[nH++] = h1H[i];
+        }
+        if(nL < 2)
+        {
+            bool pl = true;
+            for(int j = 1; j <= pivWin && pl; j++)
+                if(h1L[i-j] <= h1L[i] || h1L[i+j] <= h1L[i]) pl = false;
+            if(pl) swL[nL++] = h1L[i];
+        }
+    }
+
+    // Update H1 bias from swing sequence (swH[0]/swL[0] = most recent)
+    if(nH >= 2 && nL >= 2)
+    {
+        int prev = h1Bias;
+        if     (swH[0] > swH[1] && swL[0] > swL[1]) h1Bias =  1;
+        else if(swH[0] < swH[1] && swL[0] < swL[1]) h1Bias = -1;
+        if(h1Bias != prev)
+            PrintFormat("SR_Zones_EA: H1 Bias → %s | SwH=%.2f/%.2f SwL=%.2f/%.2f",
+                        h1Bias > 0 ? "BULLISH" : "BEARISH",
+                        swH[0], swH[1], swL[0], swL[1]);
+    }
+
+    // Sweep detection on the bar that just closed (index 0)
+    if(nL >= 1 && !h1SweepBull && h1L[0] < swL[0] && h1C[0] > swL[0])
+    {
+        h1SweepBull     = true;
+        h1SweepBullTime = TimeCurrent();
+        PrintFormat("SR_Zones_EA: H1 BULLISH SWEEP | SwingLow=%.2f Wick=%.2f Close=%.2f",
+                    swL[0], h1L[0], h1C[0]);
+        if(InpH1SweepAlert)
+            SendAlert(StringFormat("[%s] H1 Bullish Sweep\nSell-Side Liq. Swept @ %.2f\nWatch for M5 long setup",
+                                   _Symbol, swL[0]));
+    }
+    if(nH >= 1 && !h1SweepBear && h1H[0] > swH[0] && h1C[0] < swH[0])
+    {
+        h1SweepBear     = true;
+        h1SweepBearTime = TimeCurrent();
+        PrintFormat("SR_Zones_EA: H1 BEARISH SWEEP | SwingHigh=%.2f Wick=%.2f Close=%.2f",
+                    swH[0], h1H[0], h1C[0]);
+        if(InpH1SweepAlert)
+            SendAlert(StringFormat("[%s] H1 Bearish Sweep\nBuy-Side Liq. Swept @ %.2f\nWatch for M5 short setup",
+                                   _Symbol, swH[0]));
+    }
+
+    // Expire stale sweep flags after InpH1SweepExpiry H1 bars
+    int expSec = InpH1SweepExpiry * 3600;
+    if(h1SweepBull && (int)(TimeCurrent() - h1SweepBullTime) > expSec)
+        { h1SweepBull = false; Print("SR_Zones_EA: H1 bull sweep flag expired."); }
+    if(h1SweepBear && (int)(TimeCurrent() - h1SweepBearTime) > expSec)
+        { h1SweepBear = false; Print("SR_Zones_EA: H1 bear sweep flag expired."); }
+}
+
+//+------------------------------------------------------------------+
 //| Send push notification helper                                    |
 //+------------------------------------------------------------------+
 void SendAlert(string msg)
@@ -1269,7 +1378,7 @@ void SendAlert(string msg)
 //+------------------------------------------------------------------+
 void SendSignalAlert(string direction, double entry, double sl,
                      double tp1, double tp2, double tp3,
-                     string zoneType, double zoneCenter)
+                     string zoneType, double zoneCenter, string tag = "")
 {
     string sym = _Symbol;
     int    dg  = _Digits;
@@ -1280,19 +1389,29 @@ void SendSignalAlert(string direction, double entry, double sl,
     else if(isRanging)         biasStr = "RANGING";
     else                       biasStr = "UNCLEAR";
 
+    string h1Str;
+    if(h1Bias > 0)      h1Str = "BULLISH";
+    else if(h1Bias < 0) h1Str = "BEARISH";
+    else                h1Str = "UNCLEAR";
+    bool isBuy = (StringFind(direction, "BUY") >= 0);
+    if(InpUseH1Filter && h1Bias != 0 && ((isBuy && h1Bias < 0) || (!isBuy && h1Bias > 0)))
+        h1Str += " [!]";
+
+    string tagStr = (tag != "") ? StringFormat(" [%s]", tag) : "";
+
     string msg = StringFormat(
-        "[%s] %s SIGNAL\n"
+        "[%s] %s SIGNAL%s\n"
         "Zone: %s @ %s\n"
-        "Bias: %s\n"
+        "Bias: %s | H1: %s\n"
         "Entry: %s\n"
         "SL: %s\n"
         "TP1: %s\n"
         "TP2: %s\n"
         "TP3: %s\n"
         "TF: %s",
-        sym, direction,
+        sym, direction, tagStr,
         zoneType, DoubleToString(zoneCenter, dg),
-        biasStr,
+        biasStr, h1Str,
         DoubleToString(entry, dg),
         DoubleToString(sl, dg),
         tp1 > 0 ? DoubleToString(tp1, dg) : "-",
@@ -1308,14 +1427,15 @@ void SendSignalAlert(string direction, double entry, double sl,
 //| Send EA trade open notification                                  |
 //+------------------------------------------------------------------+
 void SendTradeAlert(string direction, double entry, double sl,
-                    double tp1, double tp2, double tp3, double lots)
+                    double tp1, double tp2, double tp3, double lots, string tag = "")
 {
+    string tagStr = (tag != "") ? StringFormat(" [%s]", tag) : "";
     string msg = StringFormat(
-        "[%s] TRADE OPENED: %s\n"
+        "[%s] TRADE OPENED: %s%s\n"
         "Lots: %.2f | Entry: %s\n"
         "SL: %s\n"
         "TP1: %s | TP2: %s | TP3: %s",
-        _Symbol, direction, lots,
+        _Symbol, direction, tagStr, lots,
         DoubleToString(entry, _Digits),
         DoubleToString(sl, _Digits),
         tp1 > 0 ? DoubleToString(tp1, _Digits) : "-",
@@ -1649,6 +1769,7 @@ void CheckFlipSignal(double atr, int barIdx)
 
         if(hasBearOB && bearCandle && CooldownOk(obSelCenter, atr))
         {
+            string swpTag = ConsumeSweepTag(false);
             PrintFormat("SR_Zones_EA: FLIP SELL OB | Closing long. Entry=%.5f SL=%.5f", obSelEntry, obSelSL);
             virtualSL = 0;
             pyramid.ClosePyramid();
@@ -1659,7 +1780,7 @@ void CheckFlipSignal(double atr, int barIdx)
                pyramid.OpenInitial(POSITION_TYPE_SELL, obSelEntry, tradeSL, InpLotInitial))
             {
                 if(!InpUseSL) virtualSL = obSelSL;
-                SendTradeAlert("SELL OB (FLIP)", obSelEntry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                SendTradeAlert("SELL OB (FLIP)", obSelEntry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
             }
             return;
         }
@@ -1668,6 +1789,7 @@ void CheckFlipSignal(double atr, int barIdx)
         if(structAllowSell && bearCandle &&
            CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx))
         {
+            string swpTag = ConsumeSweepTag(false);
             PrintFormat("SR_Zones_EA: FLIP SELL RETEST | Closing long. Entry=%.5f SL=%.5f", entry, sl);
             virtualSL = 0;
             pyramid.ClosePyramid();
@@ -1678,7 +1800,7 @@ void CheckFlipSignal(double atr, int barIdx)
                pyramid.OpenInitial(POSITION_TYPE_SELL, entry, tradeSL, InpLotInitial))
             {
                 if(!InpUseSL) virtualSL = sl;
-                SendTradeAlert("SELL RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                SendTradeAlert("SELL RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
             }
             return;
         }
@@ -1692,6 +1814,7 @@ void CheckFlipSignal(double atr, int barIdx)
 
         if(hasBullOB && bullCandle && CooldownOk(obBuyCenter, atr))
         {
+            string swpTag = ConsumeSweepTag(true);
             PrintFormat("SR_Zones_EA: FLIP BUY OB | Closing short. Entry=%.5f SL=%.5f", obBuyEntry, obBuySL);
             virtualSL = 0;
             pyramid.ClosePyramid();
@@ -1702,7 +1825,7 @@ void CheckFlipSignal(double atr, int barIdx)
                pyramid.OpenInitial(POSITION_TYPE_BUY, obBuyEntry, tradeSL, InpLotInitial))
             {
                 if(!InpUseSL) virtualSL = obBuySL;
-                SendTradeAlert("BUY OB (FLIP)", obBuyEntry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                SendTradeAlert("BUY OB (FLIP)", obBuyEntry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
             }
             return;
         }
@@ -1711,6 +1834,7 @@ void CheckFlipSignal(double atr, int barIdx)
         if(structAllowBuy && bullCandle &&
            CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx))
         {
+            string swpTag = ConsumeSweepTag(true);
             PrintFormat("SR_Zones_EA: FLIP BUY RETEST | Closing short. Entry=%.5f SL=%.5f", entry, sl);
             virtualSL = 0;
             pyramid.ClosePyramid();
@@ -1721,7 +1845,7 @@ void CheckFlipSignal(double atr, int barIdx)
                pyramid.OpenInitial(POSITION_TYPE_BUY, entry, tradeSL, InpLotInitial))
             {
                 if(!InpUseSL) virtualSL = sl;
-                SendTradeAlert("BUY RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                SendTradeAlert("BUY RETEST (FLIP)", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
             }
             return;
         }
@@ -1835,6 +1959,9 @@ void OnTick()
     if(InpMode == SIGNAL_MODE)
         ManageManualTrades();
 
+    // H1 structure + sweep detection (self-gated, runs once per H1 bar)
+    UpdateH1Bias();
+
     // Signal / entry logic only on new bars
     if(!IsNewBar()) return;
 
@@ -1920,14 +2047,15 @@ void OnTick()
     // --- 1a. BUY Order Block ---
     if(hasBullOB && bullCandle && CooldownOk(obBuyCenter, atr))
     {
+        string swpTag = ConsumeSweepTag(true);
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obBuyEntry, 1, tp1ob, tp2ob, tp3ob, atr);
         RecordCooldown(obBuyCenter);
         Print("SR_Zones_EA: BUY OB | Type=", obBuyType, " Center=", obBuyCenter,
-              " Entry=", obBuyEntry, " SL=", obBuySL);
+              " Entry=", obBuyEntry, " SL=", obBuySL, swpTag != "" ? " [Liq.SWP]" : "");
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter);
+            SendSignalAlert("BUY OB", obBuyEntry, obBuySL, tp1ob, tp2ob, tp3ob, obBuyType, obBuyCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(obBuySL);
@@ -1938,7 +2066,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = obBuySL;
-                    SendTradeAlert("BUY OB", obBuyEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+                    SendTradeAlert("BUY OB", obBuyEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial, swpTag);
                 }
             }
         }
@@ -1948,14 +2076,15 @@ void OnTick()
     // --- 1b. SELL Order Block ---
     if(hasBearOB && bearCandle && CooldownOk(obSelCenter, atr))
     {
+        string swpTag = ConsumeSweepTag(false);
         double tp1ob = 0, tp2ob = 0, tp3ob = 0;
         FindTpTargets(obSelEntry, -1, tp1ob, tp2ob, tp3ob, atr);
         RecordCooldown(obSelCenter);
         Print("SR_Zones_EA: SELL OB | Type=", obSelType, " Center=", obSelCenter,
-              " Entry=", obSelEntry, " SL=", obSelSL);
+              " Entry=", obSelEntry, " SL=", obSelSL, swpTag != "" ? " [Liq.SWP]" : "");
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter);
+            SendSignalAlert("SELL OB", obSelEntry, obSelSL, tp1ob, tp2ob, tp3ob, obSelType, obSelCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(obSelSL);
@@ -1966,7 +2095,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = obSelSL;
-                    SendTradeAlert("SELL OB", obSelEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial);
+                    SendTradeAlert("SELL OB", obSelEntry, tradeSL, tp1ob, tp2ob, tp3ob, InpLotInitial, swpTag);
                 }
             }
         }
@@ -1977,13 +2106,14 @@ void OnTick()
     if(structAllowBuy && bullCandle &&
        CheckRetestBuy(atr, entry, sl, zoneCenter, zoneType, barIdx))
     {
+        string swpTag = ConsumeSweepTag(true);
         Print("SR_Zones_EA: BUY RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
-              " Entry=", entry, " SL=", sl);
+              " Entry=", entry, " SL=", sl, swpTag != "" ? " [Liq.SWP]" : "");
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("BUY RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(sl);
@@ -1994,7 +2124,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
-                    SendTradeAlert("BUY RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("BUY RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
             else
@@ -2008,13 +2138,14 @@ void OnTick()
     if(structAllowSell && bearCandle &&
        CheckRetestSell(atr, entry, sl, zoneCenter, zoneType, barIdx))
     {
+        string swpTag = ConsumeSweepTag(false);
         Print("SR_Zones_EA: SELL RETEST signal | Zone=", zoneType, " Center=", zoneCenter,
-              " Entry=", entry, " SL=", sl);
+              " Entry=", entry, " SL=", sl, swpTag != "" ? " [Liq.SWP]" : "");
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("SELL RETEST", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(sl);
@@ -2025,7 +2156,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
-                    SendTradeAlert("SELL RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("SELL RETEST", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
             else
@@ -2039,13 +2170,14 @@ void OnTick()
     if(!InpRetestOnly && structAllowBuy && bullCandle &&
        CheckBuySignal(atr, entry, sl, zoneCenter, zoneType))
     {
+        string swpTag = ConsumeSweepTag(true);
         Print("SR_Zones_EA: BUY signal | Zone=", zoneType, " Center=", zoneCenter,
-              " Entry=", entry, " SL=", sl);
+              " Entry=", entry, " SL=", sl, swpTag != "" ? " [Liq.SWP]" : "");
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("BUY", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(sl);
@@ -2056,7 +2188,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
-                    SendTradeAlert("BUY", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("BUY", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
             else
@@ -2070,13 +2202,14 @@ void OnTick()
     if(!InpRetestOnly && structAllowSell && bearCandle &&
        CheckSellSignal(atr, entry, sl, zoneCenter, zoneType))
     {
+        string swpTag = ConsumeSweepTag(false);
         Print("SR_Zones_EA: SELL signal | Zone=", zoneType, " Center=", zoneCenter,
-              " Entry=", entry, " SL=", sl);
+              " Entry=", entry, " SL=", sl, swpTag != "" ? " [Liq.SWP]" : "");
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
         RecordCooldown(zoneCenter);
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("SELL", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(sl);
@@ -2087,7 +2220,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
-                    SendTradeAlert("SELL", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("SELL", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
             else
@@ -2101,6 +2234,7 @@ void OnTick()
     // Bullish sweep: wick below rangeLow, close back inside → accumulation → BUY
     if(bullManip && bullCandle && CooldownOk(rangeLow, atr))
     {
+        string swpTag = ConsumeSweepTag(true);
         entry      = iClose(_Symbol, _Period, 1);
         sl         = NormalizeDouble(rangeLow - atr * InpRetestSlBuffer, _Digits);
         FindTpTargets(entry, 1, tp1, tp2, tp3, atr);
@@ -2108,10 +2242,10 @@ void OnTick()
         zoneType   = "Range Low Sweep";
         RecordCooldown(zoneCenter);
         Print("SR_Zones_EA: BULL MANIPULATION | RangeLow=", rangeLow,
-              " Entry=", entry, " SL=", sl);
+              " Entry=", entry, " SL=", sl, swpTag != "" ? " [Liq.SWP]" : "");
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("BUY SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(sl);
@@ -2122,7 +2256,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
-                    SendTradeAlert("BUY SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("BUY SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
         }
@@ -2132,6 +2266,7 @@ void OnTick()
     // Bearish sweep: wick above rangeHigh, close back inside → distribution → SELL
     if(bearManip && bearCandle && CooldownOk(rangeHigh, atr))
     {
+        string swpTag = ConsumeSweepTag(false);
         entry      = iClose(_Symbol, _Period, 1);
         sl         = NormalizeDouble(rangeHigh + atr * InpRetestSlBuffer, _Digits);
         FindTpTargets(entry, -1, tp1, tp2, tp3, atr);
@@ -2139,10 +2274,10 @@ void OnTick()
         zoneType   = "Range High Sweep";
         RecordCooldown(zoneCenter);
         Print("SR_Zones_EA: BEAR MANIPULATION | RangeHigh=", rangeHigh,
-              " Entry=", entry, " SL=", sl);
+              " Entry=", entry, " SL=", sl, swpTag != "" ? " [Liq.SWP]" : "");
 
         if(InpMode == SIGNAL_MODE)
-            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter);
+            SendSignalAlert("SELL SWEEP", entry, sl, tp1, tp2, tp3, zoneType, zoneCenter, swpTag);
         else
         {
             double tradeSL = ApplySLToggle(sl);
@@ -2153,7 +2288,7 @@ void OnTick()
                 else
                 {
                     if(!InpUseSL) virtualSL = sl;
-                    SendTradeAlert("SELL SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial);
+                    SendTradeAlert("SELL SWEEP", entry, tradeSL, tp1, tp2, tp3, InpLotInitial, swpTag);
                 }
             }
         }
