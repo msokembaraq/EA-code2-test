@@ -1461,8 +1461,8 @@ void Fib_ArmWatch(int direction, string source, bool isPO3=false, double specifi
    { // Bias-driven retracement: expand zone to full equil range (0.25→0.75)
      // Price anywhere in equil with matching bias = valid pullback entry
      if(g_fibInternalBias==direction)
-     { zT=(direction==1)?g_fibLevel075+buf:g_fibLevel075+buf;
-       zB=(direction==1)?g_fibLevel025-buf:g_fibLevel025-buf; }
+     { zT=g_fibLevel075+buf;   // full equil range for aligned-bias entry
+       zB=g_fibLevel025-buf; }
      else
      { zT=(direction==1)?MathMin(g_fibLevel025+buf+prox,g_fibLevel05):(g_fibLevel075+buf);
        zB=(direction==1)?(g_fibLevel025-buf):MathMax(g_fibLevel075-buf-prox,g_fibLevel05); } }
@@ -2218,6 +2218,7 @@ void ManageTrade()
 { for(int i=g_openTradeCount-1;i>=0;i--)
   { if(!PositionSelectByTicket(g_openTrades[i].ticket)){for(int j=i;j<g_openTradeCount-1;j++)g_openTrades[j]=g_openTrades[j+1];g_openTradeCount--;continue;}
     if(g_openTrades[i].tpBucket==0||g_openTrades[i].assignedTP<=0)continue;
+    if(!PositionSelectByTicket(g_openTrades[i].ticket))continue;   // re-select before GetDouble
     double cp=PositionGetDouble(POSITION_PRICE_CURRENT);int dir=g_openTrades[i].direction;
     bool hit=(dir==1)?(cp>=g_openTrades[i].assignedTP):(cp<=g_openTrades[i].assignedTP);
     if(hit){trade.SetTypeFilling(GetFill());
@@ -2351,6 +2352,7 @@ void UnifiedManagePositions()
          if(!bar1Bull) continue;
          double newSL = NormalizeDouble(bar1Low, dg);
          if(newSL <= cSL + pip) continue;
+         if(newSL <= op)        continue;   // never trail below entry
          if(cp - newSL < minSt) continue;
          if(trade.PositionModify(g_unifiedPositions[i].ticket, newSL, cTP))
          { trailBuyCount++; trailBuyNewSL=newSL; }
@@ -2360,6 +2362,7 @@ void UnifiedManagePositions()
          if(!bar1Bear) continue;
          double newSL = NormalizeDouble(bar1High, dg);
          if(newSL >= cSL - pip) continue;
+         if(newSL >= op)        continue;   // never trail above entry
          if(newSL - cp < minSt) continue;
          if(trade.PositionModify(g_unifiedPositions[i].ticket, newSL, cTP))
          { trailSellCount++; trailSellNewSL=newSL; }
@@ -2493,12 +2496,12 @@ void ExecuteSignal(int direction, double signalClose)
       Log("📐 PO3 watch active for "+dirStr);
 }
 
-//| STATE PERSISTENCE — STATE_VER=36                               |
+//| STATE PERSISTENCE — STATE_VER=37                               |
 string StateFile()
 { string tf=EnumToString(PERIOD_CURRENT);StringReplace(tf,":","_");
   // B4 FIX: include MagicNumber — prevents state collision between EA instances on same symbol/TF
   return "LinerX_Snflow_v8.0_"+_Symbol+"_"+tf+"_"+IntegerToString(MagicNumber)+".state";}
-#define STATE_VER 36
+#define STATE_VER 37
 
 void SaveStateFile()
 {
@@ -2528,8 +2531,7 @@ void SaveStateFile()
    FileWriteInteger(h,g_fibWatch.active?1:0);FileWriteInteger(h,g_fibWatch.direction);
    FileWriteDouble(h,g_fibWatch.zoneTop);FileWriteDouble(h,g_fibWatch.zoneBot);
    FileWriteInteger(h,g_fibWatch.armedBar);FileWriteInteger(h,g_fibWatch.isPO3?1:0);
-   int wsc=0;if(StringFind(g_fibWatch.signalSource,"PO3")>=0)wsc=3;else if(StringFind(g_fibWatch.signalSource,"ST")>=0)wsc=1;
-   FileWriteInteger(h,wsc);
+   FileWriteString(h,g_fibWatch.signalSource+"\n");
    // M12 ReAnchor — one-side locked extremes
    FileWriteDouble(h,g_fibLockedFloor);
    FileWriteDouble(h,g_fibLockedCeiling);
@@ -2584,8 +2586,8 @@ void LoadStateFile()
    int fAB=FileReadInteger(h);int fSt=FileReadInteger(h);bool fHF=(FileReadInteger(h)==1);bool fLF=(FileReadInteger(h)==1);
    if(fv&&fH>fL){Fib_SetAnchor(fL,fH,false);g_fib.anchorBar=fAB;g_fib.state=(ENUM_FIB_STATE)fSt;g_fib.highFlipped=fHF;g_fib.lowFlipped=fLF;}
    bool wa=(FileReadInteger(h)==1);int wd=FileReadInteger(h);double wt=FileReadDouble(h);double wb=FileReadDouble(h);
-   int wab=FileReadInteger(h);bool wpo=(FileReadInteger(h)==1);int wsc=FileReadInteger(h);
-   if(wa&&(wd==1||wd==-1)){g_fibWatch.active=true;g_fibWatch.direction=wd;g_fibWatch.zoneTop=wt;g_fibWatch.zoneBot=wb;g_fibWatch.armedBar=wab;g_fibWatch.isPO3=wpo;g_fibWatch.signalSource=(wsc==3)?"PO3-MANIP":(wsc==1)?"ST":"";}
+   int wab=FileReadInteger(h);bool wpo=(FileReadInteger(h)==1);string wss=FileReadString(h);
+   if(wa&&(wd==1||wd==-1)){g_fibWatch.active=true;g_fibWatch.direction=wd;g_fibWatch.zoneTop=wt;g_fibWatch.zoneBot=wb;g_fibWatch.armedBar=wab;g_fibWatch.isPO3=wpo;g_fibWatch.signalSource=wss;}
    // M12 ReAnchor — one-side locked extremes
    g_fibLockedFloor       = FileReadDouble(h);
    g_fibLockedCeiling     = FileReadDouble(h);
@@ -2699,7 +2701,7 @@ int OnInit()
    Print("SR (M5)  : ",UseSRChannels?"ON zones="+IntegerToString(g_srChannelCount):"OFF");
    Print("SR (M30) : zones=",g_srM30ChannelCount);
    Print("ATR SL   : ",UseATRBasedSL?"ON x"+DoubleToString(ATR_SL_Multiplier,1):"OFF");
-   Print("State    : Save=",SaveState," Load=",LoadState," [STATE_VER=36]");
+   Print("State    : Save=",SaveState," Load=",LoadState," [STATE_VER=37]");
    Print("ScoreMins: Entry=",Fib_EntryMinScore," Cascade=",Fib_CascadeMinScore);
    Print("===================================================================");
    return INIT_SUCCEEDED;
