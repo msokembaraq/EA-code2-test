@@ -136,7 +136,8 @@ input int    NumberOfPositions = 5;
 input int    MaxPositions      = 5;
 input int    MagicNumber       = 20260800;
 input int    Slippage          = 20;
-input bool   CloseOnOpposite   = true;
+input bool   CloseOnOpposite    = true;
+input bool   ManageManualTrades = false;  // also apply BE/trail to magic=0 manual positions
 
 input group "════════════════ HUMAN CLICK DELAY ════════════════"
 input bool UseHumanDelay      = true;
@@ -305,6 +306,9 @@ bool   g_fibWaitingNewFloor    = false; // true after break down — waiting for
 double g_fibFlippedLevels[32];
 int    g_fibFlippedDir[32];
 int    g_fibFlippedCount = 0;
+// Cooldown tracker for flipped-level retests (one entry per slot, mirrors g_fibFlippedLevels index)
+int    g_lastFlipBar[32];
+bool   g_lastFlipBarInit = false;
 
 double g_fibLevel0   = 0;
 double g_fibLevel025 = 0;
@@ -441,7 +445,7 @@ int UpdateSuperTrend()
    else if(g_st_trend==-1&&cl>g_st_dn_prev) g_st_trend=1;
    else if(g_st_trend== 1&&cl<g_st_up_prev) g_st_trend=-1;
    int flip=0; if(g_st_trend==1&&pt==-1)flip=1; if(g_st_trend==-1&&pt==1)flip=-1;
-   static int sn=0; sn++;
+   static uint sn=0; sn++;
    if(PrintToLog&&(sn<=10||flip!=0))
       Print("═══ ST #",sn," bar=",g_barCount," trend=",pt,"→",g_st_trend," FLIP=",flip);
    return flip;
@@ -694,12 +698,14 @@ void Range_CalcLevels(int direction, double entry,
 
 // ── HEAD & SHOULDERS PATTERN DETECTION ───────────────────────────
 double HS_HighBetween(int barOld, int barNew)
-{ double maxH=0;
+{ if(barNew > barOld) { int tmp=barOld; barOld=barNew; barNew=tmp; }
+  double maxH=0;
   for(int i=barNew;i<=barOld;i++) maxH=MathMax(maxH,iHigh(_Symbol,PERIOD_CURRENT,i));
   return maxH; }
 
 double HS_LowBetween(int barOld, int barNew)
-{ double minL=DBL_MAX;
+{ if(barNew > barOld) { int tmp=barOld; barOld=barNew; barNew=tmp; }
+  double minL=DBL_MAX;
   for(int i=barNew;i<=barOld;i++) minL=MathMin(minL,iLow(_Symbol,PERIOD_CURRENT,i));
   return minL; }
 
@@ -839,11 +845,15 @@ void Fib_SetAnchor(double low, double high, bool resetFlips=true)
 // dir = -1 → was SELL ceiling, now BUY support
 void Fib_AddFlippedLevel(double price, int dir)
 {
-   if(price <= 0 || g_fibFlippedCount >= 32) return;
+   if(price <= 0) return;
    double tol = Fib_PDBuffer * GetPointsize() * 3.0;
-   // Avoid duplicate near same price
    for(int i=0; i<g_fibFlippedCount; i++)
       if(MathAbs(g_fibFlippedLevels[i]-price)<=tol && g_fibFlippedDir[i]==dir) return;
+   if(g_fibFlippedCount >= 32)
+   { // Ring buffer: evict oldest entry to make room
+     for(int i=0; i<31; i++) { g_fibFlippedLevels[i]=g_fibFlippedLevels[i+1]; g_fibFlippedDir[i]=g_fibFlippedDir[i+1]; }
+     g_fibFlippedCount = 31;
+     Log("⚠️ FLIP BUFFER FULL — oldest level evicted"); }
    g_fibFlippedLevels[g_fibFlippedCount] = price;
    g_fibFlippedDir[g_fibFlippedCount]    = dir;
    g_fibFlippedCount++;
@@ -1624,19 +1634,17 @@ void Fib_CheckSDReversalZones()
    // ── FLIPPED LEVEL RETEST CHECK ────────────────────────────────
    // Notify when price retests a previously broken level from the other side
    if(g_fibFlippedCount>0)
-   { static int lastFlipBar[32];
-     static bool lastFlipInit=false;
-     if(!lastFlipInit){ ArrayInitialize(lastFlipBar,0); lastFlipInit=true; }
+   { if(!g_lastFlipBarInit){ ArrayInitialize(g_lastFlipBar,0); g_lastFlipBarInit=true; }
      // Seed any uncooldown slots with current bar to prevent startup burst
-     for(int j=0;j<32;j++) if(lastFlipBar[j]==0) lastFlipBar[j]=g_barCount-sdCooldown;
+     for(int j=0;j<32;j++) if(g_lastFlipBar[j]==0) g_lastFlipBar[j]=g_barCount-sdCooldown;
      double buf=Fib_PDBuffer*GetPointsize()*3.0;
      for(int i=0;i<g_fibFlippedCount;i++)
      { if(g_fibFlippedLevels[i]<=0)continue;
-       if(g_barCount-lastFlipBar[i]<sdCooldown)continue;
+       if(g_barCount-g_lastFlipBar[i]<sdCooldown)continue;
        bool sellRetest=(g_fibFlippedDir[i]==+1 && hi1>=g_fibFlippedLevels[i]-buf && hi1<=g_fibFlippedLevels[i]+buf && checkSellSD);
        bool buyRetest =(g_fibFlippedDir[i]==-1 && lo1>=g_fibFlippedLevels[i]-buf && lo1<=g_fibFlippedLevels[i]+buf && checkBuySD);
        if(sellRetest||buyRetest)
-       { lastFlipBar[i]=g_barCount;
+       { g_lastFlipBar[i]=g_barCount;
          int dir=(sellRetest)?-1:1;
          int score=Fib_ScoreZoneEntry(dir,cl1,1);
          string label=sellRetest?"🔴 ROLE-FLIP SELL":"🟢 ROLE-FLIP BUY";
@@ -1772,6 +1780,8 @@ void Fib_UpdateState()
    { string msg=StringFormat("🔄 FALSE BREAK DOWN|%s|cl1=%.5f recovered above 0.25(%.5f)|cancelling floor shift|arming BUY",
          _Symbol, cl1, g_fibLevel025);
      Log(msg); Notify(msg);  // structural only — actual entry fires when watch executes
+     if(g_fibWatch.active && StringFind(g_fibWatch.signalSource,"PO3")<0)
+        Log(StringFormat("⚠️ FALSE BREAK: cancelled active '%s' watch — superseded by PO3-FALSE-BREAK",g_fibWatch.signalSource));
      g_fibWaitingNewFloor   = false;
      g_fib.state            = FIB_RANGE;
      ZeroMemory(g_fibWatch);
@@ -1786,6 +1796,8 @@ void Fib_UpdateState()
    { string msg=StringFormat("🔄 FALSE BREAK UP|%s|cl1=%.5f dropped below 0.75(%.5f)|cancelling ceiling shift|arming SELL",
          _Symbol, cl1, g_fibLevel075);
      Log(msg); Notify(msg);  // structural only — actual entry fires when watch executes
+     if(g_fibWatch.active && StringFind(g_fibWatch.signalSource,"PO3")<0)
+        Log(StringFormat("⚠️ FALSE BREAK: cancelled active '%s' watch — superseded by PO3-FALSE-BREAK",g_fibWatch.signalSource));
      g_fibWaitingNewCeiling = false;
      g_fib.state            = FIB_RANGE;
      ZeroMemory(g_fibWatch);
@@ -1917,6 +1929,7 @@ void Fib_ResetAll()
    g_fibFlippedCount=0;
    ArrayInitialize(g_fibFlippedLevels,0);
    ArrayInitialize(g_fibFlippedDir,0);
+   ArrayInitialize(g_lastFlipBar,0); g_lastFlipBarInit=false;
    g_fibBuyZoneTouches=0; g_fibSellZoneTouches=0;
    ArrayInitialize(g_sdBuyZoneTouches,0);
    ArrayInitialize(g_sdSellZoneTouches,0);
@@ -2091,10 +2104,9 @@ void OpenPositions(int direction, double signalClose, double sl, double tp1, dou
        if(GetTrackedTpBucket(t)==0){Log("🏃 Runner #"+IntegerToString((int)t)+" exempt");continue;}
        trade.PositionClose(t);Log("Closed opposite #"+IntegerToString((int)t));}}
    else if(cascadeActive && CloseOnOpposite)
-   { // CASCADE mode: close opposite positions that are IN PROFIT (take the gain)
-     // Leave losing positions — they were RBS bounces; let BE/trail manage them
-     // Prevents indefinite hold if price rallies but never reaches far TP
-     int nProfit=0, nKept=0;
+   { // CASCADE mode: close ALL opposite positions before opening new cascade direction
+     // Accumulating two opposing losing positions creates unlimited drawdown risk
+     int nClosed=0;
      for(int i=PositionsTotal()-1;i>=0;i--)
      { ulong t=PositionGetTicket(i);if(!t||!PositionSelectByTicket(t))continue;
        if(PositionGetString(POSITION_SYMBOL)!=_Symbol)continue;
@@ -2104,15 +2116,10 @@ void OpenPositions(int direction, double signalClose, double sl, double tp1, dou
        if(!isOpp)continue;
        if(GetTrackedTpBucket(t)==0){Log("🏃 Runner #"+IntegerToString((int)t)+" exempt");continue;}
        double profit=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
-       if(profit > 0)
-       { trade.PositionClose(t);
-         Log(StringFormat("💰 CASCADE PROFIT-TAKE | #%d | profit=%.2f",  (int)t, profit));
-         nProfit++; }
-       else
-       { nKept++;
-         Log(StringFormat("⚠️ CASCADE HOLD | #%d | profit=%.2f | letting BE/trail manage",(int)t,profit)); }}
-     if(nProfit>0||nKept>0)
-        Log(StringFormat("⚠️ CASCADE exit | took profit: %d | kept at loss/BE: %d", nProfit, nKept)); }
+       trade.PositionClose(t);
+       Log(StringFormat("%s CASCADE CLOSE | #%d | profit=%.2f",profit>=0?"💰":"🛑",(int)t,profit));
+       nClosed++; }
+     if(nClosed>0) Log(StringFormat("⚠️ CASCADE: closed %d opposite(s) before new entry",nClosed)); }
    int ex=0;
    for(int i=0;i<PositionsTotal();i++){ulong t=PositionGetTicket(i);if(t>0&&PositionSelectByTicket(t)&&PositionGetString(POSITION_SYMBOL)==_Symbol&&(ulong)PositionGetInteger(POSITION_MAGIC)==(ulong)MagicNumber)ex++;}
    int slots=MathMin(NumberOfPositions,MathMax(0,MaxPositions-ex));
@@ -2176,10 +2183,12 @@ void OpenOneFromQueue()
      Log(StringFormat("📌 %s SL recalc at fill: %.5f [VirtualSL=%.1fpts]",
          p.tpBucket==0?"RUNNER":"TP",nSL,vsl/GetPointsize())); }
 
-   // Validate SL on correct side
+   // Validate SL on correct side and not inverted
    if(nSL>0)
-   { if(p.direction==1&&nSL>=bp-mn){Log("⛔ BUY SL too close");return;}
-     if(p.direction==-1&&nSL<=bp+mn){Log("⛔ SELL SL too close");return;} }
+   { if(p.direction==1  && nSL >= bp)    { Log("⛔ BUY SL above entry — aborting");  return; }
+     if(p.direction==-1 && nSL <= bp)    { Log("⛔ SELL SL below entry — aborting"); return; }
+     if(p.direction==1  && nSL>=bp-mn)   { Log("⛔ BUY SL too close");  return; }
+     if(p.direction==-1 && nSL<=bp+mn)   { Log("⛔ SELL SL too close"); return; } }
 
    // Validate TP on correct side — switch to RUNNER if inverted
    if(nTP>0)
@@ -2219,6 +2228,9 @@ void ManageTrade()
   { if(!PositionSelectByTicket(g_openTrades[i].ticket)){for(int j=i;j<g_openTradeCount-1;j++)g_openTrades[j]=g_openTrades[j+1];g_openTradeCount--;continue;}
     if(g_openTrades[i].tpBucket==0||g_openTrades[i].assignedTP<=0)continue;
     if(!PositionSelectByTicket(g_openTrades[i].ticket))continue;   // re-select before GetDouble
+    double brokerTP=PositionGetDouble(POSITION_TP);
+    // If user manually changed TP in MT5 UI, broker handles the close — skip EA management
+    if(brokerTP>0 && MathAbs(brokerTP-g_openTrades[i].assignedTP)>ScaledPip()) continue;
     double cp=PositionGetDouble(POSITION_PRICE_CURRENT);int dir=g_openTrades[i].direction;
     bool hit=(dir==1)?(cp>=g_openTrades[i].assignedTP):(cp<=g_openTrades[i].assignedTP);
     if(hit){trade.SetTypeFilling(GetFill());
@@ -2244,7 +2256,7 @@ void UnifiedScanAndEnroll()
    for(int i=0;i<PositionsTotal();i++)
    { ulong tk=PositionGetTicket(i);if(!PositionSelectByTicket(tk))continue;
      if(PositionGetString(POSITION_SYMBOL)!=_Symbol)continue;
-     ulong mg=(ulong)PositionGetInteger(POSITION_MAGIC);bool isEA=(mg==MagicNumber),isMn=(mg==0);if(!isEA&&!isMn)continue;
+     ulong mg=(ulong)PositionGetInteger(POSITION_MAGIC);bool isEA=(mg==MagicNumber),isMn=(mg==0&&ManageManualTrades);if(!isEA&&!isMn)continue;
      bool found=false;
      for(int j=0;j<g_unifiedPosCount;j++){if(g_unifiedPositions[j].ticket==tk){found=true;double cp=PositionGetDouble(POSITION_PRICE_CURRENT);
        if(g_unifiedPositions[j].direction==POSITION_TYPE_BUY){if(cp>g_unifiedPositions[j].highWaterMark)g_unifiedPositions[j].highWaterMark=cp;}
@@ -2496,12 +2508,12 @@ void ExecuteSignal(int direction, double signalClose)
       Log("📐 PO3 watch active for "+dirStr);
 }
 
-//| STATE PERSISTENCE — STATE_VER=37                               |
+//| STATE PERSISTENCE — STATE_VER=38                               |
 string StateFile()
 { string tf=EnumToString(PERIOD_CURRENT);StringReplace(tf,":","_");
   // B4 FIX: include MagicNumber — prevents state collision between EA instances on same symbol/TF
   return "LinerX_Snflow_v8.0_"+_Symbol+"_"+tf+"_"+IntegerToString(MagicNumber)+".state";}
-#define STATE_VER 37
+#define STATE_VER 38
 
 void SaveStateFile()
 {
@@ -2550,8 +2562,11 @@ void SaveStateFile()
    FileWriteInteger(h,g_fibFlippedCount);
    for(int i=0;i<g_fibFlippedCount;i++)
    { FileWriteDouble(h,g_fibFlippedLevels[i]); FileWriteInteger(h,g_fibFlippedDir[i]); }
+   // Consolidation state (STATE_VER 38)
+   FileWriteInteger(h,g_inConsolidation?1:0);
+   FileWriteDouble(h,g_consolHigh); FileWriteDouble(h,g_consolLow); FileWriteDouble(h,g_adrValue);
    FileClose(h);
-   Log("💾 Saved V8.0 | ST="+IntegerToString(g_st_trend)+" fib="+EnumToString(g_fib.state)+" watch="+(g_fibWatch.active?"ARMED":"IDLE")+" flips="+IntegerToString(g_fibFlippedCount));
+   Log("💾 Saved V8.0 | ST="+IntegerToString(g_st_trend)+" fib="+EnumToString(g_fib.state)+" watch="+(g_fibWatch.active?"ARMED":"IDLE")+" flips="+IntegerToString(g_fibFlippedCount)+" consol="+(g_inConsolidation?"YES":"NO"));
 }
 
 void LoadStateFile()
@@ -2560,7 +2575,17 @@ void LoadStateFile()
    string fn=StateFile();if(!FileIsExist(fn,FILE_COMMON))return;
    int h=FileOpen(fn,FILE_READ|FILE_BIN|FILE_COMMON);if(h==INVALID_HANDLE)return;
    int fmt=FileReadInteger(h);
-   if(fmt!=STATE_VER){FileClose(h);FileDelete(fn,FILE_COMMON);Print("⚠️ State version mismatch (got ",fmt,") expected ",STATE_VER," — fresh start");return;}
+   if(fmt!=STATE_VER)
+   { FileClose(h); FileDelete(fn,FILE_COMMON);
+     Print("⚠️ State version mismatch (got ",fmt,") expected ",STATE_VER," — fresh start");
+     // Check if there are open positions that will be untracked (no SL/TP management)
+     int openCount=0;
+     for(int i=0;i<PositionsTotal();i++)
+     { ulong t=PositionGetTicket(i);if(!t||!PositionSelectByTicket(t))continue;
+       if(PositionGetString(POSITION_SYMBOL)==_Symbol&&(ulong)PositionGetInteger(POSITION_MAGIC)==(ulong)MagicNumber)openCount++;}
+     if(openCount>0)
+        Print("⚠️ WARNING: ",openCount," open position(s) on ",_Symbol," are now UNTRACKED — check SL/TP manually");
+     return; }
    datetime ts=(datetime)FileReadLong(h);
    if(MaxStateAgeHours>0&&TimeCurrent()-ts>(datetime)(MaxStateAgeHours*3600)){FileClose(h);FileDelete(fn,FILE_COMMON);Print("⚠️ State expired");return;}
    g_st_up=FileReadDouble(h);g_st_dn=FileReadDouble(h);
@@ -2616,8 +2641,13 @@ void LoadStateFile()
    { g_fibFlippedLevels[i]=FileReadDouble(h); g_fibFlippedDir[i]=FileReadInteger(h); g_fibFlippedCount++; }
    if(g_fibFlippedCount>0)
       Log(StringFormat("💾 Flipped levels restored: %d levels",g_fibFlippedCount));
+   // Consolidation state (STATE_VER 38)
+   g_inConsolidation=(FileReadInteger(h)==1);
+   g_consolHigh=FileReadDouble(h); g_consolLow=FileReadDouble(h); g_adrValue=FileReadDouble(h);
+   if(g_inConsolidation)
+      Log(StringFormat("💾 Consolidation restored | high=%.5f low=%.5f ADR=%.5f",g_consolHigh,g_consolLow,g_adrValue));
    FileClose(h);
-   Log("💾 Loaded V8.0 | trades="+IntegerToString(g_openTradeCount)+" SR="+IntegerToString(g_srChannelCount)+" fib="+EnumToString(g_fib.state)+" watch="+(g_fibWatch.active?"ARMED":"IDLE"));
+   Log("💾 Loaded V8.0 | trades="+IntegerToString(g_openTradeCount)+" SR="+IntegerToString(g_srChannelCount)+" fib="+EnumToString(g_fib.state)+" watch="+(g_fibWatch.active?"ARMED":"IDLE")+" consol="+(g_inConsolidation?"YES":"NO"));
 }
 
 //| INIT                                                            |
@@ -2680,8 +2710,11 @@ int OnInit()
      { Print(StringFormat("💾 Fib outside range but reanchor in progress (%s) — preserving state",
              g_fibWaitingNewCeiling?"CEILING↑":"FLOOR↓")); }
      else if(priceOutside)
-     { Print("⚠️ Stale fib — resetting (price outside range, no reanchor pending)");
-       Fib_ResetAll(); }}
+     { if(g_openTradeCount > 0)
+          Print("⚠️ Stale fib — price outside range but ",g_openTradeCount," open trade(s) — preserving to protect management");
+       else
+       { Print("⚠️ Stale fib — resetting (price outside range, no reanchor, no open trades)");
+         Fib_ResetAll(); }}}
 
    if(UseSRChannels&&g_srPivotCount==0) SR_BackfillPivots();
    else if(UseSRChannels&&g_srPivotCount>0&&g_srChannelCount==0){Print("💾 SR pivots loaded — rebuilding...");SR_BuildChannels();}
@@ -2701,7 +2734,7 @@ int OnInit()
    Print("SR (M5)  : ",UseSRChannels?"ON zones="+IntegerToString(g_srChannelCount):"OFF");
    Print("SR (M30) : zones=",g_srM30ChannelCount);
    Print("ATR SL   : ",UseATRBasedSL?"ON x"+DoubleToString(ATR_SL_Multiplier,1):"OFF");
-   Print("State    : Save=",SaveState," Load=",LoadState," [STATE_VER=37]");
+   Print("State    : Save=",SaveState," Load=",LoadState," [STATE_VER=38]");
    Print("ScoreMins: Entry=",Fib_EntryMinScore," Cascade=",Fib_CascadeMinScore);
    Print("===================================================================");
    return INIT_SUCCEEDED;
