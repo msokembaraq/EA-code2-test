@@ -202,6 +202,24 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    bool crossedDown = (k2 >= d2) && (k1 < d1);
    if(!crossedUp && !crossedDown) return false;
 
+   //--- DEBUG: log every cross with bar OHLC and current price
+   {
+      double barO = iOpen (_Symbol, tf, 1);
+      double barH = iHigh (_Symbol, tf, 1);
+      double barL = iLow  (_Symbol, tf, 1);
+      double barC = iClose(_Symbol, tf, 1);
+      double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      Print("[CROSS ", TFName(tf), " ", TimeToString(barTimes[1], TIME_DATE|TIME_MINUTES), "]",
+            "  ", (crossedUp ? "UP" : "DN"),
+            "  K=",    DoubleToString(k1, 2), " D=",    DoubleToString(d1, 2),
+            "  prevK=",DoubleToString(k2, 2), " prevD=",DoubleToString(d2, 2),
+            "  | O:", DoubleToString(barO, _Digits),
+            " H:", DoubleToString(barH, _Digits),
+            " L:", DoubleToString(barL, _Digits),
+            " C:", DoubleToString(barC, _Digits),
+            "  | Bid:", DoubleToString(bid, _Digits));
+   }
+
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
    //    K crosses D upward while K is in oversold zone
    if(crossedUp && k1 <= InpOS_Level)
@@ -209,6 +227,7 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
       lastOS_pivot = k1;
       state        = SIG_BUY;
       stateBar     = barTimes[1];
+      Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2), " <= OS:", InpOS_Level, ")");
       return true;
    }
 
@@ -219,6 +238,7 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
       lastOB_pivot = k1;
       state        = SIG_SELL;
       stateBar     = barTimes[1];
+      Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2), " >= OB:", InpOB_Level, ")");
       return true;
    }
 
@@ -232,8 +252,10 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          lastOB_pivot = k1;
          state        = SIG_SELL_AGAIN;
          stateBar     = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → SELL AGAIN  (K=", DoubleToString(k1,2), " pivot was:", DoubleToString(lastOB_pivot,2), ")");
          return true;
       }
+      Print("[REJECT ", TFName(tf), "] SELL AGAIN zone hit but pivot check failed  (K=", DoubleToString(k1,2), " lastOB_pivot=", DoubleToString(lastOB_pivot,2), ")");
       return false;
    }
 
@@ -247,11 +269,14 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          lastOS_pivot = k1;
          state        = SIG_BUY_AGAIN;
          stateBar     = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → BUY AGAIN  (K=", DoubleToString(k1,2), " pivot was:", DoubleToString(lastOS_pivot,2), ")");
          return true;
       }
+      Print("[REJECT ", TFName(tf), "] BUY AGAIN zone hit but pivot check failed  (K=", DoubleToString(k1,2), " lastOS_pivot=", DoubleToString(lastOS_pivot,2), ")");
       return false;
    }
 
+   Print("[REJECT ", TFName(tf), "] Cross ", (crossedUp?"UP":"DN"), " K=", DoubleToString(k1,2), " – no zone matched");
    return false;
 }
 
@@ -316,14 +341,18 @@ string TFName(ENUM_TIMEFRAMES tf)
 //+------------------------------------------------------------------+
 void FireAlert(string msg)
 {
-   if(InpEnablePush && !SendNotification(msg))
+   string bid = DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits);
+   string ask = DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits);
+   string fullMsg = msg + "  Bid:" + bid + " Ask:" + ask;
+
+   if(InpEnablePush && !SendNotification(fullMsg))
       Print("Push failed. Ensure mobile terminal is linked.");
 
    if(InpEnablePopup)
-      Alert(msg);
+      Alert(fullMsg);
 
    if(InpEnablePrint)
-      Print(msg);
+      Print("*** SIGNAL *** ", fullMsg);
 }
 
 //+------------------------------------------------------------------+
