@@ -2,7 +2,7 @@
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with K-Level Zone Filter + Price Pivots  |
 //|    Dual-TF State Machine – TF1 signals, TF2 confirms direction   |
-//|    v4.33 – Two-stage push alerts, TP/SL targets, clean logs      |
+//|    v4.34 – EMA cross independent secondary signal                |
 //|                                                                  |
 //|  SIGNAL LOGIC (TF1 – strict):                                    |
 //|   BUY        – K crosses D UP   AND K touched OS within N bars   |
@@ -17,10 +17,11 @@
 //|  STAGE 1: TF1 arms → push "BUY/SELL READY (RISKY)"             |
 //|  STAGE 2: TF2 confirms → push "BUY/SELL NOW (SAFE)"            |
 //|           with TP1 / TP2 / TP3 and SL at recent swing           |
+//|  EMA CROSS: fast EMA crosses slow EMA → independent push        |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.33"
-#property description "Stoch K/D cross – two-stage push alerts with TP/SL targets"
+#property version     "4.34"
+#property description "Stoch K/D cross + EMA cross – dual independent signal streams"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -53,12 +54,17 @@ input group "══════ Re-Entry Filters ══════"
 input double InpMinPriceGap      = 500;  // Min price gap in points (e.g. 500 = $5 on XAUUSD)
 input int    InpSignalCooldownMin = 60;  // Min minutes between same-type signals (0 = off)
 
-input group "══════ MA Trend Filter (re-entries only) ══════"
-input bool           InpEnableMAFilter = true;     // Require MA slope agreement for re-entries
-input int            InpMA_Period      = 34;      // TF1 MA period
-input ENUM_MA_METHOD InpMA_Method      = MODE_SMA; // MA method
-input bool           InpTF2UseOwnMA    = true;    // Use different MA period for TF2
-input int            InpMA_Period2     = 16;      // TF2 MA period
+input group "══════ EMA Settings ══════"
+input int            InpMA_Period      = 34;       // Slow EMA period
+input int            InpMA_Period2     = 16;       // Fast EMA period
+input ENUM_MA_METHOD InpMA_Method      = MODE_EMA; // MA method
+
+input group "══════ EMA Cross Signal (independent) ══════"
+input bool            InpEMACrossEnable = true;       // Enable EMA cross secondary signal
+input ENUM_TIMEFRAMES InpEMACross_TF    = PERIOD_M5;  // TF for both EMAs (same TF cross)
+
+input group "══════ MA Slope Filter (re-entries only) ══════"
+input bool           InpEnableMAFilter = true;     // Require slow EMA slope for re-entries
 
 input group "══════ Timeframe Selection ══════"
 input ENUM_TIMEFRAMES InpTF1            = PERIOD_M5;  // Timeframe 1 (signal source – strict zones)
@@ -115,6 +121,8 @@ datetime g_fired_bar_2 = 0;
 int      g_lastCooldownSig  = SIG_NONE;
 datetime g_lastCooldownTime = 0;
 
+datetime g_lastMACrossBar   = 0;   // bar guard for EMA cross detection
+
 //+------------------------------------------------------------------+
 //  INIT
 //+------------------------------------------------------------------+
@@ -128,6 +136,7 @@ int OnInit()
    g_fired_bar_1 = g_fired_bar_2 = 0;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
+   g_lastMACrossBar   = 0;
 
    int tf2K    = InpTF2UseOwnStoch ? InpStoch_K2    : InpStoch_K;
    int tf2D    = InpTF2UseOwnStoch ? InpStoch_D2    : InpStoch_D;
@@ -139,29 +148,32 @@ int OnInit()
    if(g_h_stoch_1 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF1 handle"); return INIT_FAILED; }
    if(g_h_stoch_2 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF2 handle"); return INIT_FAILED; }
 
-   if(InpEnableMAFilter)
+   // Slow EMA – used for re-entry slope filter and EMA cross slow side
+   if(InpEnableMAFilter || InpEMACrossEnable)
    {
-      int tf2MAPeriod = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-      g_h_ma_1 = iMA(_Symbol, InpTF1, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
-      g_h_ma_2 = iMA(_Symbol, InpTF2, tf2MAPeriod,  0, InpMA_Method, PRICE_CLOSE);
-      if(g_h_ma_1 == INVALID_HANDLE){ Alert("StochRSI: Failed MA TF1 handle"); return INIT_FAILED; }
-      if(g_h_ma_2 == INVALID_HANDLE){ Alert("StochRSI: Failed MA TF2 handle"); return INIT_FAILED; }
+      g_h_ma_1 = iMA(_Symbol, InpEMACross_TF, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
+      if(g_h_ma_1 == INVALID_HANDLE){ Alert("StochRSI: Failed slow EMA handle"); return INIT_FAILED; }
+   }
+   // Fast EMA – used for EMA cross fast side
+   if(InpEMACrossEnable)
+   {
+      g_h_ma_2 = iMA(_Symbol, InpEMACross_TF, InpMA_Period2, 0, InpMA_Method, PRICE_CLOSE);
+      if(g_h_ma_2 == INVALID_HANDLE){ Alert("StochRSI: Failed fast EMA handle"); return INIT_FAILED; }
    }
 
    EventSetTimer(2);
 
-   int tf2MAPeriodLog = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-   Print("StochRSI v4.33 loaded  ", _Symbol,
+   Print("StochRSI v4.34 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1),
          " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
-         " MA(", InpMA_Period, ")",
          " | TF2:", TFName(InpTF2),
          " Stoch(", tf2K, ",", tf2D, ",", tf2Slow, ")",
-         " MA(", tf2MAPeriodLog, ")",
+         " | EMA cross:", TFName(InpEMACross_TF),
+         " EMA", InpMA_Period2, "/EMA", InpMA_Period,
+         " enabled:", (InpEMACrossEnable ? "YES" : "NO"),
          " | OB:", InpOB_Level, " OS:", InpOS_Level, " Lookback:", InpOSLookback,
          " | SL:", InpSLLookback, "bars  TP RR:", InpTP1_RR, "/", InpTP2_RR, "/", InpTP3_RR,
-         " | Cooldown:", InpSignalCooldownMin, "min",
-         " | Gap:", InpMinPriceGap, "pts");
+         " | Cooldown:", InpSignalCooldownMin, "min Gap:", InpMinPriceGap, "pts");
 
    return INIT_SUCCEEDED;
 }
@@ -222,6 +234,8 @@ void CheckAllTimeframes()
 
    if(changed1 || changed2)
       CheckConfirmation();
+
+   CheckMACross();
 }
 
 //+------------------------------------------------------------------+
@@ -341,6 +355,46 @@ void FireConfirmedAlert(int sigType)
       Alert(msg);
    if(InpEnablePrint)
       Print("*** SIGNAL *** ", msg);
+}
+
+//+------------------------------------------------------------------+
+//  CheckMACross – independent EMA cross secondary signal
+//  Fast EMA crosses slow EMA → push "EMA CROSS M5 BUY/SELL SYMBOL"
+//+------------------------------------------------------------------+
+void CheckMACross()
+{
+   if(!InpEMACrossEnable)                               return;
+   if(g_h_ma_1 == INVALID_HANDLE ||
+      g_h_ma_2 == INVALID_HANDLE)                       return;
+
+   datetime barTimes[3];
+   if(CopyTime(_Symbol, InpEMACross_TF, 0, 3, barTimes) < 3) return;
+   if(barTimes[1] == g_lastMACrossBar)                  return;
+   g_lastMACrossBar = barTimes[1];
+
+   double slow[3], fast[3];
+   if(CopyBuffer(g_h_ma_1, 0, 0, 3, slow) < 3) return;  // slow EMA (34)
+   if(CopyBuffer(g_h_ma_2, 0, 0, 3, fast) < 3) return;  // fast EMA (16)
+
+   bool crossUp   = (fast[2] <= slow[2]) && (fast[1] > slow[1]);
+   bool crossDown = (fast[2] >= slow[2]) && (fast[1] < slow[1]);
+   if(!crossUp && !crossDown) return;
+
+   string dir   = crossUp ? "BUY" : "SELL";
+   string tfStr = TFName(InpEMACross_TF);
+   double price = iClose(_Symbol, InpEMACross_TF, 1);
+
+   string msg = "EMA CROSS " + tfStr + " " + dir + " " + _Symbol
+              + "  Price:" + DoubleToString(price,   _Digits)
+              + "  EMA"   + IntegerToString(InpMA_Period2) + ":" + DoubleToString(fast[1], _Digits)
+              + "  EMA"   + IntegerToString(InpMA_Period)  + ":" + DoubleToString(slow[1], _Digits);
+
+   if(InpEnablePush && !SendNotification(msg))
+      Print("Push failed. Ensure mobile terminal is linked.");
+   if(InpEnablePopup)
+      Alert(msg);
+   if(InpEnablePrint)
+      Print("[EMA CROSS] ", msg);
 }
 
 //+------------------------------------------------------------------+
