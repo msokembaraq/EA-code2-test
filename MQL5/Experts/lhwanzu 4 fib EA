@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                              LinerX_v9_FibST_EA.mq5             |
-//|  V9.0 — Clean Fib + SuperTrend rewrite                          |
+//|  V9.1 — Fix pip scalar, SR backfill, cascade dead-zone          |
 //|  STRATEGY:                                                       |
 //|    ST flip at PD zone (discount/premium) → immediate entry       |
 //|    Cascade levels (RevL/RevH/FLIP-1/FLIP1H) bypass SR check      |
@@ -8,9 +8,9 @@
 //|    PO3 manipulation wick arms trade, next ST flip fires entry    |
 //|    Consolidation: wick to RevL/RevH fires direct entry           |
 //+------------------------------------------------------------------+
-#property copyright "LinerX v9.0"
-#property version   "9.0"
-#property description "LinerX v9.0 — ST + Fib PD Zone + Cascade + PO3 + Consolidation"
+#property copyright "LinerX v9.1"
+#property version   "9.1"
+#property description "LinerX v9.1 — ST + Fib PD Zone + Cascade + PO3 + Consolidation"
 #include <Trade/Trade.mqh>
 
 //+------------------------------------------------------------------+
@@ -719,14 +719,64 @@ void SR_Update()
 }
 
 //+------------------------------------------------------------------+
+//| SR BACKFILL — load historical pivot S/R levels on startup        |
+//+------------------------------------------------------------------+
+void SR_Backfill()
+{
+   int total = iBars(_Symbol, PERIOD_CURRENT);
+   int prd   = SR_PivotLookback;
+   if(total < prd*2+3) return;
+   int scanBars = MathMin(total - prd - 1, SR_MaxZones * 8);
+   g_srCount = 0;
+
+   for(int bar = prd; bar < scanBars && g_srCount < SR_MaxZones*2; bar++)
+   {
+      double h = iHigh(_Symbol,PERIOD_CURRENT,bar); bool isPH=true;
+      for(int k=1; k<=prd&&isPH; k++)
+      {
+         if(bar-k<0||bar+k>=total){isPH=false;break;}
+         if(iHigh(_Symbol,PERIOD_CURRENT,bar-k)>=h||iHigh(_Symbol,PERIOD_CURRENT,bar+k)>=h) isPH=false;
+      }
+      if(isPH)
+      {
+         bool ex=false;
+         for(int k=0;k<g_srCount;k++) if(g_srTypes[k]==1&&MathAbs(g_srLevels[k]-h)<_Point){ex=true;break;}
+         if(!ex&&g_srCount<SR_MaxZones*2){g_srLevels[g_srCount]=h;g_srTypes[g_srCount]=1;g_srCount++;}
+      }
+      double l = iLow(_Symbol,PERIOD_CURRENT,bar); bool isPL=true;
+      for(int k=1; k<=prd&&isPL; k++)
+      {
+         if(bar-k<0||bar+k>=total){isPL=false;break;}
+         if(iLow(_Symbol,PERIOD_CURRENT,bar-k)<=l||iLow(_Symbol,PERIOD_CURRENT,bar+k)<=l) isPL=false;
+      }
+      if(isPL)
+      {
+         bool ex=false;
+         for(int k=0;k<g_srCount;k++) if(g_srTypes[k]==-1&&MathAbs(g_srLevels[k]-l)<_Point){ex=true;break;}
+         if(!ex&&g_srCount<SR_MaxZones*2){g_srLevels[g_srCount]=l;g_srTypes[g_srCount]=-1;g_srCount++;}
+      }
+   }
+   Print(StringFormat("📍 SR Backfill: %d levels loaded (scanned %d bars, lookback=%d)",
+         g_srCount, scanBars, prd));
+}
+
+//+------------------------------------------------------------------+
 //| SR HAS CONFLUENCE                                                |
 //+------------------------------------------------------------------+
 bool SR_HasConfluence(int direction, double price)
 {
    double tol = SR_TolerancePips * ScaledPip();
 
-   // Equilibrium acts as S/R for both directions
-   if(g_fibValid && g_f05 > 0 && MathAbs(price - g_f05) <= tol) return true;
+   // All key fib levels act as S/R — being near any of them = confluence
+   if(g_fibValid)
+   {
+      double fibSR[9];
+      fibSR[0]=g_f0; fibSR[1]=g_f025; fibSR[2]=g_f0382; fibSR[3]=g_f05;
+      fibSR[4]=g_f0618; fibSR[5]=g_f075; fibSR[6]=g_f1;
+      fibSR[7]=g_fRevL; fibSR[8]=g_fRevH;
+      for(int i=0; i<9; i++)
+         if(fibSR[i]>0 && MathAbs(price-fibSR[i])<=tol) return true;
+   }
 
    for(int i=0; i<g_srCount; i++)
    {
@@ -1385,6 +1435,9 @@ void ExecuteSignal(int direction)
       if(nearRevL)       { zoneOK=true; zoneTag="RevL"; isCascadeLevel=true; }
       if(nearFlip1L)     { zoneOK=true; zoneTag="FLIP-1"; isCascadeLevel=true; }
       if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
+      // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0)
+      if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0-(g_f0-g_fRevL)*0.5 && ep>=g_fRevL-buf*3)
+         { zoneOK=true; zoneTag="CASCADE-LOWER"; isCascadeLevel=true; }
    }
    else
    {
@@ -1392,6 +1445,9 @@ void ExecuteSignal(int direction)
       if(nearRevH)        { zoneOK=true; zoneTag="RevH"; isCascadeLevel=true; }
       if(nearFlip1H)      { zoneOK=true; zoneTag="FLIP1H"; isCascadeLevel=true; }
       if(atRoleFlipSell)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
+      // Cascade UP: upper half of the extension range (midpoint between f1 and RevH)
+      if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1+(g_fRevH-g_f1)*0.5 && ep<=g_fRevH+buf*3)
+         { zoneOK=true; zoneTag="CASCADE-UPPER"; isCascadeLevel=true; }
    }
 
    if(!zoneOK)
@@ -1559,20 +1615,18 @@ void LoadStateFile()
 int OnInit()
 {
    MathSrand(GetTickCount());
-   Print("════ LinerX v9.0 FibST EA ════");
+   Print("════ LinerX v9.1 FibST EA ════");
 
-   // Price scalar — auto-scale for high-value instruments
+   // Price scalar — maps broker "point" to a trader "pip" of meaningful size.
+   // XAUUSD uses 2 decimal places (point=0.01); 1 pip = $1 = 100 points → scalar=100.
+   // 3-digit pairs: scalar=10.  Standard 4/5-digit forex: scalar=1.
    {
-      double price=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-      double pip=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
-      if(price>0 && pip>0)
-      {
-         double ratio=price/pip;
-         double reference=450000.0;
-         g_priceScalar=MathMax(1.0, MathMin(100.0, ratio/reference));
-      }
-      Print(StringFormat("📐 Price scalar: %.2f | %s (price=%.2f point=%.5f)",
-            g_priceScalar, _Symbol, SymbolInfoDouble(_Symbol,SYMBOL_BID), GetPointsize()));
+      int dg2 = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      if     (dg2 <= 2) g_priceScalar = 100.0;
+      else if(dg2 == 3) g_priceScalar = 10.0;
+      else              g_priceScalar = 1.0;
+      Print(StringFormat("📐 Price scalar: %.0f | %s (%d digits, point=%.5f) — 1 pip = %.4f",
+            g_priceScalar, _Symbol, dg2, GetPointsize(), GetPointsize()*g_priceScalar));
    }
 
    // ATR handle
@@ -1612,6 +1666,9 @@ int OnInit()
           " RevL="+DoubleToString(g_fRevL,_Digits)+
           " RevH="+DoubleToString(g_fRevH,_Digits));
    }
+
+   // Backfill SR pivot levels from historical bars
+   SR_Backfill();
 
    Print("════ V9.0 INIT COMPLETE ════");
    Print("Mode      : ", EAMode==EA_MODE_TRADE?"TRADE":"SIGNAL");
