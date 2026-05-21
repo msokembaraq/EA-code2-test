@@ -1443,9 +1443,8 @@ void ExecuteSignal(int direction)
       if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
       // F0618 bounce: only outside active cascade (ceiling may keep breaking during cascade UP)
       if(atF0618Bounce && !g_waitCeil)  { zoneOK=true; zoneTag="F0618-SUPP"; }
-      // Cascade UP: with-trend BUY anywhere from f0618 up to the midpoint of f1→RevH
-      // Covers pullbacks deep into premium zone (not just the narrow f1±buf band)
-      if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f0618-buf && ep<g_f1+(g_fRevH-g_f1)*0.5)
+      // Cascade UP: with-trend BUY just above/below f1 (tight pullback to the breakout level)
+      if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1-buf && ep<g_f1+(g_fRevH-g_f1)*0.5)
          { zoneOK=true; zoneTag="CASCADE-PULLBACK"; isCascadeLevel=true; }
       // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0) — reversal BUY
       if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0-(g_f0-g_fRevL)*0.5 && ep>=g_fRevL-buf*3)
