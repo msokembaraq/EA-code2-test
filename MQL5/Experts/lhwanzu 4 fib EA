@@ -561,11 +561,12 @@ void Fib_UpdateState()
       // Cascade continuation: if close breaks through current RevH
       if(cl1 > g_fRevH + bb)
       {
+         double oldRevH = g_fRevH;
          AddFlippedLevel(g_fRevH, -1); // RevH broke up → now BUY support on retest
          Fib_SetAnchor(g_lockedFloor, g_fRevH);
          g_waitCeil = true; // still waiting — new RevH is next target
-         Log(StringFormat("🔺 FIB CASCADE↑|broke RevH %.5f|next RevH target=%.5f", g_fRevH, g_fRevH));
-         Notify(StringFormat("🔺 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, g_fRevH, g_fRevH));
+         Log(StringFormat("🔺 FIB CASCADE↑|broke RevH %.5f|next RevH target=%.5f", oldRevH, g_fRevH));
+         Notify(StringFormat("🔺 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, oldRevH, g_fRevH));
       }
       return;
    }
@@ -599,11 +600,12 @@ void Fib_UpdateState()
       // Cascade continuation: close broke through current RevL
       if(cl1 < g_fRevL - bb)
       {
+         double oldRevL = g_fRevL;
          AddFlippedLevel(g_fRevL, +1); // RevL broke down → now SELL resistance on retest
          Fib_SetAnchor(g_fRevL, g_lockedCeil);
          g_waitFloor = true; // still waiting — new RevL is next target
-         Log(StringFormat("🔻 FIB CASCADE↓|broke RevL %.5f|next RevL target=%.5f", g_fRevL, g_fRevL));
-         Notify(StringFormat("🔻 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, g_fRevL, g_fRevL));
+         Log(StringFormat("🔻 FIB CASCADE↓|broke RevL %.5f|next RevL target=%.5f", oldRevL, g_fRevL));
+         Notify(StringFormat("🔻 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, oldRevL, g_fRevL));
       }
       return;
    }
@@ -813,13 +815,14 @@ void CalcTP(int direction, double entry, double &slOut,
       tp2Out = NormalizeDouble(g_waitCeil ? g_f1 : g_f075, dg);     // cascade: f1, else role-flip
       tp3Out = NormalizeDouble(g_waitCeil ? g_fFlip1H : g_fRevH, dg); // cascade: FLIP1H, else RevH
 
-      // Enforce minimum distances
-      tp1Out = MathMax(tp1Out, entry + mn);
+      // Enforce minimum distances — use 3 pips minimum so TP1 is never trivially close
+      double minTP = MathMax(mn, 3.0 * pip);
+      tp1Out = MathMax(tp1Out, entry + minTP);
       tp2Out = MathMax(tp2Out, tp1Out + mn);
       tp3Out = MathMax(tp3Out, tp2Out + mn);
 
       // If tp1 would be below or at entry (e.g. cascade buy above f05), use proportional TPs
-      if(tp1Out <= entry + mn)
+      if(tp1Out <= entry + minTP)
       {
          double revDist = MathAbs(g_fRevH - entry);
          if(revDist > mn*3)
@@ -842,13 +845,14 @@ void CalcTP(int direction, double entry, double &slOut,
       tp2Out = NormalizeDouble(g_waitFloor ? g_f0 : g_f025, dg);     // cascade: f0, else role-flip
       tp3Out = NormalizeDouble(g_waitFloor ? g_fFlip1L : g_fRevL, dg); // cascade: FLIP-1, else RevL
 
-      // Enforce minimum distances
-      tp1Out = MathMin(tp1Out, entry - mn);
+      // Enforce minimum distances — use 3 pips minimum so TP1 is never trivially close
+      double minTP = MathMax(mn, 3.0 * pip);
+      tp1Out = MathMin(tp1Out, entry - minTP);
       tp2Out = MathMin(tp2Out, tp1Out - mn);
       tp3Out = MathMin(tp3Out, tp2Out - mn);
 
       // If tp1 would be above or at entry (e.g. cascade sell below f05)
-      if(tp1Out >= entry - mn)
+      if(tp1Out >= entry - minTP)
       {
          double revDist = MathAbs(entry - g_fRevL);
          if(revDist > mn*3)
@@ -1446,8 +1450,9 @@ void ExecuteSignal(int direction)
       if(nearRevL)       { zoneOK=true; zoneTag="RevL"; isCascadeLevel=true; }
       if(nearFlip1L)     { zoneOK=true; zoneTag="FLIP-1"; isCascadeLevel=true; }
       if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
-      // F0618 bounce: only outside active cascade (ceiling may keep breaking during cascade UP)
-      if(atF0618Bounce && !g_waitCeil)  { zoneOK=true; zoneTag="F0618-SUPP"; }
+      // F0618 bounce: blocked during any active cascade AND must not overwrite a cascade-level match
+      if(atF0618Bounce && !g_waitCeil && !g_waitFloor && !isCascadeLevel)
+         { zoneOK=true; zoneTag="F0618-SUPP"; }
       // Cascade UP: with-trend BUY just above/below f1 (tight pullback to the breakout level)
       if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1-buf && ep<g_f1+(g_fRevH-g_f1)*0.5)
          { zoneOK=true; zoneTag="CASCADE-PULLBACK"; isCascadeLevel=true; }
@@ -1463,8 +1468,9 @@ void ExecuteSignal(int direction)
       if(nearRevH)        { zoneOK=true; zoneTag="RevH"; isCascadeLevel=true; }
       if(nearFlip1H)      { zoneOK=true; zoneTag="FLIP1H"; isCascadeLevel=true; }
       if(atRoleFlipSell)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
-      // F0382 rejection: only outside active cascade (floor may keep breaking during cascade DOWN)
-      if(atF0382Reject && !g_waitFloor) { zoneOK=true; zoneTag="F0382-REJ"; }
+      // F0382 rejection: blocked during any active cascade AND must not overwrite a cascade-level match
+      if(atF0382Reject && !g_waitFloor && !g_waitCeil && !isCascadeLevel)
+         { zoneOK=true; zoneTag="F0382-REJ"; }
       // Cascade DOWN: with-trend SELL in upper half of RevL→f0 (bounce into the breakdown zone)
       if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0+buf && ep>g_f0-(g_f0-g_fRevL)*0.5)
          { zoneOK=true; zoneTag="CASCADE-BOUNCE"; isCascadeLevel=true; }
