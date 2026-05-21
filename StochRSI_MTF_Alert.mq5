@@ -1,25 +1,25 @@
 //+------------------------------------------------------------------+
 //|                    StochRSI_MTF_Alert.mq5                        |
-//|    Stochastic K/D Cross with K-Level Zone Filter + Pivots        |
+//|    Stochastic K/D Cross with K-Level Zone Filter + Price Pivots  |
 //|    Dual-TF State Machine – both TFs must agree, no expiry        |
-//|    v4.20 – separate MA period per TF                             |
+//|    v4.30 – price-based pivots for BUY/SELL AGAIN                 |
 //|                                                                  |
-//|  SIGNAL LOGIC (zone = K level at the moment of cross):           |
-//|   BUY        – K crosses D UP   while K <= OS level  (e.g. 20)   |
-//|   SELL       – K crosses D DOWN while K >= OB level  (e.g. 80)   |
-//|   BUY AGAIN  – K crosses D UP   in 25–35                        |
-//|                AND K > last BUY pivot + MinGap (higher high)     |
-//|                AND MA sloping UP                                 |
-//|   SELL AGAIN – K crosses D DOWN in 65–75                        |
-//|                AND K < last SELL pivot - MinGap (lower low)      |
+//|  SIGNAL LOGIC:                                                   |
+//|   BUY        – K crosses D UP   while K <= OS level              |
+//|   SELL       – K crosses D DOWN while K >= OB level              |
+//|   BUY AGAIN  – K crosses D UP   in BuyAgain zone                 |
+//|                AND close > last BUY close + MinPriceGap          |
+//|                AND MA sloping UP                                  |
+//|   SELL AGAIN – K crosses D DOWN in SellAgain zone                |
+//|                AND close < last SELL close - MinPriceGap         |
 //|                AND MA sloping DOWN                               |
 //|                                                                  |
 //|  CONFIRMATION: alert fires only when TF1 AND TF2 hold the same  |
 //|  state. No expiry – states persist until overwritten.            |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.20"
-#property description "Stoch K/D cross filtered by K level – dual-TF state machine alerts"
+#property version     "4.30"
+#property description "Stoch K/D cross with price-pivot re-entries – dual-TF state machine"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -48,15 +48,15 @@ input double InpBuyAgain_High  = 35.0;  // Buy-Again K upper
 input double InpBuyAgain_Low   = 25.0;  // Buy-Again K lower
 
 input group "══════ Re-Entry Filters ══════"
-input double InpMinPivotGap       = 5.0;  // Min K-point gap from last pivot (0 = off)
-input int    InpSignalCooldownMin = 60;   // Min minutes between same-type signals (0 = off)
+input double InpMinPriceGap      = 500;  // Min price gap in points (e.g. 500 = $5 on XAUUSD)
+input int    InpSignalCooldownMin = 60;  // Min minutes between same-type signals (0 = off)
 
 input group "══════ MA Trend Filter (re-entries only) ══════"
 input bool           InpEnableMAFilter = true;     // Require MA slope agreement for re-entries
 input int            InpMA_Period      = 200;      // TF1 MA period
 input ENUM_MA_METHOD InpMA_Method      = MODE_SMA; // MA method
-input bool           InpTF2UseOwnMA   = false;    // Use different MA period for TF2
-input int            InpMA_Period2    = 100;       // TF2 MA period (higher TF → shorter period)
+input bool           InpTF2UseOwnMA    = false;    // Use different MA period for TF2
+input int            InpMA_Period2     = 100;      // TF2 MA period
 
 input group "══════ Timeframe Selection ══════"
 input ENUM_TIMEFRAMES InpTF1       = PERIOD_H1;  // Timeframe 1
@@ -92,11 +92,11 @@ int g_h_ma_2    = INVALID_HANDLE;
 datetime g_lastBar_1 = 0;
 datetime g_lastBar_2 = 0;
 
-// Pivot memory – K value at last primary signal
-double g_lastOB_pivot_1 = -1.0;
-double g_lastOS_pivot_1 = -1.0;
-double g_lastOB_pivot_2 = -1.0;
-double g_lastOS_pivot_2 = -1.0;
+// Price at last primary signal — used for BUY AGAIN / SELL AGAIN pivot check
+double g_lastBuyPrice_1  = -1.0;   // close price at last BUY on TF1
+double g_lastSellPrice_1 = -1.0;   // close price at last SELL on TF1
+double g_lastBuyPrice_2  = -1.0;
+double g_lastSellPrice_2 = -1.0;
 
 // TF state (persists until a new signal overwrites it)
 int      g_state_1 = SIG_NONE;
@@ -119,8 +119,8 @@ datetime g_lastCooldownTime = 0;
 int OnInit()
 {
    g_lastBar_1 = g_lastBar_2 = 0;
-   g_lastOB_pivot_1 = g_lastOS_pivot_1 = -1.0;
-   g_lastOB_pivot_2 = g_lastOS_pivot_2 = -1.0;
+   g_lastBuyPrice_1 = g_lastSellPrice_1 = -1.0;
+   g_lastBuyPrice_2 = g_lastSellPrice_2 = -1.0;
    g_state_1 = g_state_2 = SIG_NONE;
    g_bar_1   = g_bar_2   = 0;
    g_fired_bar_1 = g_fired_bar_2 = 0;
@@ -140,8 +140,8 @@ int OnInit()
    if(InpEnableMAFilter)
    {
       int tf2MAPeriod = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-      g_h_ma_1 = iMA(_Symbol, InpTF1, InpMA_Period,  0, InpMA_Method, PRICE_CLOSE);
-      g_h_ma_2 = iMA(_Symbol, InpTF2, tf2MAPeriod,   0, InpMA_Method, PRICE_CLOSE);
+      g_h_ma_1 = iMA(_Symbol, InpTF1, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
+      g_h_ma_2 = iMA(_Symbol, InpTF2, tf2MAPeriod,  0, InpMA_Method, PRICE_CLOSE);
       if(g_h_ma_1 == INVALID_HANDLE){ Alert("StochRSI: Failed MA TF1 handle"); return INIT_FAILED; }
       if(g_h_ma_2 == INVALID_HANDLE){ Alert("StochRSI: Failed MA TF2 handle"); return INIT_FAILED; }
    }
@@ -149,7 +149,7 @@ int OnInit()
    EventSetTimer(2);
 
    int tf2MAPeriodLog = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-   Print("StochRSI v4.20 loaded  ", _Symbol,
+   Print("StochRSI v4.30 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1),
          " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
          " MA(", InpMA_Period, ")",
@@ -159,7 +159,8 @@ int OnInit()
          " | MAfilter:", (InpEnableMAFilter ? "ON" : "OFF"),
          " | OB:", InpOB_Level, " OS:", InpOS_Level,
          " | Cooldown:", InpSignalCooldownMin, "min",
-         " | PivotGap:", InpMinPivotGap);
+         " | PriceGap:", InpMinPriceGap, "pts (=",
+         DoubleToString(InpMinPriceGap * _Point, _Digits), ")");
 
    return INIT_SUCCEEDED;
 }
@@ -177,13 +178,10 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//  TIMER
+//  TIMER / ONCALCULATE
 //+------------------------------------------------------------------+
 void OnTimer() { CheckAllTimeframes(); }
 
-//+------------------------------------------------------------------+
-//  MAIN CALCULATION
-//+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
                 const int prev_calculated,
                 const datetime &time[],
@@ -210,13 +208,13 @@ void CheckAllTimeframes()
    if(InpEnableTF1)
       changed1 = ProcessTimeframe(InpTF1, g_h_stoch_1, g_h_ma_1,
                                   g_lastBar_1,
-                                  g_lastOB_pivot_1, g_lastOS_pivot_1,
+                                  g_lastBuyPrice_1, g_lastSellPrice_1,
                                   g_state_1, g_bar_1);
 
    if(InpEnableTF2)
       changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2, g_h_ma_2,
                                   g_lastBar_2,
-                                  g_lastOB_pivot_2, g_lastOS_pivot_2,
+                                  g_lastBuyPrice_2, g_lastSellPrice_2,
                                   g_state_2, g_bar_2);
 
    if(changed1 || changed2)
@@ -225,25 +223,24 @@ void CheckAllTimeframes()
 
 //+------------------------------------------------------------------+
 //  PassesCooldown
-//  Returns true if enough time has passed since last same-type signal.
 //+------------------------------------------------------------------+
 bool PassesCooldown(int sigType, datetime t)
 {
-   if(InpSignalCooldownMin <= 0)      return true;
-   if(g_lastCooldownSig != sigType)   return true;
+   if(InpSignalCooldownMin <= 0)    return true;
+   if(g_lastCooldownSig != sigType) return true;
    return (t - g_lastCooldownTime) >= (datetime)(InpSignalCooldownMin * 60);
 }
 
 //+------------------------------------------------------------------+
 //  ProcessTimeframe
-//  Returns true if the state changed on this call.
+//  Returns true if state changed.
 //+------------------------------------------------------------------+
 bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
                       int              h_stoch,
                       int              h_ma,
                       datetime        &lastBar,
-                      double          &lastOB_pivot,
-                      double          &lastOS_pivot,
+                      double          &lastBuyPrice,
+                      double          &lastSellPrice,
                       int             &state,
                       datetime        &stateBar)
 {
@@ -256,35 +253,33 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    if(CopyBuffer(h_stoch, MAIN_LINE,   0, 3, k_buf) < 3) return false;
    if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3, d_buf) < 3) return false;
 
-   double k1 = k_buf[1];   // last closed bar K
-   double d1 = d_buf[1];   // last closed bar D
-   double k2 = k_buf[2];   // prior closed bar K
-   double d2 = d_buf[2];   // prior closed bar D
+   double k1 = k_buf[1];
+   double d1 = d_buf[1];
+   double k2 = k_buf[2];
+   double d2 = d_buf[2];
 
    bool crossedUp   = (k2 <= d2) && (k1 > d1);
    bool crossedDown = (k2 >= d2) && (k1 < d1);
    if(!crossedUp && !crossedDown) return false;
 
-   //--- DEBUG: log every cross with bar OHLC and current price
-   {
-      double barO = iOpen (_Symbol, tf, 1);
-      double barH = iHigh (_Symbol, tf, 1);
-      double barL = iLow  (_Symbol, tf, 1);
-      double barC = iClose(_Symbol, tf, 1);
-      double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      Print("[CROSS ", TFName(tf), " ", TimeToString(barTimes[1], TIME_DATE|TIME_MINUTES), "]",
-            "  ", (crossedUp ? "UP" : "DN"),
-            "  K=",    DoubleToString(k1, 2), " D=",    DoubleToString(d1, 2),
-            "  prevK=",DoubleToString(k2, 2), " prevD=",DoubleToString(d2, 2),
-            "  | O:", DoubleToString(barO, _Digits),
-            " H:", DoubleToString(barH, _Digits),
-            " L:", DoubleToString(barL, _Digits),
-            " C:", DoubleToString(barC, _Digits),
-            "  | Bid:", DoubleToString(bid, _Digits));
-   }
+   double barO = iOpen (_Symbol, tf, 1);
+   double barH = iHigh (_Symbol, tf, 1);
+   double barL = iLow  (_Symbol, tf, 1);
+   double barC = iClose(_Symbol, tf, 1);
+   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   Print("[CROSS ", TFName(tf), " ", TimeToString(barTimes[1], TIME_DATE|TIME_MINUTES), "]",
+         "  ", (crossedUp ? "UP" : "DN"),
+         "  K=",    DoubleToString(k1, 2), " D=",    DoubleToString(d1, 2),
+         "  prevK=",DoubleToString(k2, 2), " prevD=",DoubleToString(d2, 2),
+         "  | O:", DoubleToString(barO, _Digits),
+         " H:", DoubleToString(barH, _Digits),
+         " L:", DoubleToString(barL, _Digits),
+         " C:", DoubleToString(barC, _Digits),
+         "  | Bid:", DoubleToString(bid, _Digits));
 
    //--- ══ MA slope for trend filter ════════════════════════════════
-   bool maUptrend   = true;  // default: pass if filter off or data unavailable
+   bool maUptrend   = true;
    bool maDowntrend = true;
    if(InpEnableMAFilter && h_ma != INVALID_HANDLE)
    {
@@ -297,33 +292,31 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    }
 
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
-   //    K crosses D upward while K is in oversold zone
    if(crossedUp && k1 <= InpOS_Level)
    {
-      lastOS_pivot = k1;
-      lastOB_pivot = -1.0;   // invalidate sell pivot – trend has reversed
+      lastBuyPrice = barC;
       state        = SIG_BUY;
       stateBar     = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2), " <= OS:", InpOS_Level, " | sell pivot cleared)");
+      Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2),
+            " <= OS:", InpOS_Level, " | buyPrice=", DoubleToString(barC, _Digits), ")");
       return true;
    }
 
    //--- ══ PRIMARY SELL ══════════════════════════════════════════════
-   //    K crosses D downward while K is in overbought zone
    if(crossedDown && k1 >= InpOB_Level)
    {
-      lastOB_pivot = k1;
-      lastOS_pivot = -1.0;   // invalidate buy pivot – trend has reversed
-      state        = SIG_SELL;
-      stateBar     = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2), " >= OB:", InpOB_Level, " | buy pivot cleared)");
+      lastSellPrice = barC;
+      state         = SIG_SELL;
+      stateBar      = barTimes[1];
+      Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2),
+            " >= OB:", InpOB_Level, " | sellPrice=", DoubleToString(barC, _Digits), ")");
       return true;
    }
 
    //--- ══ SELL AGAIN ════════════════════════════════════════════════
-   //    K crosses D downward in tightened mid-range (65–75)
-   //    K must be lower than last SELL pivot by MinPivotGap (lower low)
-   //    MA must be sloping down
+   //    K crosses D down in zone (65–75)
+   //    Close must be LOWER than last SELL close by MinPriceGap (lower low in price)
+   //    MA must slope DOWN
    if(crossedDown && k1 >= InpSellAgain_Low && k1 <= InpSellAgain_High)
    {
       if(!maDowntrend)
@@ -331,31 +324,37 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          Print("[REJECT ", TFName(tf), "] SELL AGAIN – MA not sloping down  (K=", DoubleToString(k1,2), ")");
          return false;
       }
-      double gap = MathMax(InpMinPivotGap, 0.0);
-      // Pass if: no prior pivot in this cycle (first re-entry), OR lower low with gap
-      if(lastOB_pivot < 0.0 || k1 < lastOB_pivot - gap)
+      if(lastSellPrice < 0.0)
       {
-         double oldPivot = lastOB_pivot;
-         lastOB_pivot    = k1;
-         state           = SIG_SELL_AGAIN;
-         stateBar        = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → SELL AGAIN  (K=", DoubleToString(k1,2),
-               (oldPivot < 0.0 ? " first re-entry this cycle" :
-                StringFormat(" < prev pivot:%.2f - gap:%.1f", oldPivot, gap)),
-               " → new pivot:", DoubleToString(k1,2), ")");
+         Print("[REJECT ", TFName(tf), "] SELL AGAIN – no prior SELL price established");
+         return false;
+      }
+      double minPrice = lastSellPrice - InpMinPriceGap * _Point;
+      if(barC < minPrice)
+      {
+         double oldPrice  = lastSellPrice;
+         lastSellPrice    = barC;
+         state            = SIG_SELL_AGAIN;
+         stateBar         = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → SELL AGAIN",
+               "  K=", DoubleToString(k1,2),
+               "  C=", DoubleToString(barC, _Digits),
+               " < prev SELL:", DoubleToString(oldPrice, _Digits),
+               " - gap:", DoubleToString(InpMinPriceGap * _Point, _Digits),
+               " → new sellPrice=", DoubleToString(barC, _Digits));
          return true;
       }
-      Print("[REJECT ", TFName(tf), "] SELL AGAIN – pivot check failed",
-            "  (K=", DoubleToString(k1,2),
-            " lastOB_pivot=", DoubleToString(lastOB_pivot,2),
-            " need < ", DoubleToString(lastOB_pivot - gap, 2), ")");
+      Print("[REJECT ", TFName(tf), "] SELL AGAIN – price not lower low",
+            "  C=", DoubleToString(barC, _Digits),
+            " lastSellPrice=", DoubleToString(lastSellPrice, _Digits),
+            " need < ", DoubleToString(minPrice, _Digits));
       return false;
    }
 
    //--- ══ BUY AGAIN ═════════════════════════════════════════════════
-   //    K crosses D upward in tightened mid-range (25–35)
-   //    K must be higher than last BUY pivot by MinPivotGap (higher high)
-   //    MA must be sloping up
+   //    K crosses D up in zone (25–35)
+   //    Close must be HIGHER than last BUY close by MinPriceGap (higher high in price)
+   //    MA must slope UP
    if(crossedUp && k1 >= InpBuyAgain_Low && k1 <= InpBuyAgain_High)
    {
       if(!maUptrend)
@@ -363,24 +362,30 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          Print("[REJECT ", TFName(tf), "] BUY AGAIN – MA not sloping up  (K=", DoubleToString(k1,2), ")");
          return false;
       }
-      double gap = MathMax(InpMinPivotGap, 0.0);
-      // Pass if: no prior pivot in this cycle (first re-entry), OR higher high with gap
-      if(lastOS_pivot < 0.0 || k1 > lastOS_pivot + gap)
+      if(lastBuyPrice < 0.0)
       {
-         double oldPivot = lastOS_pivot;
-         lastOS_pivot    = k1;
+         Print("[REJECT ", TFName(tf), "] BUY AGAIN – no prior BUY price established");
+         return false;
+      }
+      double minPrice = lastBuyPrice + InpMinPriceGap * _Point;
+      if(barC > minPrice)
+      {
+         double oldPrice = lastBuyPrice;
+         lastBuyPrice    = barC;
          state           = SIG_BUY_AGAIN;
          stateBar        = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → BUY AGAIN  (K=", DoubleToString(k1,2),
-               (oldPivot < 0.0 ? " first re-entry this cycle" :
-                StringFormat(" > prev pivot:%.2f + gap:%.1f", oldPivot, gap)),
-               " → new pivot:", DoubleToString(k1,2), ")");
+         Print("[STATE ", TFName(tf), "] → BUY AGAIN",
+               "  K=", DoubleToString(k1,2),
+               "  C=", DoubleToString(barC, _Digits),
+               " > prev BUY:", DoubleToString(oldPrice, _Digits),
+               " + gap:", DoubleToString(InpMinPriceGap * _Point, _Digits),
+               " → new buyPrice=", DoubleToString(barC, _Digits));
          return true;
       }
-      Print("[REJECT ", TFName(tf), "] BUY AGAIN – pivot check failed",
-            "  (K=", DoubleToString(k1,2),
-            " lastOS_pivot=", DoubleToString(lastOS_pivot,2),
-            " need > ", DoubleToString(lastOS_pivot + gap, 2), ")");
+      Print("[REJECT ", TFName(tf), "] BUY AGAIN – price not higher high",
+            "  C=", DoubleToString(barC, _Digits),
+            " lastBuyPrice=", DoubleToString(lastBuyPrice, _Digits),
+            " need > ", DoubleToString(minPrice, _Digits));
       return false;
    }
 
@@ -394,7 +399,6 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
 //+------------------------------------------------------------------+
 void CheckConfirmation()
 {
-   //--- Single-TF mode: fire directly
    if(!InpEnableTF1 || !InpEnableTF2)
    {
       if(InpEnableTF1 && g_state_1 != SIG_NONE && g_bar_1 != g_fired_bar_1)
@@ -407,7 +411,7 @@ void CheckConfirmation()
             g_lastCooldownTime = g_bar_1;
          }
          else
-            Print("[COOLDOWN] ", SignalTypeName(g_state_1), " blocked (TF1) – within ", InpSignalCooldownMin, "min window");
+            Print("[COOLDOWN] ", SignalTypeName(g_state_1), " blocked (TF1)");
       }
       if(InpEnableTF2 && g_state_2 != SIG_NONE && g_bar_2 != g_fired_bar_2)
       {
@@ -419,7 +423,7 @@ void CheckConfirmation()
             g_lastCooldownTime = g_bar_2;
          }
          else
-            Print("[COOLDOWN] ", SignalTypeName(g_state_2), " blocked (TF2) – within ", InpSignalCooldownMin, "min window");
+            Print("[COOLDOWN] ", SignalTypeName(g_state_2), " blocked (TF2)");
       }
       return;
    }
@@ -431,9 +435,7 @@ void CheckConfirmation()
    datetime confirmedTime = MathMax(g_bar_1, g_bar_2);
    if(!PassesCooldown(g_state_1, confirmedTime))
    {
-      Print("[COOLDOWN] ", SignalTypeName(g_state_1),
-            " blocked – within ", InpSignalCooldownMin, "min window");
-      // Still update fired bars so we don't keep printing this every tick
+      Print("[COOLDOWN] ", SignalTypeName(g_state_1), " blocked – within ", InpSignalCooldownMin, "min");
       g_fired_bar_1 = g_bar_1;
       g_fired_bar_2 = g_bar_2;
       return;
