@@ -249,10 +249,11 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    {
       if(lastOB_pivot > 0.0 && k1 < lastOB_pivot)
       {
+         double oldPivot = lastOB_pivot;
          lastOB_pivot = k1;
          state        = SIG_SELL_AGAIN;
          stateBar     = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → SELL AGAIN  (K=", DoubleToString(k1,2), " pivot was:", DoubleToString(lastOB_pivot,2), ")");
+         Print("[STATE ", TFName(tf), "] → SELL AGAIN  (K=", DoubleToString(k1,2), " < prev pivot:", DoubleToString(oldPivot,2), " → new pivot:", DoubleToString(k1,2), ")");
          return true;
       }
       Print("[REJECT ", TFName(tf), "] SELL AGAIN zone hit but pivot check failed  (K=", DoubleToString(k1,2), " lastOB_pivot=", DoubleToString(lastOB_pivot,2), ")");
@@ -266,10 +267,11 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    {
       if(lastOS_pivot > 0.0 && k1 > lastOS_pivot)
       {
+         double oldPivot = lastOS_pivot;
          lastOS_pivot = k1;
          state        = SIG_BUY_AGAIN;
          stateBar     = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → BUY AGAIN  (K=", DoubleToString(k1,2), " pivot was:", DoubleToString(lastOS_pivot,2), ")");
+         Print("[STATE ", TFName(tf), "] → BUY AGAIN  (K=", DoubleToString(k1,2), " > prev pivot:", DoubleToString(oldPivot,2), " → new pivot:", DoubleToString(k1,2), ")");
          return true;
       }
       Print("[REJECT ", TFName(tf), "] BUY AGAIN zone hit but pivot check failed  (K=", DoubleToString(k1,2), " lastOS_pivot=", DoubleToString(lastOS_pivot,2), ")");
