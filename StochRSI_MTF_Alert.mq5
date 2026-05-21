@@ -2,11 +2,11 @@
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with K-Level Zone Filter + Price Pivots  |
 //|    Dual-TF State Machine – both TFs must agree, no expiry        |
-//|    v4.30 – price-based pivots for BUY/SELL AGAIN                 |
+//|    v4.31 – "recently in OS/OB" lookback for primary BUY/SELL     |
 //|                                                                  |
 //|  SIGNAL LOGIC:                                                   |
-//|   BUY        – K crosses D UP   while K <= OS level              |
-//|   SELL       – K crosses D DOWN while K >= OB level              |
+//|   BUY        – K crosses D UP   AND K touched OS within N bars   |
+//|   SELL       – K crosses D DOWN AND K touched OB within N bars   |
 //|   BUY AGAIN  – K crosses D UP   in BuyAgain zone                 |
 //|                AND close > last BUY close + MinPriceGap          |
 //|                AND MA sloping UP                                  |
@@ -18,7 +18,7 @@
 //|  state. No expiry – states persist until overwritten.            |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.30"
+#property version     "4.31"
 #property description "Stoch K/D cross with price-pivot re-entries – dual-TF state machine"
 #property indicator_chart_window
 #property indicator_plots 0
@@ -40,6 +40,7 @@ input int    InpStoch_Slow2 = 7;    // TF2 Slowing
 input group "══════ OB / OS Levels ══════"
 input double InpOB_Level   = 80.0;  // Overbought – K above this → SELL zone
 input double InpOS_Level   = 20.0;  // Oversold   – K below this → BUY zone
+input int    InpOSLookback = 8;     // Bars to look back for recent OB/OS touch
 
 input group "══════ Re-Entry Zone Filters (K level) ══════"
 input double InpSellAgain_High = 75.0;  // Sell-Again K upper
@@ -149,7 +150,7 @@ int OnInit()
    EventSetTimer(2);
 
    int tf2MAPeriodLog = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-   Print("StochRSI v4.30 loaded  ", _Symbol,
+   Print("StochRSI v4.31 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1),
          " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
          " MA(", InpMA_Period, ")",
@@ -157,7 +158,7 @@ int OnInit()
          " Stoch(", tf2K, ",", tf2D, ",", tf2Slow, ")",
          " MA(", tf2MAPeriodLog, ")",
          " | MAfilter:", (InpEnableMAFilter ? "ON" : "OFF"),
-         " | OB:", InpOB_Level, " OS:", InpOS_Level,
+         " | OB:", InpOB_Level, " OS:", InpOS_Level, " OSLookback:", InpOSLookback,
          " | Cooldown:", InpSignalCooldownMin, "min",
          " | PriceGap:", InpMinPriceGap, "pts (=",
          DoubleToString(InpMinPriceGap * _Point, _Digits), ")");
@@ -249,9 +250,12 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    if(barTimes[1] == lastBar)                     return false;
    lastBar = barTimes[1];
 
-   double k_buf[3], d_buf[3];
-   if(CopyBuffer(h_stoch, MAIN_LINE,   0, 3, k_buf) < 3) return false;
-   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3, d_buf) < 3) return false;
+   int    kCopy = InpOSLookback + 2;
+   double k_buf[];
+   double d_buf[3];
+   ArrayResize(k_buf, kCopy);
+   if(CopyBuffer(h_stoch, MAIN_LINE,   0, kCopy, k_buf) < kCopy) return false;
+   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return false;
 
    double k1 = k_buf[1];
    double d1 = d_buf[1];
@@ -261,6 +265,15 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    bool crossedUp   = (k2 <= d2) && (k1 > d1);
    bool crossedDown = (k2 >= d2) && (k1 < d1);
    if(!crossedUp && !crossedDown) return false;
+
+   // Scan last InpOSLookback bars (including cross bar) for OB/OS touch
+   bool recentlyOS = false;
+   bool recentlyOB = false;
+   for(int i = 1; i <= InpOSLookback && i < kCopy; i++)
+   {
+      if(k_buf[i] <= InpOS_Level) recentlyOS = true;
+      if(k_buf[i] >= InpOB_Level) recentlyOB = true;
+   }
 
    double barO = iOpen (_Symbol, tf, 1);
    double barH = iHigh (_Symbol, tf, 1);
@@ -292,24 +305,29 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    }
 
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
-   if(crossedUp && k1 <= InpOS_Level)
+   // K/D cross up AND K touched OS (<=20) within the last InpOSLookback bars.
+   // Fast stochastics bounce out of OS before the cross; lookback catches them.
+   if(crossedUp && recentlyOS)
    {
       lastBuyPrice = barC;
       state        = SIG_BUY;
       stateBar     = barTimes[1];
       Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2),
-            " <= OS:", InpOS_Level, " | buyPrice=", DoubleToString(barC, _Digits), ")");
+            " recentlyOS=yes lookback:", InpOSLookback,
+            " | buyPrice=", DoubleToString(barC, _Digits), ")");
       return true;
    }
 
    //--- ══ PRIMARY SELL ══════════════════════════════════════════════
-   if(crossedDown && k1 >= InpOB_Level)
+   // K/D cross down AND K touched OB (>=80) within the last InpOSLookback bars.
+   if(crossedDown && recentlyOB)
    {
       lastSellPrice = barC;
       state         = SIG_SELL;
       stateBar      = barTimes[1];
       Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2),
-            " >= OB:", InpOB_Level, " | sellPrice=", DoubleToString(barC, _Digits), ")");
+            " recentlyOB=yes lookback:", InpOSLookback,
+            " | sellPrice=", DoubleToString(barC, _Digits), ")");
       return true;
    }
 
