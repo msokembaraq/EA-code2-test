@@ -1443,7 +1443,10 @@ void ExecuteSignal(int direction)
       if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
       // F0618 bounce: only outside active cascade (ceiling may keep breaking during cascade UP)
       if(atF0618Bounce && !g_waitCeil)  { zoneOK=true; zoneTag="F0618-SUPP"; }
-      // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0)
+      // Cascade UP: with-trend BUY in lower half of f1→RevH (pullback into the breakout zone)
+      if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1-buf && ep<g_f1+(g_fRevH-g_f1)*0.5)
+         { zoneOK=true; zoneTag="CASCADE-PULLBACK"; isCascadeLevel=true; }
+      // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0) — reversal BUY
       if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0-(g_f0-g_fRevL)*0.5 && ep>=g_fRevL-buf*3)
          { zoneOK=true; zoneTag="CASCADE-LOWER"; isCascadeLevel=true; }
    }
@@ -1457,7 +1460,10 @@ void ExecuteSignal(int direction)
       if(atRoleFlipSell)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
       // F0382 rejection: only outside active cascade (floor may keep breaking during cascade DOWN)
       if(atF0382Reject && !g_waitFloor) { zoneOK=true; zoneTag="F0382-REJ"; }
-      // Cascade UP: upper half of the extension range (midpoint between f1 and RevH)
+      // Cascade DOWN: with-trend SELL in upper half of RevL→f0 (bounce into the breakdown zone)
+      if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0+buf && ep>g_f0-(g_f0-g_fRevL)*0.5)
+         { zoneOK=true; zoneTag="CASCADE-BOUNCE"; isCascadeLevel=true; }
+      // Cascade UP: upper half of the extension range (midpoint between f1 and RevH) — reversal SELL
       if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1+(g_fRevH-g_f1)*0.5 && ep<=g_fRevH+buf*3)
          { zoneOK=true; zoneTag="CASCADE-UPPER"; isCascadeLevel=true; }
    }
