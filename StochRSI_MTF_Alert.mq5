@@ -1,22 +1,25 @@
 //+------------------------------------------------------------------+
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with RSI(1) Level Filter + Pivots        |
-//|    Multi-Timeframe – selectable TF1 / TF2, both must agree       |
+//|    Dual-TF State Machine – both TFs must agree, no expiry        |
+//|                                                                  |
+//|  HOW IT WORKS:                                                   |
+//|   Each TF independently watches for crosses and holds its last   |
+//|   signal state indefinitely. A confirmed alert fires the moment  |
+//|   both TFs hold the same state. It will not re-fire on the same  |
+//|   agreement; at least one TF must transition before a repeat.    |
 //|                                                                  |
 //|  SIGNAL LOGIC:                                                   |
 //|   BUY        – K crosses D UP   while RSI in OS zone  (1–8)      |
 //|   SELL       – K crosses D DOWN while RSI in OB zone  (90–98)    |
 //|   BUY AGAIN  – K crosses D UP   while RSI in 15–40              |
-//|                AND cross K level > last BUY pivot  (higher high) |
+//|                AND cross K > last BUY pivot  (higher high)       |
 //|   SELL AGAIN – K crosses D DOWN while RSI in 60–80              |
-//|                AND cross K level < last SELL pivot (lower low)   |
-//|                                                                  |
-//|  CONFIRMATION: alert fires only when TF1 AND TF2 detect the same |
-//|  signal type within InpConfirmMins of each other.                |
+//|                AND cross K < last SELL pivot (lower low)         |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "1.30"
-#property description "Stoch K/D cross filtered by RSI(1) level – dual-TF confirmed alerts"
+#property version     "2.00"
+#property description "Stoch K/D cross filtered by RSI(1) – dual-TF state machine alerts"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -42,16 +45,15 @@ input double InpBuyAgain_High  = 40.0;  // Buy-Again RSI upper
 input double InpBuyAgain_Low   = 15.0;  // Buy-Again RSI lower
 
 input group "══════ Timeframe Selection ══════"
-input ENUM_TIMEFRAMES InpTF1        = PERIOD_M4;  // Timeframe 1
-input bool            InpEnableTF1  = true;        // Enable TF1
-input ENUM_TIMEFRAMES InpTF2        = PERIOD_M6;  // Timeframe 2
-input bool            InpEnableTF2  = true;        // Enable TF2
+input ENUM_TIMEFRAMES InpTF1       = PERIOD_M4;  // Timeframe 1
+input bool            InpEnableTF1 = true;        // Enable TF1
+input ENUM_TIMEFRAMES InpTF2       = PERIOD_M6;  // Timeframe 2
+input bool            InpEnableTF2 = true;        // Enable TF2
 
 input group "══════ Notification Settings ══════"
-input int  InpConfirmMins  = 12;    // Confirmation window (minutes) – max gap between TF1 and TF2 signal bars
-input bool InpEnablePush   = true;  // Send Push Notification
-input bool InpEnablePopup  = false; // Show Alert Popup
-input bool InpEnablePrint  = true;  // Print to Journal
+input bool InpEnablePush   = true;   // Send Push Notification
+input bool InpEnablePopup  = false;  // Show Alert Popup
+input bool InpEnablePrint  = true;   // Print to Journal
 
 input group "══════ Display Settings ══════"
 input bool InpDrawArrows    = true;  // Draw signal arrows on chart
@@ -67,49 +69,44 @@ input bool InpShowDashboard = true;  // Show info dashboard
 #define SIG_SELL_AGAIN 4
 
 //════════════════════════════════════════════════════════════════════
-//  PENDING SIGNAL  –  one per TF, waits for the other TF to agree
-//════════════════════════════════════════════════════════════════════
-struct PendingSignal
-{
-   int      type;    // SIG_* constant
-   datetime bar;     // closed bar time that generated the signal
-   color    clr;     // arrow / display colour
-   int      arrow;   // OBJ_ARROW_BUY or OBJ_ARROW_SELL
-
-   void Clear() { type = SIG_NONE; bar = 0; clr = clrNONE; arrow = 0; }
-};
-
-//════════════════════════════════════════════════════════════════════
 //  GLOBALS
 //════════════════════════════════════════════════════════════════════
 
-// Indicator handles (TF1 / TF2)
+// Indicator handles
 int g_h_rsi_1   = INVALID_HANDLE;
 int g_h_stoch_1 = INVALID_HANDLE;
 int g_h_rsi_2   = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
 
-// Last processed bar timestamps
+// Last processed bar timestamps (gate: process only on new closed bar)
 datetime g_lastBar_1 = 0;
 datetime g_lastBar_2 = 0;
 
-// Pivot memory – K value at last primary signal (per TF)
+// Pivot memory – K value at last primary signal
 double g_lastOB_pivot_1 = -1.0;
 double g_lastOS_pivot_1 = -1.0;
 double g_lastOB_pivot_2 = -1.0;
 double g_lastOS_pivot_2 = -1.0;
 
-// Last signal text for dashboard (per TF)
-string g_last_signal_1 = "–";
-string g_last_signal_2 = "–";
+//--- TF1 state  (persists until a new signal overwrites it)
+int      g_state_1 = SIG_NONE;
+datetime g_bar_1   = 0;          // bar time that set this state
+color    g_clr_1   = clrNONE;
+int      g_arrow_1 = 0;
+
+//--- TF2 state
+int      g_state_2 = SIG_NONE;
+datetime g_bar_2   = 0;
+color    g_clr_2   = clrNONE;
+int      g_arrow_2 = 0;
+
+//--- Tracks the bar pair at the last confirmed fire.
+//    Prevents re-firing on the same agreement without a new transition.
+datetime g_fired_bar_1 = 0;
+datetime g_fired_bar_2 = 0;
 
 // Arrow counter
 int g_arrowCount = 0;
-
-// Pending signals – each TF stores its latest detection here;
-// a confirmed alert fires only when both agree on the same type
-PendingSignal g_pend_1;
-PendingSignal g_pend_2;
 
 //+------------------------------------------------------------------+
 //  INIT
@@ -120,10 +117,14 @@ int OnInit()
    g_lastBar_1 = g_lastBar_2 = 0;
    g_lastOB_pivot_1 = g_lastOS_pivot_1 = -1.0;
    g_lastOB_pivot_2 = g_lastOS_pivot_2 = -1.0;
-   g_last_signal_1  = g_last_signal_2  = "–";
-   g_arrowCount = 0;
-   g_pend_1.Clear();
-   g_pend_2.Clear();
+
+   g_state_1 = g_state_2 = SIG_NONE;
+   g_bar_1   = g_bar_2   = 0;
+   g_clr_1   = g_clr_2   = clrNONE;
+   g_arrow_1 = g_arrow_2 = 0;
+
+   g_fired_bar_1 = g_fired_bar_2 = 0;
+   g_arrowCount  = 0;
 
    //--- Create indicator handles
    g_h_rsi_1   = iRSI       (_Symbol, InpTF1, InpRSI_Period, PRICE_CLOSE);
@@ -131,17 +132,15 @@ int OnInit()
    g_h_rsi_2   = iRSI       (_Symbol, InpTF2, InpRSI_Period, PRICE_CLOSE);
    g_h_stoch_2 = iStochastic(_Symbol, InpTF2, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
 
-   if(g_h_rsi_1   == INVALID_HANDLE){ Alert("StochRSI: Failed to create RSI TF1 handle");   return INIT_FAILED; }
-   if(g_h_stoch_1 == INVALID_HANDLE){ Alert("StochRSI: Failed to create Stoch TF1 handle"); return INIT_FAILED; }
-   if(g_h_rsi_2   == INVALID_HANDLE){ Alert("StochRSI: Failed to create RSI TF2 handle");   return INIT_FAILED; }
-   if(g_h_stoch_2 == INVALID_HANDLE){ Alert("StochRSI: Failed to create Stoch TF2 handle"); return INIT_FAILED; }
+   if(g_h_rsi_1   == INVALID_HANDLE){ Alert("StochRSI: Failed RSI TF1 handle");   return INIT_FAILED; }
+   if(g_h_stoch_1 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF1 handle"); return INIT_FAILED; }
+   if(g_h_rsi_2   == INVALID_HANDLE){ Alert("StochRSI: Failed RSI TF2 handle");   return INIT_FAILED; }
+   if(g_h_stoch_2 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF2 handle"); return INIT_FAILED; }
 
-   //--- Recurring 2-second timer to catch bars that form on off-chart TFs
    EventSetTimer(2);
 
-   Print("StochRSI MTF Alert loaded  ", _Symbol,
-         " | TF1:", TFName(InpTF1), " TF2:", TFName(InpTF2),
-         " | ConfirmWindow:", InpConfirmMins, "min");
+   Print("StochRSI State Machine loaded  ", _Symbol,
+         " | TF1:", TFName(InpTF1), " TF2:", TFName(InpTF2));
 
    return INIT_SUCCEEDED;
 }
@@ -192,51 +191,58 @@ int OnCalculate(const int rates_total,
 //+------------------------------------------------------------------+
 void CheckAllTimeframes()
 {
+   bool changed1 = false;
+   bool changed2 = false;
+
    if(InpEnableTF1)
-      ProcessTimeframe(InpTF1,
-                       g_h_rsi_1, g_h_stoch_1,
-                       g_lastBar_1,
-                       g_lastOB_pivot_1, g_lastOS_pivot_1,
-                       g_last_signal_1,
-                       g_pend_1);
+      changed1 = ProcessTimeframe(InpTF1,
+                                  g_h_rsi_1, g_h_stoch_1,
+                                  g_lastBar_1,
+                                  g_lastOB_pivot_1, g_lastOS_pivot_1,
+                                  g_state_1, g_bar_1, g_clr_1, g_arrow_1);
 
    if(InpEnableTF2)
-      ProcessTimeframe(InpTF2,
-                       g_h_rsi_2, g_h_stoch_2,
-                       g_lastBar_2,
-                       g_lastOB_pivot_2, g_lastOS_pivot_2,
-                       g_last_signal_2,
-                       g_pend_2);
+      changed2 = ProcessTimeframe(InpTF2,
+                                  g_h_rsi_2, g_h_stoch_2,
+                                  g_lastBar_2,
+                                  g_lastOB_pivot_2, g_lastOS_pivot_2,
+                                  g_state_2, g_bar_2, g_clr_2, g_arrow_2);
 
-   CheckConfirmation();
+   //--- Only evaluate confirmation when at least one TF just transitioned
+   if(changed1 || changed2)
+      CheckConfirmation();
 
    if(InpShowDashboard)
       DrawDashboard();
 }
 
 //+------------------------------------------------------------------+
-//  ProcessTimeframe – detect signal on one TF and store as pending
+//  ProcessTimeframe
+//  Watches one TF for signal crosses and updates its state.
+//  Returns true if the state changed on this call.
 //+------------------------------------------------------------------+
-void ProcessTimeframe(ENUM_TIMEFRAMES  tf,
+bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
                       int              h_rsi,
                       int              h_stoch,
                       datetime        &lastBar,
                       double          &lastOB_pivot,
                       double          &lastOS_pivot,
-                      string          &lastSignalTxt,
-                      PendingSignal   &pend)
+                      int             &state,
+                      datetime        &stateBar,
+                      color           &stateClr,
+                      int             &stateArrow)
 {
-   //--- Only act once per newly closed bar
+   //--- Gate: only act once per newly closed bar
    datetime barTimes[3];
-   if(CopyTime(_Symbol, tf, 0, 3, barTimes) < 3) return;
-   if(barTimes[1] == lastBar) return;
+   if(CopyTime(_Symbol, tf, 0, 3, barTimes) < 3) return false;
+   if(barTimes[1] == lastBar)                     return false;
    lastBar = barTimes[1];
 
-   //--- Read confirmed (closed) bar values
+   //--- Read closed-bar indicator values
    double rsi_buf[3], k_buf[3], d_buf[3];
-   if(CopyBuffer(h_rsi,   0,           0, 3, rsi_buf) < 3) return;
-   if(CopyBuffer(h_stoch, MAIN_LINE,   0, 3, k_buf)   < 3) return;
-   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3, d_buf)   < 3) return;
+   if(CopyBuffer(h_rsi,   0,           0, 3, rsi_buf) < 3) return false;
+   if(CopyBuffer(h_stoch, MAIN_LINE,   0, 3, k_buf)   < 3) return false;
+   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3, d_buf)   < 3) return false;
 
    double rsi = rsi_buf[1];   // last closed bar
    double k1  = k_buf[1];
@@ -246,108 +252,107 @@ void ProcessTimeframe(ENUM_TIMEFRAMES  tf,
 
    bool crossedUp   = (k2 <= d2) && (k1 > d1);
    bool crossedDown = (k2 >= d2) && (k1 < d1);
-   if(!crossedUp && !crossedDown) return;
+   if(!crossedUp && !crossedDown) return false;
 
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
    if(crossedUp && rsi >= InpRSI_OS_Low && rsi <= InpRSI_OS_High)
    {
-      lastOS_pivot  = k1;
-      lastSignalTxt = "BUY @ RSI " + DoubleToString(rsi, 1);
-      pend.type     = SIG_BUY;
-      pend.bar      = barTimes[1];
-      pend.clr      = clrLime;
-      pend.arrow    = OBJ_ARROW_BUY;
-      return;
+      lastOS_pivot = k1;
+      state        = SIG_BUY;
+      stateBar     = barTimes[1];
+      stateClr     = clrLime;
+      stateArrow   = OBJ_ARROW_BUY;
+      return true;
    }
 
    //--- ══ PRIMARY SELL ══════════════════════════════════════════════
    if(crossedDown && rsi >= InpRSI_OB_Low && rsi <= InpRSI_OB_High)
    {
-      lastOB_pivot  = k1;
-      lastSignalTxt = "SELL @ RSI " + DoubleToString(rsi, 1);
-      pend.type     = SIG_SELL;
-      pend.bar      = barTimes[1];
-      pend.clr      = clrRed;
-      pend.arrow    = OBJ_ARROW_SELL;
-      return;
+      lastOB_pivot = k1;
+      state        = SIG_SELL;
+      stateBar     = barTimes[1];
+      stateClr     = clrRed;
+      stateArrow   = OBJ_ARROW_SELL;
+      return true;
    }
 
    //--- ══ SELL AGAIN ════════════════════════════════════════════════
-   //    K crosses D downward in the 60–80 RSI zone
-   //    Pivot condition: current cross K < previous OB pivot K  (lower low = trend continuation)
+   //    lower low on K = trend continuation
    if(crossedDown && rsi >= InpSellAgain_Low && rsi <= InpSellAgain_High)
    {
       if(lastOB_pivot > 0.0 && k1 < lastOB_pivot)
       {
-         lastSignalTxt = "SELL AGAIN @ RSI " + DoubleToString(rsi, 1);
-         pend.type     = SIG_SELL_AGAIN;
-         pend.bar      = barTimes[1];
-         pend.clr      = clrOrangeRed;
-         pend.arrow    = OBJ_ARROW_SELL;
-         lastOB_pivot  = k1;
+         lastOB_pivot = k1;
+         state        = SIG_SELL_AGAIN;
+         stateBar     = barTimes[1];
+         stateClr     = clrOrangeRed;
+         stateArrow   = OBJ_ARROW_SELL;
+         return true;
       }
-      return;
+      return false;
    }
 
    //--- ══ BUY AGAIN ═════════════════════════════════════════════════
-   //    K crosses D upward in the 15–40 RSI zone
-   //    Pivot condition: current cross K > previous OS pivot K  (higher high = trend continuation)
+   //    higher high on K = trend continuation
    if(crossedUp && rsi >= InpBuyAgain_Low && rsi <= InpBuyAgain_High)
    {
       if(lastOS_pivot > 0.0 && k1 > lastOS_pivot)
       {
-         lastSignalTxt = "BUY AGAIN @ RSI " + DoubleToString(rsi, 1);
-         pend.type     = SIG_BUY_AGAIN;
-         pend.bar      = barTimes[1];
-         pend.clr      = clrAqua;
-         pend.arrow    = OBJ_ARROW_BUY;
-         lastOS_pivot  = k1;
+         lastOS_pivot = k1;
+         state        = SIG_BUY_AGAIN;
+         stateBar     = barTimes[1];
+         stateClr     = clrAqua;
+         stateArrow   = OBJ_ARROW_BUY;
+         return true;
       }
-      return;
+      return false;
    }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
-//  CheckConfirmation – fire only when both TFs agree
+//  CheckConfirmation
+//  Called only when at least one TF just changed state.
+//  Fires once per unique bar-pair agreement; does not expire.
 //+------------------------------------------------------------------+
 void CheckConfirmation()
 {
-   //--- Single-TF mode: bypass cross-TF requirement, fire directly
+   //--- Single-TF mode: fire directly on the TF that changed
    if(!InpEnableTF1 || !InpEnableTF2)
    {
-      if(InpEnableTF1 && g_pend_1.type != SIG_NONE)
+      if(InpEnableTF1 && g_state_1 != SIG_NONE && g_bar_1 != g_fired_bar_1)
       {
-         string msg = SignalTypeName(g_pend_1.type) + " " + _Symbol;
-         FireAlert(msg, g_pend_1.clr, g_pend_1.arrow, g_pend_1.bar);
-         g_pend_1.Clear();
+         FireAlert(SignalTypeName(g_state_1) + " " + _Symbol,
+                   g_clr_1, g_arrow_1, g_bar_1);
+         g_fired_bar_1 = g_bar_1;
       }
-      if(InpEnableTF2 && g_pend_2.type != SIG_NONE)
+      if(InpEnableTF2 && g_state_2 != SIG_NONE && g_bar_2 != g_fired_bar_2)
       {
-         string msg = SignalTypeName(g_pend_2.type) + " " + _Symbol;
-         FireAlert(msg, g_pend_2.clr, g_pend_2.arrow, g_pend_2.bar);
-         g_pend_2.Clear();
+         FireAlert(SignalTypeName(g_state_2) + " " + _Symbol,
+                   g_clr_2, g_arrow_2, g_bar_2);
+         g_fired_bar_2 = g_bar_2;
       }
       return;
    }
 
-   //--- Both TFs must have a pending signal
-   if(g_pend_1.type == SIG_NONE || g_pend_2.type == SIG_NONE) return;
+   //--- Both TFs must have reached a signal state
+   if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE) return;
 
-   //--- Signal types must match exactly
-   if(g_pend_1.type != g_pend_2.type) return;
+   //--- Both states must match
+   if(g_state_1 != g_state_2) return;
 
-   //--- Signal bars must be within the confirmation window
-   int gapSecs = (int)MathAbs((double)(g_pend_1.bar - g_pend_2.bar));
-   if(gapSecs > InpConfirmMins * 60) return;
+   //--- At least one TF must have a bar newer than the last confirmed fire.
+   //    This prevents re-firing on the same steady agreement.
+   if(g_bar_1 == g_fired_bar_1 && g_bar_2 == g_fired_bar_2) return;
 
-   //--- Both agree – fire once
-   string msg = SignalTypeName(g_pend_1.type) + " " + _Symbol;
-   datetime arrowBar = (g_pend_1.bar >= g_pend_2.bar) ? g_pend_1.bar : g_pend_2.bar;
+   //--- Agreement confirmed – fire once
+   datetime arrowBar = (g_bar_1 >= g_bar_2) ? g_bar_1 : g_bar_2;
+   FireAlert(SignalTypeName(g_state_1) + " " + _Symbol,
+             g_clr_1, g_arrow_1, arrowBar);
 
-   FireAlert(msg, g_pend_1.clr, g_pend_1.arrow, arrowBar);
-
-   g_pend_1.Clear();
-   g_pend_2.Clear();
+   g_fired_bar_1 = g_bar_1;
+   g_fired_bar_2 = g_bar_2;
 }
 
 //+------------------------------------------------------------------+
@@ -362,11 +367,11 @@ string SignalTypeName(int sigType)
       case SIG_BUY_AGAIN:  return "BUY AGAIN";
       case SIG_SELL_AGAIN: return "SELL AGAIN";
    }
-   return "";
+   return "–";
 }
 
 //+------------------------------------------------------------------+
-//  TFName – human-readable timeframe label
+//  TFName
 //+------------------------------------------------------------------+
 string TFName(ENUM_TIMEFRAMES tf)
 {
@@ -376,7 +381,7 @@ string TFName(ENUM_TIMEFRAMES tf)
 }
 
 //+------------------------------------------------------------------+
-//  FireAlert – dispatch notifications and draw arrow
+//  FireAlert
 //+------------------------------------------------------------------+
 void FireAlert(string msg, color arrowClr, int arrowType, datetime barTime)
 {
@@ -427,16 +432,26 @@ void DrawDashboard()
    string tf1 = TFName(InpTF1);
    string tf2 = TFName(InpTF2);
 
-   string pend1 = (g_pend_1.type != SIG_NONE)
-                  ? SignalTypeName(g_pend_1.type) + " – waiting " + tf2 + "..."
-                  : "–";
-   string pend2 = (g_pend_2.type != SIG_NONE)
-                  ? SignalTypeName(g_pend_2.type) + " – waiting " + tf1 + "..."
-                  : "–";
+   //--- State labels with agreement indicator
+   string s1 = SignalTypeName(g_state_1);
+   string s2 = SignalTypeName(g_state_2);
+
+   bool agreed = (g_state_1 != SIG_NONE)
+              && (g_state_1 == g_state_2)
+              && (g_bar_1 == g_fired_bar_1)
+              && (g_bar_2 == g_fired_bar_2);
+
+   if(agreed)       { s1 += " ✓"; s2 += " ✓"; }
+   else if(g_state_1 != SIG_NONE && g_state_2 == SIG_NONE)
+                    s1 += " (waiting " + tf2 + ")";
+   else if(g_state_2 != SIG_NONE && g_state_1 == SIG_NONE)
+                    s2 += " (waiting " + tf1 + ")";
+   else if(g_state_1 != SIG_NONE && g_state_2 != SIG_NONE && g_state_1 != g_state_2)
+                    { s1 += " ✗"; s2 += " ✗"; }
 
    string dash = "\n"
       + "╔══════════════════════════════════════════╗\n"
-      + "║  StochRSI MTF Alert  |  " + _Symbol + "\n"
+      + "║  StochRSI State Machine  |  " + _Symbol + "\n"
       + "╠══════════════════════════════════════════╣\n"
       + "║  RSI(1)  OB: "
          + DoubleToString(InpRSI_OB_Low, 0) + "–" + DoubleToString(InpRSI_OB_High, 0)
@@ -444,19 +459,15 @@ void DrawDashboard()
          + DoubleToString(InpRSI_OS_Low, 0) + "–" + DoubleToString(InpRSI_OS_High, 0) + "\n"
       + "║  Stoch(" + IntegerToString(InpStoch_K) + ","
                     + IntegerToString(InpStoch_D) + ","
-                    + IntegerToString(InpStoch_Slow) + ")"
-      + "  Confirm: " + IntegerToString(InpConfirmMins) + " min\n"
-      + "║  TF1: " + tf1 + "   TF2: " + tf2 + "\n"
+                    + IntegerToString(InpStoch_Slow) + ")\n"
       + "╠══════════════════════════════════════════╣\n"
-      + "║  " + tf1 + " Last  : " + g_last_signal_1 + "\n"
-      + "║  " + tf1 + " OB Piv: " + (g_lastOB_pivot_1 > 0 ? DoubleToString(g_lastOB_pivot_1, 1) : "–") + "\n"
-      + "║  " + tf1 + " OS Piv: " + (g_lastOS_pivot_1 > 0 ? DoubleToString(g_lastOS_pivot_1, 1) : "–") + "\n"
-      + "║  " + tf1 + " Pend  : " + pend1 + "\n"
+      + "║  " + tf1 + " State  : " + s1 + "\n"
+      + "║  " + tf1 + " OB Piv : " + (g_lastOB_pivot_1 > 0 ? DoubleToString(g_lastOB_pivot_1, 1) : "–") + "\n"
+      + "║  " + tf1 + " OS Piv : " + (g_lastOS_pivot_1 > 0 ? DoubleToString(g_lastOS_pivot_1, 1) : "–") + "\n"
       + "╠══════════════════════════════════════════╣\n"
-      + "║  " + tf2 + " Last  : " + g_last_signal_2 + "\n"
-      + "║  " + tf2 + " OB Piv: " + (g_lastOB_pivot_2 > 0 ? DoubleToString(g_lastOB_pivot_2, 1) : "–") + "\n"
-      + "║  " + tf2 + " OS Piv: " + (g_lastOS_pivot_2 > 0 ? DoubleToString(g_lastOS_pivot_2, 1) : "–") + "\n"
-      + "║  " + tf2 + " Pend  : " + pend2 + "\n"
+      + "║  " + tf2 + " State  : " + s2 + "\n"
+      + "║  " + tf2 + " OB Piv : " + (g_lastOB_pivot_2 > 0 ? DoubleToString(g_lastOB_pivot_2, 1) : "–") + "\n"
+      + "║  " + tf2 + " OS Piv : " + (g_lastOS_pivot_2 > 0 ? DoubleToString(g_lastOS_pivot_2, 1) : "–") + "\n"
       + "╚══════════════════════════════════════════╝";
 
    Comment(dash);
