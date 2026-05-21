@@ -148,13 +148,14 @@ int OnInit()
    if(g_h_stoch_1 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF1 handle"); return INIT_FAILED; }
    if(g_h_stoch_2 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF2 handle"); return INIT_FAILED; }
 
-   // Slow EMA – used for re-entry slope filter and EMA cross slow side
+   // Slow EMA on TF1 – re-entry slope filter. Also used as EMA cross slow side
+   // when InpEMACross_TF == InpTF1 (the expected configuration).
    if(InpEnableMAFilter || InpEMACrossEnable)
    {
-      g_h_ma_1 = iMA(_Symbol, InpEMACross_TF, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
+      g_h_ma_1 = iMA(_Symbol, InpTF1, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
       if(g_h_ma_1 == INVALID_HANDLE){ Alert("StochRSI: Failed slow EMA handle"); return INIT_FAILED; }
    }
-   // Fast EMA – used for EMA cross fast side
+   // Fast EMA on InpEMACross_TF – EMA cross fast side only, not used for re-entries
    if(InpEMACrossEnable)
    {
       g_h_ma_2 = iMA(_Symbol, InpEMACross_TF, InpMA_Period2, 0, InpMA_Method, PRICE_CLOSE);
@@ -226,7 +227,7 @@ void CheckAllTimeframes()
                                   true);               // TF1 always strict
 
    if(InpEnableTF2)
-      changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2, g_h_ma_2,
+      changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2, INVALID_HANDLE,
                                   g_lastBar_2,
                                   g_lastBuyPrice_2, g_lastSellPrice_2,
                                   g_state_2, g_bar_2,
@@ -380,21 +381,15 @@ void CheckMACross()
    bool crossDown = (fast[2] >= slow[2]) && (fast[1] < slow[1]);
    if(!crossUp && !crossDown) return;
 
-   string dir   = crossUp ? "BUY" : "SELL";
-   string tfStr = TFName(InpEMACross_TF);
-   double price = iClose(_Symbol, InpEMACross_TF, 1);
-
-   string msg = "EMA CROSS " + tfStr + " " + dir + " " + _Symbol
-              + "  Price:" + DoubleToString(price,   _Digits)
-              + "  EMA"   + IntegerToString(InpMA_Period2) + ":" + DoubleToString(fast[1], _Digits)
-              + "  EMA"   + IntegerToString(InpMA_Period)  + ":" + DoubleToString(slow[1], _Digits);
+   string dir = crossUp ? "BUY" : "SELL";
+   string msg = "EMA CROSS " + TFName(InpEMACross_TF) + " " + dir + " " + _Symbol;
 
    if(InpEnablePush && !SendNotification(msg))
       Print("Push failed. Ensure mobile terminal is linked.");
    if(InpEnablePopup)
       Alert(msg);
    if(InpEnablePrint)
-      Print("[EMA CROSS] ", msg);
+      Print("*** SIGNAL *** ", msg);
 }
 
 //+------------------------------------------------------------------+
