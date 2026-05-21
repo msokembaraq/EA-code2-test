@@ -34,7 +34,7 @@ input int    InpStoch_D    = 7;     // TF1 %D Period (signal)
 input int    InpStoch_Slow = 11;    // TF1 Slowing
 
 input group "══════ Stochastic Settings – TF2 Override ══════"
-input bool   InpTF2UseOwnStoch = false; // Use different Stoch params for TF2
+input bool   InpTF2UseOwnStoch = true; // Use different Stoch params for TF2
 input int    InpStoch_K2    = 24;   // TF2 %K Period
 input int    InpStoch_D2    = 3;    // TF2 %D Period (signal)
 input int    InpStoch_Slow2 = 9;    // TF2 Slowing
@@ -56,7 +56,7 @@ input int    InpSignalCooldownMin = 60;  // Min minutes between same-type signal
 
 input group "══════ EMA Settings ══════"
 input int            InpMA_Period      = 34;       // Slow EMA period
-input int            InpMA_Period2     = 16;       // Fast EMA period
+input int            InpMA_Period2     = 9;       // Fast EMA period
 input ENUM_MA_METHOD InpMA_Method      = MODE_EMA; // MA method
 
 input group "══════ EMA Cross Signal (independent) ══════"
