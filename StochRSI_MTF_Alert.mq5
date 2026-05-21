@@ -342,7 +342,8 @@ void FireConfirmedAlert(int sigType)
    double sl, tp1, tp2, tp3;
    CalcTPSL(sigType, entry, sl, tp1, tp2, tp3);
 
-   string msg = SignalTypeName(sigType)
+   string emoji = IsBullish(sigType) ? "🟢" : "🔴";
+   string msg = emoji + " " + SignalTypeName(sigType)
               + " NOW (SAFE) " + _Symbol
               + "  Entry:" + DoubleToString(entry, _Digits)
               + "  SL:"    + DoubleToString(sl,    _Digits)
@@ -355,7 +356,7 @@ void FireConfirmedAlert(int sigType)
    if(InpEnablePopup)
       Alert(msg);
    if(InpEnablePrint)
-      Print("*** SIGNAL *** ", msg);
+      Print(msg);
 }
 
 //+------------------------------------------------------------------+
@@ -382,14 +383,15 @@ void CheckMACross()
    if(!crossUp && !crossDown) return;
 
    string dir = crossUp ? "BUY" : "SELL";
-   string msg = "EMA CROSS " + TFName(InpEMACross_TF) + " " + dir + " " + _Symbol;
+   string emoji2 = crossUp ? "🟢" : "🔴";
+   string msg = emoji2 + " EMA CROSS " + TFName(InpEMACross_TF) + " " + dir + " " + _Symbol;
 
    if(InpEnablePush && !SendNotification(msg))
       Print("Push failed. Ensure mobile terminal is linked.");
    if(InpEnablePopup)
       Alert(msg);
    if(InpEnablePrint)
-      Print("*** SIGNAL *** ", msg);
+      Print(msg);
 }
 
 //+------------------------------------------------------------------+
