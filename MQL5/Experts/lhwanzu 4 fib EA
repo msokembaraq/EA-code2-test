@@ -1435,22 +1435,28 @@ void ExecuteSignal(int direction)
 
    if(direction==1)
    {
-      if(inDiscountZone) { zoneOK=true; zoneTag="DISCOUNT"; }
+      // During cascade DOWN (g_waitFloor), the floor is still breaking — block counter-trend BUY
+      // in the regular discount zone. Only cascade-specific BUY levels (RevL, role-flips) allowed.
+      if(inDiscountZone && !g_waitFloor) { zoneOK=true; zoneTag="DISCOUNT"; }
       if(nearRevL)       { zoneOK=true; zoneTag="RevL"; isCascadeLevel=true; }
       if(nearFlip1L)     { zoneOK=true; zoneTag="FLIP-1"; isCascadeLevel=true; }
       if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
-      if(atF0618Bounce)  { zoneOK=true; zoneTag="F0618-SUPP"; }          // premium floor bounce
+      // F0618 bounce: only outside active cascade (ceiling may keep breaking during cascade UP)
+      if(atF0618Bounce && !g_waitCeil)  { zoneOK=true; zoneTag="F0618-SUPP"; }
       // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0)
       if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0-(g_f0-g_fRevL)*0.5 && ep>=g_fRevL-buf*3)
          { zoneOK=true; zoneTag="CASCADE-LOWER"; isCascadeLevel=true; }
    }
    else
    {
-      if(inPremiumZone)   { zoneOK=true; zoneTag="PREMIUM"; }
+      // During cascade UP (g_waitCeil), the ceiling is still breaking — block counter-trend SELL
+      // in the regular premium zone. Only cascade-specific SELL levels (RevH, role-flips) allowed.
+      if(inPremiumZone && !g_waitCeil)  { zoneOK=true; zoneTag="PREMIUM"; }
       if(nearRevH)        { zoneOK=true; zoneTag="RevH"; isCascadeLevel=true; }
       if(nearFlip1H)      { zoneOK=true; zoneTag="FLIP1H"; isCascadeLevel=true; }
       if(atRoleFlipSell)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
-      if(atF0382Reject)   { zoneOK=true; zoneTag="F0382-REJ"; }          // discount ceiling rejection
+      // F0382 rejection: only outside active cascade (floor may keep breaking during cascade DOWN)
+      if(atF0382Reject && !g_waitFloor) { zoneOK=true; zoneTag="F0382-REJ"; }
       // Cascade UP: upper half of the extension range (midpoint between f1 and RevH)
       if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1+(g_fRevH-g_f1)*0.5 && ep<=g_fRevH+buf*3)
          { zoneOK=true; zoneTag="CASCADE-UPPER"; isCascadeLevel=true; }
@@ -1458,8 +1464,10 @@ void ExecuteSignal(int direction)
 
    if(!zoneOK)
    {
-      Log(StringFormat("🚫 %s BLOCKED | price %.5f not in valid zone | f0=%.5f f0382=%.5f f0618=%.5f f1=%.5f",
-          direction==1?"BUY":"SELL", ep, g_f0, g_f0382, g_f0618, g_f1));
+      string cascadeNote = (g_waitFloor&&direction==1)?" [CASCADE-DOWN: discount BUY suspended]":
+                           (g_waitCeil &&direction==-1)?" [CASCADE-UP: premium SELL suspended]":"";
+      Log(StringFormat("🚫 %s BLOCKED | price %.5f not in valid zone | f0=%.5f f0382=%.5f f0618=%.5f f1=%.5f%s",
+          direction==1?"BUY":"SELL", ep, g_f0, g_f0382, g_f0618, g_f1, cascadeNote));
       return;
    }
 
