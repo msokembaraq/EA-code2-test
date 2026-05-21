@@ -562,10 +562,13 @@ void Fib_UpdateState()
       if(cl1 > g_fRevH + bb)
       {
          double oldRevH = g_fRevH;
+         // Anchor f1 at the actual bar high (where price truly extended), not the pre-defined RevH
+         double actualHigh = iHigh(_Symbol, _Period, 1);
+         double newF1 = MathMax(actualHigh, g_fRevH);
          AddFlippedLevel(g_fRevH, -1); // RevH broke up → now BUY support on retest
-         Fib_SetAnchor(g_lockedFloor, g_fRevH);
+         Fib_SetAnchor(g_lockedFloor, newF1);
          g_waitCeil = true; // still waiting — new RevH is next target
-         Log(StringFormat("🔺 FIB CASCADE↑|broke RevH %.5f|next RevH target=%.5f", oldRevH, g_fRevH));
+         Log(StringFormat("🔺 FIB CASCADE↑|broke RevH %.5f|actual high=%.5f|next RevH target=%.5f", oldRevH, newF1, g_fRevH));
          Notify(StringFormat("🔺 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, oldRevH, g_fRevH));
       }
       return;
@@ -601,10 +604,13 @@ void Fib_UpdateState()
       if(cl1 < g_fRevL - bb)
       {
          double oldRevL = g_fRevL;
+         // Anchor f0 at the actual bar low (where price truly extended), not the pre-defined RevL
+         double actualLow = iLow(_Symbol, _Period, 1);
+         double newF0 = MathMin(actualLow, g_fRevL);
          AddFlippedLevel(g_fRevL, +1); // RevL broke down → now SELL resistance on retest
-         Fib_SetAnchor(g_fRevL, g_lockedCeil);
+         Fib_SetAnchor(newF0, g_lockedCeil);
          g_waitFloor = true; // still waiting — new RevL is next target
-         Log(StringFormat("🔻 FIB CASCADE↓|broke RevL %.5f|next RevL target=%.5f", oldRevL, g_fRevL));
+         Log(StringFormat("🔻 FIB CASCADE↓|broke RevL %.5f|actual low=%.5f|next RevL target=%.5f", oldRevL, newF0, g_fRevL));
          Notify(StringFormat("🔻 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, oldRevL, g_fRevL));
       }
       return;
