@@ -104,6 +104,7 @@ struct FibWatch
    int    armedBar;
    string signalSource;
    bool   isPO3;
+   bool   wasCascade;  // true if armed while g_fibWaitingNewFloor/Ceiling was active
    // ── Priority Queue Fields ──────────────────────────
    int    score;       // signal quality score at time of arming
    int    priority;    // source priority 1=highest(H&S) 5=lowest(SD alone)
@@ -1493,6 +1494,8 @@ void Fib_ArmWatch(int direction, string source, bool isPO3=false, double specifi
    g_fibWatch.armedBar     = g_barCount;
    g_fibWatch.signalSource = source;
    g_fibWatch.isPO3        = isPO3;
+   g_fibWatch.wasCascade   = (g_fibWaitingNewFloor && direction==1) ||
+                             (g_fibWaitingNewCeiling && direction==-1);
    g_fibWatch.score        = incomingScore;
    g_fibWatch.priority     = incomingPriority;
 
@@ -1548,8 +1551,10 @@ void Fib_CheckWatch()
    // Score the entry — candle patterns + structural confluences
    int score = Fib_ScoreZoneEntry(g_fibWatch.direction, cl1, 1);
 
-   // Min score — cascade uses lower threshold (no PD zone bonus available)
-   bool watchCascade  = (g_fibWaitingNewFloor || g_fibWaitingNewCeiling);
+   // Min score — cascade uses lower threshold (no PD zone bonus available).
+   // wasCascade preserves the cascade context even after the re-anchor clears the shift flag
+   // (re-anchor happens inside Fib_UpdateState before Fib_CheckWatch runs in the same tick).
+   bool watchCascade  = (g_fibWaitingNewFloor || g_fibWaitingNewCeiling) || g_fibWatch.wasCascade;
    int  watchMinScore = watchCascade ? Fib_CascadeMinScore : Fib_EntryMinScore;
    if(score < watchMinScore)
    { Log(StringFormat("⏳ FIB WATCH: zone hit | score=%d < min=%d%s | waiting for pattern",
@@ -1698,11 +1703,18 @@ void Fib_CheckSDCascadeReAnchor()
 
       if(wickHit && closeAbove)
       {
+         // Arm the BUY watch BEFORE re-anchoring so:
+         // (a) zone is set around the current RevL, and
+         // (b) wasCascade=true is captured (g_fibWaitingNewFloor still true here).
+         // Fib_CheckWatch() runs after Fib_UpdateState() in the same OnTick and will
+         // execute the trade with cascade-level score threshold.
+         ZeroMemory(g_fibWatch);  // clear any stale proximity/SD watch
+         Fib_ArmWatch(1, "REVL-HOLD", false);
          Fib_AddFlippedLevel(target, -1); // held as BUY floor → stays support on future retest
          Fib_SetAnchor(target, g_fibLockedCeiling, false);
          g_fibWaitingNewFloor = false;
          g_fib.state = FIB_RANGE;
-         Log(StringFormat("✅ FIB CASCADE HOLD↓|new 0=%.5f|1=%.5f(LOCKED)|new RevL=%.5f",
+         Log(StringFormat("✅ FIB CASCADE HOLD↓|new 0=%.5f|1=%.5f(LOCKED)|new RevL=%.5f|BUY watch armed",
              g_fibLevel0, g_fibLevel1, g_fibRevL));
          Notify(StringFormat("✅ FIB CASCADE HOLD|%s|new 0=%.5f|1=%.5f|0.25=%.5f|0.75=%.5f|RevL→%.5f",
                 _Symbol,g_fibLevel0,g_fibLevel1,g_fibLevel025,g_fibLevel075,g_fibRevL));
@@ -1741,11 +1753,16 @@ void Fib_CheckSDCascadeReAnchor()
 
       if(wickHit && closeBelow)
       {
+         // Arm the SELL watch BEFORE re-anchoring so:
+         // (a) zone is set around the current RevH, and
+         // (b) wasCascade=true is captured (g_fibWaitingNewCeiling still true here).
+         ZeroMemory(g_fibWatch);  // clear any stale proximity/SD watch
+         Fib_ArmWatch(-1, "REVH-HOLD", false);
          Fib_AddFlippedLevel(target, +1); // held as SELL ceiling → stays resistance on future retest
          Fib_SetAnchor(g_fibLockedFloor, target, false);
          g_fibWaitingNewCeiling = false;
          g_fib.state = FIB_RANGE;
-         Log(StringFormat("✅ FIB CASCADE HOLD↑|new 1=%.5f|0=%.5f(LOCKED)|new RevH=%.5f",
+         Log(StringFormat("✅ FIB CASCADE HOLD↑|new 1=%.5f|0=%.5f(LOCKED)|new RevH=%.5f|SELL watch armed",
              g_fibLevel1, g_fibLevel0, g_fibRevH));
          Notify(StringFormat("✅ FIB CASCADE HOLD|%s|new 1=%.5f|0=%.5f|0.25=%.5f|0.75=%.5f|RevH→%.5f",
                 _Symbol,g_fibLevel1,g_fibLevel0,g_fibLevel025,g_fibLevel075,g_fibRevH));
