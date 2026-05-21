@@ -2,25 +2,25 @@
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with K-Level Zone Filter + Price Pivots  |
 //|    Dual-TF State Machine – TF1 signals, TF2 confirms direction   |
-//|    v4.32 – TF2 confirms with any K/D cross (no zone required)    |
+//|    v4.33 – Two-stage push alerts, TP/SL targets, clean logs      |
 //|                                                                  |
 //|  SIGNAL LOGIC (TF1 – strict):                                    |
 //|   BUY        – K crosses D UP   AND K touched OS within N bars   |
 //|   SELL       – K crosses D DOWN AND K touched OB within N bars   |
-//|   BUY AGAIN  – K crosses D UP   in BuyAgain zone                 |
+//|   BUY AGAIN  – K crosses D UP   in BuyAgain zone (25-35)        |
 //|                AND close > last BUY close + MinPriceGap          |
 //|                AND MA sloping UP                                  |
-//|   SELL AGAIN – K crosses D DOWN in SellAgain zone                |
+//|   SELL AGAIN – K crosses D DOWN in SellAgain zone (65-75)       |
 //|                AND close < last SELL close - MinPriceGap         |
 //|                AND MA sloping DOWN                               |
 //|                                                                  |
-//|  CONFIRMATION: TF1 generates signal (strict zones).              |
-//|  TF2 confirms direction only – any K/D cross UP confirms BUY,    |
-//|  any K/D cross DOWN confirms SELL. No OB/OS zone required on TF2.|
+//|  STAGE 1: TF1 arms → push "BUY/SELL READY (RISKY)"             |
+//|  STAGE 2: TF2 confirms → push "BUY/SELL NOW (SAFE)"            |
+//|           with TP1 / TP2 / TP3 and SL at recent swing           |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.32"
-#property description "Stoch K/D cross – TF1 strict signal, TF2 direction confirmation"
+#property version     "4.33"
+#property description "Stoch K/D cross – two-stage push alerts with TP/SL targets"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -65,7 +65,13 @@ input ENUM_TIMEFRAMES InpTF1            = PERIOD_M5;  // Timeframe 1 (signal sou
 input bool            InpEnableTF1      = true;        // Enable TF1
 input ENUM_TIMEFRAMES InpTF2            = PERIOD_M15;  // Timeframe 2 (confirmation)
 input bool            InpEnableTF2      = true;        // Enable TF2
-input bool            InpTF2StrictZones = false;       // TF2 strict zones (false = any cross confirms direction)
+input bool            InpTF2StrictZones = false;       // TF2 strict (false = any cross confirms direction)
+
+input group "══════ TP / SL Targets ══════"
+input int    InpSLLookback = 20;    // Bars back to find swing SL (on TF1)
+input double InpTP1_RR     = 1.0;   // TP1 Risk:Reward ratio
+input double InpTP2_RR     = 2.0;   // TP2 Risk:Reward ratio
+input double InpTP3_RR     = 3.0;   // TP3 Risk:Reward ratio
 
 input group "══════ Notification Settings ══════"
 input bool InpEnablePush   = true;   // Send Push Notification
@@ -84,35 +90,28 @@ input bool InpEnablePrint  = true;   // Print to Journal
 //════════════════════════════════════════════════════════════════════
 //  GLOBALS
 //════════════════════════════════════════════════════════════════════
-
-// Indicator handles
 int g_h_stoch_1 = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
 int g_h_ma_1    = INVALID_HANDLE;
 int g_h_ma_2    = INVALID_HANDLE;
 
-// Last processed bar timestamps
 datetime g_lastBar_1 = 0;
 datetime g_lastBar_2 = 0;
 
-// Price at last primary signal — used for BUY AGAIN / SELL AGAIN pivot check
-double g_lastBuyPrice_1  = -1.0;   // close price at last BUY on TF1
-double g_lastSellPrice_1 = -1.0;   // close price at last SELL on TF1
+double g_lastBuyPrice_1  = -1.0;
+double g_lastSellPrice_1 = -1.0;
 double g_lastBuyPrice_2  = -1.0;
 double g_lastSellPrice_2 = -1.0;
 
-// TF state (persists until a new signal overwrites it)
 int      g_state_1 = SIG_NONE;
 datetime g_bar_1   = 0;
 
 int      g_state_2 = SIG_NONE;
 datetime g_bar_2   = 0;
 
-// Bar pair at last confirmed fire – prevents re-firing same agreement
 datetime g_fired_bar_1 = 0;
 datetime g_fired_bar_2 = 0;
 
-// Cooldown – last confirmed signal type and time
 int      g_lastCooldownSig  = SIG_NONE;
 datetime g_lastCooldownTime = 0;
 
@@ -152,18 +151,17 @@ int OnInit()
    EventSetTimer(2);
 
    int tf2MAPeriodLog = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-   Print("StochRSI v4.32 loaded  ", _Symbol,
+   Print("StochRSI v4.33 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1),
          " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
          " MA(", InpMA_Period, ")",
          " | TF2:", TFName(InpTF2),
          " Stoch(", tf2K, ",", tf2D, ",", tf2Slow, ")",
          " MA(", tf2MAPeriodLog, ")",
-         " | MAfilter:", (InpEnableMAFilter ? "ON" : "OFF"),
-         " | OB:", InpOB_Level, " OS:", InpOS_Level, " OSLookback:", InpOSLookback,
+         " | OB:", InpOB_Level, " OS:", InpOS_Level, " Lookback:", InpOSLookback,
+         " | SL:", InpSLLookback, "bars  TP RR:", InpTP1_RR, "/", InpTP2_RR, "/", InpTP3_RR,
          " | Cooldown:", InpSignalCooldownMin, "min",
-         " | PriceGap:", InpMinPriceGap, "pts (=",
-         DoubleToString(InpMinPriceGap * _Point, _Digits), ")");
+         " | Gap:", InpMinPriceGap, "pts");
 
    return INIT_SUCCEEDED;
 }
@@ -213,14 +211,14 @@ void CheckAllTimeframes()
                                   g_lastBar_1,
                                   g_lastBuyPrice_1, g_lastSellPrice_1,
                                   g_state_1, g_bar_1,
-                                  true);                   // TF1 always strict
+                                  true);               // TF1 always strict
 
    if(InpEnableTF2)
       changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2, g_h_ma_2,
                                   g_lastBar_2,
                                   g_lastBuyPrice_2, g_lastSellPrice_2,
                                   g_state_2, g_bar_2,
-                                  InpTF2StrictZones);      // default false = direction-only
+                                  InpTF2StrictZones);  // default false = direction-only
 
    if(changed1 || changed2)
       CheckConfirmation();
@@ -237,8 +235,116 @@ bool PassesCooldown(int sigType, datetime t)
 }
 
 //+------------------------------------------------------------------+
-//  ProcessTimeframe
-//  Returns true if state changed.
+//  SignalTypeName
+//+------------------------------------------------------------------+
+string SignalTypeName(int sigType)
+{
+   switch(sigType)
+   {
+      case SIG_BUY:        return "BUY";
+      case SIG_SELL:       return "SELL";
+      case SIG_BUY_AGAIN:  return "BUY AGAIN";
+      case SIG_SELL_AGAIN: return "SELL AGAIN";
+   }
+   return "–";
+}
+
+//+------------------------------------------------------------------+
+//  TFName
+//+------------------------------------------------------------------+
+string TFName(ENUM_TIMEFRAMES tf)
+{
+   string s = EnumToString(tf);
+   StringReplace(s, "PERIOD_", "");
+   return s;
+}
+
+//+------------------------------------------------------------------+
+//  Direction helpers
+//+------------------------------------------------------------------+
+bool IsBullish(int s) { return s == SIG_BUY || s == SIG_BUY_AGAIN;   }
+bool IsBearish(int s) { return s == SIG_SELL || s == SIG_SELL_AGAIN; }
+
+//+------------------------------------------------------------------+
+//  CalcTPSL – swing SL + R:R targets
+//+------------------------------------------------------------------+
+void CalcTPSL(int sigType, double entry,
+              double &sl, double &tp1, double &tp2, double &tp3)
+{
+   double arr[];
+   ArrayResize(arr, InpSLLookback);
+   double risk;
+
+   if(IsBullish(sigType))
+   {
+      sl = (CopyLow(_Symbol, InpTF1, 1, InpSLLookback, arr) == InpSLLookback)
+           ? arr[ArrayMinimum(arr)]
+           : entry - InpMinPriceGap * _Point;
+      risk = entry - sl;
+      if(risk <= 0) risk = InpMinPriceGap * _Point;
+      tp1 = entry + risk * InpTP1_RR;
+      tp2 = entry + risk * InpTP2_RR;
+      tp3 = entry + risk * InpTP3_RR;
+   }
+   else
+   {
+      sl = (CopyHigh(_Symbol, InpTF1, 1, InpSLLookback, arr) == InpSLLookback)
+           ? arr[ArrayMaximum(arr)]
+           : entry + InpMinPriceGap * _Point;
+      risk = sl - entry;
+      if(risk <= 0) risk = InpMinPriceGap * _Point;
+      tp1 = entry - risk * InpTP1_RR;
+      tp2 = entry - risk * InpTP2_RR;
+      tp3 = entry - risk * InpTP3_RR;
+   }
+}
+
+//+------------------------------------------------------------------+
+//  FireArmedAlert – Stage 1: TF1 has armed a new signal
+//  Push: "BUY READY (RISKY) XAUUSD.p  Price:4176.52"
+//+------------------------------------------------------------------+
+void FireArmedAlert(int sigType, double price)
+{
+   string msg = SignalTypeName(sigType)
+              + " READY (RISKY) " + _Symbol
+              + "  Price:" + DoubleToString(price, _Digits);
+
+   if(InpEnablePush && !SendNotification(msg))
+      Print("Push failed. Ensure mobile terminal is linked.");
+   if(InpEnablePopup)
+      Alert(msg);
+   if(InpEnablePrint)
+      Print("[ARMED] ", msg);
+}
+
+//+------------------------------------------------------------------+
+//  FireConfirmedAlert – Stage 2: both TFs agree
+//  Push: "BUY NOW (SAFE) XAUUSD.p  Entry:4182  SL:4173  TP1:4191  TP2:4200  TP3:4209"
+//+------------------------------------------------------------------+
+void FireConfirmedAlert(int sigType)
+{
+   double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl, tp1, tp2, tp3;
+   CalcTPSL(sigType, entry, sl, tp1, tp2, tp3);
+
+   string msg = SignalTypeName(sigType)
+              + " NOW (SAFE) " + _Symbol
+              + "  Entry:" + DoubleToString(entry, _Digits)
+              + "  SL:"    + DoubleToString(sl,    _Digits)
+              + "  TP1:"   + DoubleToString(tp1,   _Digits)
+              + "  TP2:"   + DoubleToString(tp2,   _Digits)
+              + "  TP3:"   + DoubleToString(tp3,   _Digits);
+
+   if(InpEnablePush && !SendNotification(msg))
+      Print("Push failed. Ensure mobile terminal is linked.");
+   if(InpEnablePopup)
+      Alert(msg);
+   if(InpEnablePrint)
+      Print("*** SIGNAL *** ", msg);
+}
+
+//+------------------------------------------------------------------+
+//  ProcessTimeframe – returns true if state changed
 //+------------------------------------------------------------------+
 bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
                       int              h_stoch,
@@ -271,7 +377,30 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    bool crossedDown = (k2 >= d2) && (k1 < d1);
    if(!crossedUp && !crossedDown) return false;
 
-   // Scan last InpOSLookback bars (including cross bar) for OB/OS touch
+   double barC = iClose(_Symbol, tf, 1);
+
+   //--- ══ LOOSE CONFIRMATION MODE (TF2 default) ═════════════════════
+   // Any K/D cross sets direction state. No OB/OS zone required.
+   if(!strictZones)
+   {
+      if(crossedUp)
+      {
+         state    = SIG_BUY;
+         stateBar = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → BUY (confirm K=", DoubleToString(k1,2), " cross UP)");
+         return true;
+      }
+      if(crossedDown)
+      {
+         state    = SIG_SELL;
+         stateBar = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → SELL (confirm K=", DoubleToString(k1,2), " cross DN)");
+         return true;
+      }
+      return false;
+   }
+
+   //--- ══ Scan for recent OB/OS touch ═══════════════════════════════
    bool recentlyOS = false;
    bool recentlyOB = false;
    for(int i = 1; i <= InpOSLookback && i < kCopy; i++)
@@ -280,45 +409,7 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
       if(k_buf[i] >= InpOB_Level) recentlyOB = true;
    }
 
-   double barO = iOpen (_Symbol, tf, 1);
-   double barH = iHigh (_Symbol, tf, 1);
-   double barL = iLow  (_Symbol, tf, 1);
-   double barC = iClose(_Symbol, tf, 1);
-   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   Print("[CROSS ", TFName(tf), " ", TimeToString(barTimes[1], TIME_DATE|TIME_MINUTES), "]",
-         "  ", (crossedUp ? "UP" : "DN"),
-         "  K=",    DoubleToString(k1, 2), " D=",    DoubleToString(d1, 2),
-         "  prevK=",DoubleToString(k2, 2), " prevD=",DoubleToString(d2, 2),
-         "  | O:", DoubleToString(barO, _Digits),
-         " H:", DoubleToString(barH, _Digits),
-         " L:", DoubleToString(barL, _Digits),
-         " C:", DoubleToString(barC, _Digits),
-         "  | Bid:", DoubleToString(bid, _Digits));
-
-   //--- ══ LOOSE CONFIRMATION MODE (TF2 by default) ══════════════════
-   // Any K/D cross in the right direction is enough to set state.
-   // No OB/OS zone required – TF1 already validated the setup.
-   if(!strictZones)
-   {
-      if(crossedUp)
-      {
-         state    = SIG_BUY;
-         stateBar = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → BUY (confirm-direction K=", DoubleToString(k1,2), " cross UP)");
-         return true;
-      }
-      if(crossedDown)
-      {
-         state    = SIG_SELL;
-         stateBar = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → SELL (confirm-direction K=", DoubleToString(k1,2), " cross DN)");
-         return true;
-      }
-      return false;
-   }
-
-   //--- ══ MA slope for trend filter ════════════════════════════════
+   //--- ══ MA slope for re-entry trend filter ════════════════════════
    bool maUptrend   = true;
    bool maDowntrend = true;
    if(InpEnableMAFilter && h_ma != INVALID_HANDLE)
@@ -332,86 +423,53 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    }
 
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
-   // K/D cross up AND K touched OS (<=20) within the last InpOSLookback bars.
-   // Fast stochastics bounce out of OS before the cross; lookback catches them.
    if(crossedUp && recentlyOS)
    {
       lastBuyPrice = barC;
       state        = SIG_BUY;
       stateBar     = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2),
-            " recentlyOS=yes lookback:", InpOSLookback,
-            " | buyPrice=", DoubleToString(barC, _Digits), ")");
+      Print("[STATE ", TFName(tf), "] → BUY  K=", DoubleToString(k1,2),
+            " recentlyOS | price=", DoubleToString(barC, _Digits));
+      FireArmedAlert(SIG_BUY, barC);
       return true;
    }
 
    //--- ══ PRIMARY SELL ══════════════════════════════════════════════
-   // K/D cross down AND K touched OB (>=80) within the last InpOSLookback bars.
    if(crossedDown && recentlyOB)
    {
       lastSellPrice = barC;
       state         = SIG_SELL;
       stateBar      = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2),
-            " recentlyOB=yes lookback:", InpOSLookback,
-            " | sellPrice=", DoubleToString(barC, _Digits), ")");
+      Print("[STATE ", TFName(tf), "] → SELL  K=", DoubleToString(k1,2),
+            " recentlyOB | price=", DoubleToString(barC, _Digits));
+      FireArmedAlert(SIG_SELL, barC);
       return true;
    }
 
    //--- ══ SELL AGAIN ════════════════════════════════════════════════
-   //    K crosses D down in zone (65–75)
-   //    Close must be LOWER than last SELL close by MinPriceGap (lower low in price)
-   //    MA must slope DOWN
    if(crossedDown && k1 >= InpSellAgain_Low && k1 <= InpSellAgain_High)
    {
-      if(!maDowntrend)
-      {
-         Print("[REJECT ", TFName(tf), "] SELL AGAIN – MA not sloping down  (K=", DoubleToString(k1,2), ")");
-         return false;
-      }
-      if(lastSellPrice < 0.0)
-      {
-         Print("[REJECT ", TFName(tf), "] SELL AGAIN – no prior SELL price established");
-         return false;
-      }
+      if(!maDowntrend || lastSellPrice < 0.0) return false;
       double minPrice = lastSellPrice - InpMinPriceGap * _Point;
       if(barC < minPrice)
       {
-         double oldPrice  = lastSellPrice;
-         lastSellPrice    = barC;
-         state            = SIG_SELL_AGAIN;
-         stateBar         = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → SELL AGAIN",
-               "  K=", DoubleToString(k1,2),
+         double oldPrice = lastSellPrice;
+         lastSellPrice   = barC;
+         state           = SIG_SELL_AGAIN;
+         stateBar        = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → SELL AGAIN  K=", DoubleToString(k1,2),
                "  C=", DoubleToString(barC, _Digits),
-               " < prev SELL:", DoubleToString(oldPrice, _Digits),
-               " - gap:", DoubleToString(InpMinPriceGap * _Point, _Digits),
-               " → new sellPrice=", DoubleToString(barC, _Digits));
+               " < prev:", DoubleToString(oldPrice, _Digits));
+         FireArmedAlert(SIG_SELL_AGAIN, barC);
          return true;
       }
-      Print("[REJECT ", TFName(tf), "] SELL AGAIN – price not lower low",
-            "  C=", DoubleToString(barC, _Digits),
-            " lastSellPrice=", DoubleToString(lastSellPrice, _Digits),
-            " need < ", DoubleToString(minPrice, _Digits));
       return false;
    }
 
    //--- ══ BUY AGAIN ═════════════════════════════════════════════════
-   //    K crosses D up in zone (25–35)
-   //    Close must be HIGHER than last BUY close by MinPriceGap (higher high in price)
-   //    MA must slope UP
    if(crossedUp && k1 >= InpBuyAgain_Low && k1 <= InpBuyAgain_High)
    {
-      if(!maUptrend)
-      {
-         Print("[REJECT ", TFName(tf), "] BUY AGAIN – MA not sloping up  (K=", DoubleToString(k1,2), ")");
-         return false;
-      }
-      if(lastBuyPrice < 0.0)
-      {
-         Print("[REJECT ", TFName(tf), "] BUY AGAIN – no prior BUY price established");
-         return false;
-      }
+      if(!maUptrend || lastBuyPrice < 0.0) return false;
       double minPrice = lastBuyPrice + InpMinPriceGap * _Point;
       if(barC > minPrice)
       {
@@ -419,37 +477,23 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          lastBuyPrice    = barC;
          state           = SIG_BUY_AGAIN;
          stateBar        = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → BUY AGAIN",
-               "  K=", DoubleToString(k1,2),
+         Print("[STATE ", TFName(tf), "] → BUY AGAIN  K=", DoubleToString(k1,2),
                "  C=", DoubleToString(barC, _Digits),
-               " > prev BUY:", DoubleToString(oldPrice, _Digits),
-               " + gap:", DoubleToString(InpMinPriceGap * _Point, _Digits),
-               " → new buyPrice=", DoubleToString(barC, _Digits));
+               " > prev:", DoubleToString(oldPrice, _Digits));
+         FireArmedAlert(SIG_BUY_AGAIN, barC);
          return true;
       }
-      Print("[REJECT ", TFName(tf), "] BUY AGAIN – price not higher high",
-            "  C=", DoubleToString(barC, _Digits),
-            " lastBuyPrice=", DoubleToString(lastBuyPrice, _Digits),
-            " need > ", DoubleToString(minPrice, _Digits));
       return false;
    }
 
-   Print("[REJECT ", TFName(tf), "] Cross ", (crossedUp?"UP":"DN"),
-         " K=", DoubleToString(k1,2), " – no zone matched");
    return false;
 }
 
 //+------------------------------------------------------------------+
-//  Direction helpers
-//+------------------------------------------------------------------+
-bool IsBullish(int s) { return s == SIG_BUY || s == SIG_BUY_AGAIN; }
-bool IsBearish(int s) { return s == SIG_SELL || s == SIG_SELL_AGAIN; }
-
-//+------------------------------------------------------------------+
 //  CheckConfirmation
-//  TF1 is the signal source. TF2 must agree in direction:
-//    TF1 bullish (BUY / BUY AGAIN) + TF2 BUY  → fire TF1 signal
-//    TF1 bearish (SELL / SELL AGAIN) + TF2 SELL → fire TF1 signal
+//  TF1 is signal source. TF2 must agree in direction:
+//    TF1 bullish (BUY/BUY AGAIN) + TF2 BUY  → confirmed
+//    TF1 bearish (SELL/SELL AGAIN) + TF2 SELL → confirmed
 //+------------------------------------------------------------------+
 void CheckConfirmation()
 {
@@ -459,7 +503,7 @@ void CheckConfirmation()
       {
          if(PassesCooldown(g_state_1, g_bar_1))
          {
-            FireAlert(SignalTypeName(g_state_1) + " " + _Symbol);
+            FireConfirmedAlert(g_state_1);
             g_fired_bar_1      = g_bar_1;
             g_lastCooldownSig  = g_state_1;
             g_lastCooldownTime = g_bar_1;
@@ -471,7 +515,7 @@ void CheckConfirmation()
       {
          if(PassesCooldown(g_state_2, g_bar_2))
          {
-            FireAlert(SignalTypeName(g_state_2) + " " + _Symbol);
+            FireConfirmedAlert(g_state_2);
             g_fired_bar_2      = g_bar_2;
             g_lastCooldownSig  = g_state_2;
             g_lastCooldownTime = g_bar_2;
@@ -484,12 +528,12 @@ void CheckConfirmation()
 
    if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE) return;
 
-   // Direction agreement: TF1 signal direction must match TF2 state direction
    bool bullish = IsBullish(g_state_1) && IsBullish(g_state_2);
    bool bearish = IsBearish(g_state_1) && IsBearish(g_state_2);
    if(!bullish && !bearish)
    {
-      Print("[WAIT] TF1=", SignalTypeName(g_state_1), " TF2=", SignalTypeName(g_state_2), " – direction mismatch");
+      Print("[WAIT] TF1=", SignalTypeName(g_state_1),
+            " TF2=", SignalTypeName(g_state_2), " – direction mismatch");
       return;
    }
 
@@ -498,63 +542,19 @@ void CheckConfirmation()
    datetime confirmedTime = MathMax(g_bar_1, g_bar_2);
    if(!PassesCooldown(g_state_1, confirmedTime))
    {
-      Print("[COOLDOWN] ", SignalTypeName(g_state_1), " blocked – within ", InpSignalCooldownMin, "min");
+      Print("[COOLDOWN] ", SignalTypeName(g_state_1),
+            " blocked – within ", InpSignalCooldownMin, "min");
       g_fired_bar_1 = g_bar_1;
       g_fired_bar_2 = g_bar_2;
       return;
    }
 
-   // TF1 is source of truth – use its specific signal type for the alert
-   FireAlert(SignalTypeName(g_state_1) + " " + _Symbol);
+   FireConfirmedAlert(g_state_1);
 
    g_fired_bar_1      = g_bar_1;
    g_fired_bar_2      = g_bar_2;
    g_lastCooldownSig  = g_state_1;
    g_lastCooldownTime = confirmedTime;
-}
-
-//+------------------------------------------------------------------+
-//  SignalTypeName
-//+------------------------------------------------------------------+
-string SignalTypeName(int sigType)
-{
-   switch(sigType)
-   {
-      case SIG_BUY:        return "BUY";
-      case SIG_SELL:       return "SELL";
-      case SIG_BUY_AGAIN:  return "BUY AGAIN";
-      case SIG_SELL_AGAIN: return "SELL AGAIN";
-   }
-   return "–";
-}
-
-//+------------------------------------------------------------------+
-//  TFName
-//+------------------------------------------------------------------+
-string TFName(ENUM_TIMEFRAMES tf)
-{
-   string s = EnumToString(tf);
-   StringReplace(s, "PERIOD_", "");
-   return s;
-}
-
-//+------------------------------------------------------------------+
-//  FireAlert
-//+------------------------------------------------------------------+
-void FireAlert(string msg)
-{
-   string bid     = DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits);
-   string ask     = DoubleToString(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits);
-   string fullMsg = msg + "  Bid:" + bid + " Ask:" + ask;
-
-   if(InpEnablePush && !SendNotification(fullMsg))
-      Print("Push failed. Ensure mobile terminal is linked.");
-
-   if(InpEnablePopup)
-      Alert(fullMsg);
-
-   if(InpEnablePrint)
-      Print("*** SIGNAL *** ", fullMsg);
 }
 
 //+------------------------------------------------------------------+
