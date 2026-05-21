@@ -2106,7 +2106,7 @@ void OnTick()
 
     if(InpMode == EA_MODE && pyramid.IsActive())
     {
-        if(!InpUseSL) CheckFlipSignal(atr, barIdx); // hybrid exit: opposing OB/Retest flips the trade
+        CheckFlipSignal(atr, barIdx); // opposing OB/Retest closes and flips regardless of SL mode
         return;
     }
 
