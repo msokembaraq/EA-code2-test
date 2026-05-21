@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with K-Level Zone Filter + Price Pivots  |
-//|    Dual-TF State Machine – both TFs must agree, no expiry        |
-//|    v4.31 – "recently in OS/OB" lookback for primary BUY/SELL     |
+//|    Dual-TF State Machine – TF1 signals, TF2 confirms direction   |
+//|    v4.32 – TF2 confirms with any K/D cross (no zone required)    |
 //|                                                                  |
-//|  SIGNAL LOGIC:                                                   |
+//|  SIGNAL LOGIC (TF1 – strict):                                    |
 //|   BUY        – K crosses D UP   AND K touched OS within N bars   |
 //|   SELL       – K crosses D DOWN AND K touched OB within N bars   |
 //|   BUY AGAIN  – K crosses D UP   in BuyAgain zone                 |
@@ -14,12 +14,13 @@
 //|                AND close < last SELL close - MinPriceGap         |
 //|                AND MA sloping DOWN                               |
 //|                                                                  |
-//|  CONFIRMATION: alert fires only when TF1 AND TF2 hold the same  |
-//|  state. No expiry – states persist until overwritten.            |
+//|  CONFIRMATION: TF1 generates signal (strict zones).              |
+//|  TF2 confirms direction only – any K/D cross UP confirms BUY,    |
+//|  any K/D cross DOWN confirms SELL. No OB/OS zone required on TF2.|
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.31"
-#property description "Stoch K/D cross with price-pivot re-entries – dual-TF state machine"
+#property version     "4.32"
+#property description "Stoch K/D cross – TF1 strict signal, TF2 direction confirmation"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -60,10 +61,11 @@ input bool           InpTF2UseOwnMA    = false;    // Use different MA period fo
 input int            InpMA_Period2     = 100;      // TF2 MA period
 
 input group "══════ Timeframe Selection ══════"
-input ENUM_TIMEFRAMES InpTF1       = PERIOD_H1;  // Timeframe 1
-input bool            InpEnableTF1 = true;        // Enable TF1
-input ENUM_TIMEFRAMES InpTF2       = PERIOD_H4;  // Timeframe 2
-input bool            InpEnableTF2 = true;        // Enable TF2
+input ENUM_TIMEFRAMES InpTF1            = PERIOD_H1;  // Timeframe 1 (signal source – strict zones)
+input bool            InpEnableTF1      = true;        // Enable TF1
+input ENUM_TIMEFRAMES InpTF2            = PERIOD_H4;  // Timeframe 2 (confirmation)
+input bool            InpEnableTF2      = true;        // Enable TF2
+input bool            InpTF2StrictZones = false;       // TF2 strict zones (false = any cross confirms direction)
 
 input group "══════ Notification Settings ══════"
 input bool InpEnablePush   = true;   // Send Push Notification
@@ -150,7 +152,7 @@ int OnInit()
    EventSetTimer(2);
 
    int tf2MAPeriodLog = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
-   Print("StochRSI v4.31 loaded  ", _Symbol,
+   Print("StochRSI v4.32 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1),
          " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
          " MA(", InpMA_Period, ")",
@@ -210,13 +212,15 @@ void CheckAllTimeframes()
       changed1 = ProcessTimeframe(InpTF1, g_h_stoch_1, g_h_ma_1,
                                   g_lastBar_1,
                                   g_lastBuyPrice_1, g_lastSellPrice_1,
-                                  g_state_1, g_bar_1);
+                                  g_state_1, g_bar_1,
+                                  true);                   // TF1 always strict
 
    if(InpEnableTF2)
       changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2, g_h_ma_2,
                                   g_lastBar_2,
                                   g_lastBuyPrice_2, g_lastSellPrice_2,
-                                  g_state_2, g_bar_2);
+                                  g_state_2, g_bar_2,
+                                  InpTF2StrictZones);      // default false = direction-only
 
    if(changed1 || changed2)
       CheckConfirmation();
@@ -243,7 +247,8 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
                       double          &lastBuyPrice,
                       double          &lastSellPrice,
                       int             &state,
-                      datetime        &stateBar)
+                      datetime        &stateBar,
+                      bool             strictZones)
 {
    datetime barTimes[3];
    if(CopyTime(_Symbol, tf, 0, 3, barTimes) < 3) return false;
@@ -290,6 +295,28 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          " L:", DoubleToString(barL, _Digits),
          " C:", DoubleToString(barC, _Digits),
          "  | Bid:", DoubleToString(bid, _Digits));
+
+   //--- ══ LOOSE CONFIRMATION MODE (TF2 by default) ══════════════════
+   // Any K/D cross in the right direction is enough to set state.
+   // No OB/OS zone required – TF1 already validated the setup.
+   if(!strictZones)
+   {
+      if(crossedUp)
+      {
+         state    = SIG_BUY;
+         stateBar = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → BUY (confirm-direction K=", DoubleToString(k1,2), " cross UP)");
+         return true;
+      }
+      if(crossedDown)
+      {
+         state    = SIG_SELL;
+         stateBar = barTimes[1];
+         Print("[STATE ", TFName(tf), "] → SELL (confirm-direction K=", DoubleToString(k1,2), " cross DN)");
+         return true;
+      }
+      return false;
+   }
 
    //--- ══ MA slope for trend filter ════════════════════════════════
    bool maUptrend   = true;
@@ -413,7 +440,16 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
 }
 
 //+------------------------------------------------------------------+
+//  Direction helpers
+//+------------------------------------------------------------------+
+bool IsBullish(int s) { return s == SIG_BUY || s == SIG_BUY_AGAIN; }
+bool IsBearish(int s) { return s == SIG_SELL || s == SIG_SELL_AGAIN; }
+
+//+------------------------------------------------------------------+
 //  CheckConfirmation
+//  TF1 is the signal source. TF2 must agree in direction:
+//    TF1 bullish (BUY / BUY AGAIN) + TF2 BUY  → fire TF1 signal
+//    TF1 bearish (SELL / SELL AGAIN) + TF2 SELL → fire TF1 signal
 //+------------------------------------------------------------------+
 void CheckConfirmation()
 {
@@ -446,8 +482,17 @@ void CheckConfirmation()
       return;
    }
 
-   if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE)       return;
-   if(g_state_1 != g_state_2)                                return;
+   if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE) return;
+
+   // Direction agreement: TF1 signal direction must match TF2 state direction
+   bool bullish = IsBullish(g_state_1) && IsBullish(g_state_2);
+   bool bearish = IsBearish(g_state_1) && IsBearish(g_state_2);
+   if(!bullish && !bearish)
+   {
+      Print("[WAIT] TF1=", SignalTypeName(g_state_1), " TF2=", SignalTypeName(g_state_2), " – direction mismatch");
+      return;
+   }
+
    if(g_bar_1 == g_fired_bar_1 && g_bar_2 == g_fired_bar_2) return;
 
    datetime confirmedTime = MathMax(g_bar_1, g_bar_2);
@@ -459,6 +504,7 @@ void CheckConfirmation()
       return;
    }
 
+   // TF1 is source of truth – use its specific signal type for the alert
    FireAlert(SignalTypeName(g_state_1) + " " + _Symbol);
 
    g_fired_bar_1      = g_bar_1;
