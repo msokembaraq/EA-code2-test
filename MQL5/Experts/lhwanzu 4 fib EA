@@ -1426,35 +1426,6 @@ void ExecuteSignal(int direction)
 //+------------------------------------------------------------------+
 //| DRAW FIB OBJECTS ON CHART                                        |
 //+------------------------------------------------------------------+
-void DrawFibLevels()
-{
-   if(!g_fibValid) return;
-   int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-
-   struct LevelEntry { double price; string name; color clr; };
-
-   #define DRAW_LEVEL(p,n,c) { string _o="LX_FIB_"+(n); \
-      if(ObjectFind(0,_o)<0) ObjectCreate(0,_o,OBJ_HLINE,0,0,(p)); \
-      ObjectSetDouble (0,_o,OBJPROP_PRICE,(p)); \
-      ObjectSetInteger(0,_o,OBJPROP_COLOR,(c)); \
-      ObjectSetInteger(0,_o,OBJPROP_STYLE,STYLE_DASH); \
-      ObjectSetInteger(0,_o,OBJPROP_WIDTH,1); \
-      ObjectSetString (0,_o,OBJPROP_TEXT,(n)+" "+DoubleToString((p),dg)); }
-
-   DRAW_LEVEL(g_f0,      "FIB-0",     clrGreen)
-   DRAW_LEVEL(g_f0382,   "FIB-0.382", clrLimeGreen)
-   DRAW_LEVEL(g_f05,     "FIB-0.5",   clrYellow)
-   DRAW_LEVEL(g_f0618,   "FIB-0.618", clrOrange)
-   DRAW_LEVEL(g_f1,      "FIB-1",     clrRed)
-   DRAW_LEVEL(g_fRevL,   "REVERSAL-L",clrAqua)
-   DRAW_LEVEL(g_fRevH,   "REVERSAL-H",clrAqua)
-   DRAW_LEVEL(g_fFlip1L, "FLIP-1",    clrDodgerBlue)
-   DRAW_LEVEL(g_fFlip1H, "FLIP2",     clrDodgerBlue)
-   DRAW_LEVEL(g_f025,    "FIB-0.25",  clrSilver)
-   DRAW_LEVEL(g_f075,    "FIB-0.75",  clrSilver)
-
-   #undef DRAW_LEVEL
-}
 
 //+------------------------------------------------------------------+
 //| STATE PERSISTENCE                                                |
@@ -1710,8 +1681,6 @@ void OnTick()
    if(g_inConsol && g_fibValid) Consol_Check();
 
    // Draw fib levels on chart
-   DrawFibLevels();
-
    // ── SUPERTREND — sole entry trigger ───────────────────────────
    int stFlip = UpdateSuperTrend();
    if(stFlip != 0)
