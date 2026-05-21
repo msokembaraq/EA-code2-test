@@ -1,48 +1,42 @@
 //+------------------------------------------------------------------+
 //|                    StochRSI_MTF_Alert.mq5                        |
-//|    Stochastic K/D Cross with RSI(1) Level Filter + Pivots        |
+//|    Stochastic K/D Cross with K-Level Zone Filter + Pivots        |
 //|    Dual-TF State Machine – both TFs must agree, no expiry        |
 //|                                                                  |
-//|  HOW IT WORKS:                                                   |
-//|   Each TF independently watches for crosses and holds its last   |
-//|   signal state indefinitely. A confirmed alert fires the moment  |
-//|   both TFs hold the same state. It will not re-fire on the same  |
-//|   agreement; at least one TF must transition before a repeat.    |
-//|                                                                  |
-//|  SIGNAL LOGIC:                                                   |
-//|   BUY        – K crosses D UP   while RSI in OS zone  (1–8)      |
-//|   SELL       – K crosses D DOWN while RSI in OB zone  (90–98)    |
-//|   BUY AGAIN  – K crosses D UP   while RSI in 15–40              |
+//|  SIGNAL LOGIC (zone = K level at the moment of cross):           |
+//|   BUY        – K crosses D UP   while K <= OS level  (e.g. 20)   |
+//|   SELL       – K crosses D DOWN while K >= OB level  (e.g. 80)   |
+//|   BUY AGAIN  – K crosses D UP   while K in 20–40               |
 //|                AND cross K > last BUY pivot  (higher high)       |
-//|   SELL AGAIN – K crosses D DOWN while RSI in 60–80              |
+//|   SELL AGAIN – K crosses D DOWN while K in 60–80               |
 //|                AND cross K < last SELL pivot (lower low)         |
+//|                                                                  |
+//|  CONFIRMATION: alert fires only when TF1 AND TF2 hold the same   |
+//|  state. No expiry – states persist until overwritten.            |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "2.10"
-#property description "Stoch K/D cross filtered by RSI(1) – dual-TF state machine alerts"
+#property version     "3.00"
+#property description "Stoch K/D cross filtered by K level – dual-TF state machine alerts"
 #property indicator_chart_window
 #property indicator_plots 0
 
 //════════════════════════════════════════════════════════════════════
 //  INPUT PARAMETERS
 //════════════════════════════════════════════════════════════════════
-input group "══════ RSI Settings ══════"
-input int    InpRSI_Period     = 1;      // RSI Period
-input double InpRSI_OB_High   = 100.0;  // OB Upper Bound
-input double InpRSI_OB_Low    = 90.0;   // OB Lower Bound
-input double InpRSI_OS_High   = 8.0;    // OS Upper Bound
-input double InpRSI_OS_Low    = 0.0;    // OS Lower Bound
-
 input group "══════ Stochastic Settings ══════"
-input int    InpStoch_K       = 50;     // %K Period
-input int    InpStoch_D       = 7;      // %D Period (signal)
-input int    InpStoch_Slow    = 11;     // Slowing
+input int    InpStoch_K    = 50;    // %K Period
+input int    InpStoch_D    = 7;     // %D Period (signal)
+input int    InpStoch_Slow = 11;    // Slowing
 
-input group "══════ Re-Entry Zone Filters ══════"
-input double InpSellAgain_High = 80.0;  // Sell-Again RSI upper
-input double InpSellAgain_Low  = 60.0;  // Sell-Again RSI lower
-input double InpBuyAgain_High  = 40.0;  // Buy-Again RSI upper
-input double InpBuyAgain_Low   = 15.0;  // Buy-Again RSI lower
+input group "══════ OB / OS Levels ══════"
+input double InpOB_Level   = 80.0;  // Overbought – K above this → SELL zone
+input double InpOS_Level   = 20.0;  // Oversold   – K below this → BUY zone
+
+input group "══════ Re-Entry Zone Filters (K level) ══════"
+input double InpSellAgain_High = 80.0;  // Sell-Again K upper
+input double InpSellAgain_Low  = 60.0;  // Sell-Again K lower
+input double InpBuyAgain_High  = 40.0;  // Buy-Again K upper
+input double InpBuyAgain_Low   = 20.0;  // Buy-Again K lower
 
 input group "══════ Timeframe Selection ══════"
 input ENUM_TIMEFRAMES InpTF1       = PERIOD_M4;  // Timeframe 1
@@ -69,12 +63,10 @@ input bool InpEnablePrint  = true;   // Print to Journal
 //════════════════════════════════════════════════════════════════════
 
 // Indicator handles
-int g_h_rsi_1   = INVALID_HANDLE;
 int g_h_stoch_1 = INVALID_HANDLE;
-int g_h_rsi_2   = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
 
-// Last processed bar timestamps (gate: process only on new closed bar)
+// Last processed bar timestamps
 datetime g_lastBar_1 = 0;
 datetime g_lastBar_2 = 0;
 
@@ -84,16 +76,14 @@ double g_lastOS_pivot_1 = -1.0;
 double g_lastOB_pivot_2 = -1.0;
 double g_lastOS_pivot_2 = -1.0;
 
-// TF1 state (persists until a new signal overwrites it)
+// TF state (persists until a new signal overwrites it)
 int      g_state_1 = SIG_NONE;
 datetime g_bar_1   = 0;
 
-// TF2 state
 int      g_state_2 = SIG_NONE;
 datetime g_bar_2   = 0;
 
-// Tracks the bar pair at the last confirmed fire.
-// Prevents re-firing on the same agreement without a new transition.
+// Bar pair at last confirmed fire – prevents re-firing same agreement
 datetime g_fired_bar_1 = 0;
 datetime g_fired_bar_2 = 0;
 
@@ -109,19 +99,17 @@ int OnInit()
    g_bar_1   = g_bar_2   = 0;
    g_fired_bar_1 = g_fired_bar_2 = 0;
 
-   g_h_rsi_1   = iRSI       (_Symbol, InpTF1, InpRSI_Period, PRICE_CLOSE);
    g_h_stoch_1 = iStochastic(_Symbol, InpTF1, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
-   g_h_rsi_2   = iRSI       (_Symbol, InpTF2, InpRSI_Period, PRICE_CLOSE);
    g_h_stoch_2 = iStochastic(_Symbol, InpTF2, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
 
-   if(g_h_rsi_1   == INVALID_HANDLE){ Alert("StochRSI: Failed RSI TF1 handle");   return INIT_FAILED; }
    if(g_h_stoch_1 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF1 handle"); return INIT_FAILED; }
-   if(g_h_rsi_2   == INVALID_HANDLE){ Alert("StochRSI: Failed RSI TF2 handle");   return INIT_FAILED; }
    if(g_h_stoch_2 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF2 handle"); return INIT_FAILED; }
 
    EventSetTimer(2);
 
-   Print("StochRSI State Machine loaded  ", _Symbol,
+   Print("StochRSI loaded  ", _Symbol,
+         " | Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
+         " | OB:", InpOB_Level, " OS:", InpOS_Level,
          " | TF1:", TFName(InpTF1), " TF2:", TFName(InpTF2));
 
    return INIT_SUCCEEDED;
@@ -133,10 +121,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-
-   if(g_h_rsi_1   != INVALID_HANDLE) IndicatorRelease(g_h_rsi_1);
    if(g_h_stoch_1 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_1);
-   if(g_h_rsi_2   != INVALID_HANDLE) IndicatorRelease(g_h_rsi_2);
    if(g_h_stoch_2 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_2);
 }
 
@@ -172,15 +157,13 @@ void CheckAllTimeframes()
    bool changed2 = false;
 
    if(InpEnableTF1)
-      changed1 = ProcessTimeframe(InpTF1,
-                                  g_h_rsi_1, g_h_stoch_1,
+      changed1 = ProcessTimeframe(InpTF1, g_h_stoch_1,
                                   g_lastBar_1,
                                   g_lastOB_pivot_1, g_lastOS_pivot_1,
                                   g_state_1, g_bar_1);
 
    if(InpEnableTF2)
-      changed2 = ProcessTimeframe(InpTF2,
-                                  g_h_rsi_2, g_h_stoch_2,
+      changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2,
                                   g_lastBar_2,
                                   g_lastOB_pivot_2, g_lastOS_pivot_2,
                                   g_state_2, g_bar_2);
@@ -191,11 +174,9 @@ void CheckAllTimeframes()
 
 //+------------------------------------------------------------------+
 //  ProcessTimeframe
-//  Watches one TF for signal crosses and updates its state.
 //  Returns true if the state changed on this call.
 //+------------------------------------------------------------------+
 bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
-                      int              h_rsi,
                       int              h_stoch,
                       datetime        &lastBar,
                       double          &lastOB_pivot,
@@ -208,30 +189,22 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    if(barTimes[1] == lastBar)                     return false;
    lastBar = barTimes[1];
 
-   double rsi_buf[3], k_buf[3], d_buf[3];
-   if(CopyBuffer(h_rsi,   0,           0, 3, rsi_buf) < 3) return false;
-   if(CopyBuffer(h_stoch, MAIN_LINE,   0, 3, k_buf)   < 3) return false;
-   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3, d_buf)   < 3) return false;
+   double k_buf[3], d_buf[3];
+   if(CopyBuffer(h_stoch, MAIN_LINE,   0, 3, k_buf) < 3) return false;
+   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3, d_buf) < 3) return false;
 
-   double rsi = rsi_buf[1];
-   double k1  = k_buf[1];
-   double d1  = d_buf[1];
-   double k2  = k_buf[2];
-   double d2  = d_buf[2];
+   double k1 = k_buf[1];   // last closed bar K
+   double d1 = d_buf[1];   // last closed bar D
+   double k2 = k_buf[2];   // prior closed bar K
+   double d2 = d_buf[2];   // prior closed bar D
 
    bool crossedUp   = (k2 <= d2) && (k1 > d1);
    bool crossedDown = (k2 >= d2) && (k1 < d1);
-
-   Print(TFName(tf), " bar=", TimeToString(barTimes[1]),
-         " RSI=", DoubleToString(rsi, 2),
-         " K1=", DoubleToString(k1, 2), " D1=", DoubleToString(d1, 2),
-         " K2=", DoubleToString(k2, 2), " D2=", DoubleToString(d2, 2),
-         " crossUp=", crossedUp, " crossDn=", crossedDown);
-
    if(!crossedUp && !crossedDown) return false;
 
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
-   if(crossedUp && rsi >= InpRSI_OS_Low && rsi <= InpRSI_OS_High)
+   //    K crosses D upward while K is in oversold zone
+   if(crossedUp && k1 <= InpOS_Level)
    {
       lastOS_pivot = k1;
       state        = SIG_BUY;
@@ -240,7 +213,8 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    }
 
    //--- ══ PRIMARY SELL ══════════════════════════════════════════════
-   if(crossedDown && rsi >= InpRSI_OB_Low && rsi <= InpRSI_OB_High)
+   //    K crosses D downward while K is in overbought zone
+   if(crossedDown && k1 >= InpOB_Level)
    {
       lastOB_pivot = k1;
       state        = SIG_SELL;
@@ -249,7 +223,9 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    }
 
    //--- ══ SELL AGAIN ════════════════════════════════════════════════
-   if(crossedDown && rsi >= InpSellAgain_Low && rsi <= InpSellAgain_High)
+   //    K crosses D downward in mid-range (60–80)
+   //    K must be lower than last SELL pivot (lower low)
+   if(crossedDown && k1 >= InpSellAgain_Low && k1 <= InpSellAgain_High)
    {
       if(lastOB_pivot > 0.0 && k1 < lastOB_pivot)
       {
@@ -262,7 +238,9 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    }
 
    //--- ══ BUY AGAIN ═════════════════════════════════════════════════
-   if(crossedUp && rsi >= InpBuyAgain_Low && rsi <= InpBuyAgain_High)
+   //    K crosses D upward in mid-range (20–40)
+   //    K must be higher than last BUY pivot (higher high)
+   if(crossedUp && k1 >= InpBuyAgain_Low && k1 <= InpBuyAgain_High)
    {
       if(lastOS_pivot > 0.0 && k1 > lastOS_pivot)
       {
@@ -279,8 +257,6 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
 
 //+------------------------------------------------------------------+
 //  CheckConfirmation
-//  Called only when at least one TF just changed state.
-//  Fires once per unique bar-pair agreement; does not expire.
 //+------------------------------------------------------------------+
 void CheckConfirmation()
 {
@@ -300,9 +276,9 @@ void CheckConfirmation()
       return;
    }
 
-   if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE) return;
-   if(g_state_1 != g_state_2)                          return;
-   if(g_bar_1 == g_fired_bar_1 && g_bar_2 == g_fired_bar_2) return;
+   if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE)          return;
+   if(g_state_1 != g_state_2)                                   return;
+   if(g_bar_1 == g_fired_bar_1 && g_bar_2 == g_fired_bar_2)    return;
 
    FireAlert(SignalTypeName(g_state_1) + " " + _Symbol);
 
