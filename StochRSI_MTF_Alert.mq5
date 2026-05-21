@@ -34,14 +34,14 @@ input int    InpStoch_Slow = 11;    // TF1 Slowing
 
 input group "══════ Stochastic Settings – TF2 Override ══════"
 input bool   InpTF2UseOwnStoch = false; // Use different Stoch params for TF2
-input int    InpStoch_K2    = 30;   // TF2 %K Period
-input int    InpStoch_D2    = 5;    // TF2 %D Period (signal)
-input int    InpStoch_Slow2 = 7;    // TF2 Slowing
+input int    InpStoch_K2    = 24;   // TF2 %K Period
+input int    InpStoch_D2    = 3;    // TF2 %D Period (signal)
+input int    InpStoch_Slow2 = 9;    // TF2 Slowing
 
 input group "══════ OB / OS Levels ══════"
 input double InpOB_Level   = 80.0;  // Overbought – K above this → SELL zone
 input double InpOS_Level   = 20.0;  // Oversold   – K below this → BUY zone
-input int    InpOSLookback = 8;     // Bars to look back for recent OB/OS touch
+input int    InpOSLookback = 20;     // Bars to look back for recent OB/OS touch
 
 input group "══════ Re-Entry Zone Filters (K level) ══════"
 input double InpSellAgain_High = 75.0;  // Sell-Again K upper
@@ -55,15 +55,15 @@ input int    InpSignalCooldownMin = 60;  // Min minutes between same-type signal
 
 input group "══════ MA Trend Filter (re-entries only) ══════"
 input bool           InpEnableMAFilter = true;     // Require MA slope agreement for re-entries
-input int            InpMA_Period      = 200;      // TF1 MA period
+input int            InpMA_Period      = 34;      // TF1 MA period
 input ENUM_MA_METHOD InpMA_Method      = MODE_SMA; // MA method
-input bool           InpTF2UseOwnMA    = false;    // Use different MA period for TF2
-input int            InpMA_Period2     = 100;      // TF2 MA period
+input bool           InpTF2UseOwnMA    = true;    // Use different MA period for TF2
+input int            InpMA_Period2     = 16;      // TF2 MA period
 
 input group "══════ Timeframe Selection ══════"
-input ENUM_TIMEFRAMES InpTF1            = PERIOD_H1;  // Timeframe 1 (signal source – strict zones)
+input ENUM_TIMEFRAMES InpTF1            = PERIOD_M5;  // Timeframe 1 (signal source – strict zones)
 input bool            InpEnableTF1      = true;        // Enable TF1
-input ENUM_TIMEFRAMES InpTF2            = PERIOD_H4;  // Timeframe 2 (confirmation)
+input ENUM_TIMEFRAMES InpTF2            = PERIOD_M15;  // Timeframe 2 (confirmation)
 input bool            InpEnableTF2      = true;        // Enable TF2
 input bool            InpTF2StrictZones = false;       // TF2 strict zones (false = any cross confirms direction)
 
