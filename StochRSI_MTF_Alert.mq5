@@ -2,7 +2,7 @@
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with K-Level Zone Filter + Pivots        |
 //|    Dual-TF State Machine – both TFs must agree, no expiry        |
-//|    v4.00 – MA trend filter, tighter zones, cooldown, pivot gap   |
+//|    v4.10 – separate TF2 Stoch params; pivot reset on reversal    |
 //|                                                                  |
 //|  SIGNAL LOGIC (zone = K level at the moment of cross):           |
 //|   BUY        – K crosses D UP   while K <= OS level  (e.g. 20)   |
@@ -18,7 +18,7 @@
 //|  state. No expiry – states persist until overwritten.            |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.00"
+#property version     "4.10"
 #property description "Stoch K/D cross filtered by K level – dual-TF state machine alerts"
 #property indicator_chart_window
 #property indicator_plots 0
@@ -26,10 +26,16 @@
 //════════════════════════════════════════════════════════════════════
 //  INPUT PARAMETERS
 //════════════════════════════════════════════════════════════════════
-input group "══════ Stochastic Settings ══════"
-input int    InpStoch_K    = 50;    // %K Period
-input int    InpStoch_D    = 7;     // %D Period (signal)
-input int    InpStoch_Slow = 11;    // Slowing
+input group "══════ Stochastic Settings – TF1 ══════"
+input int    InpStoch_K    = 50;    // TF1 %K Period
+input int    InpStoch_D    = 7;     // TF1 %D Period (signal)
+input int    InpStoch_Slow = 11;    // TF1 Slowing
+
+input group "══════ Stochastic Settings – TF2 Override ══════"
+input bool   InpTF2UseOwnStoch = false; // Use different Stoch params for TF2
+input int    InpStoch_K2    = 30;   // TF2 %K Period
+input int    InpStoch_D2    = 5;    // TF2 %D Period (signal)
+input int    InpStoch_Slow2 = 7;    // TF2 Slowing
 
 input group "══════ OB / OS Levels ══════"
 input double InpOB_Level   = 80.0;  // Overbought – K above this → SELL zone
@@ -119,8 +125,12 @@ int OnInit()
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
 
+   int tf2K    = InpTF2UseOwnStoch ? InpStoch_K2    : InpStoch_K;
+   int tf2D    = InpTF2UseOwnStoch ? InpStoch_D2    : InpStoch_D;
+   int tf2Slow = InpTF2UseOwnStoch ? InpStoch_Slow2 : InpStoch_Slow;
+
    g_h_stoch_1 = iStochastic(_Symbol, InpTF1, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
-   g_h_stoch_2 = iStochastic(_Symbol, InpTF2, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
+   g_h_stoch_2 = iStochastic(_Symbol, InpTF2, tf2K,       tf2D,       tf2Slow,       MODE_SMA, STO_LOWHIGH);
 
    if(g_h_stoch_1 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF1 handle"); return INIT_FAILED; }
    if(g_h_stoch_2 == INVALID_HANDLE){ Alert("StochRSI: Failed Stoch TF2 handle"); return INIT_FAILED; }
@@ -135,11 +145,13 @@ int OnInit()
 
    EventSetTimer(2);
 
-   Print("StochRSI v4.00 loaded  ", _Symbol,
-         " | Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
+   Print("StochRSI v4.10 loaded  ", _Symbol,
+         " | TF1:", TFName(InpTF1),
+         " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
+         " | TF2:", TFName(InpTF2),
+         " Stoch(", tf2K, ",", tf2D, ",", tf2Slow, ")",
          " | OB:", InpOB_Level, " OS:", InpOS_Level,
-         " | TF1:", TFName(InpTF1), " TF2:", TFName(InpTF2),
-         " | MA(", InpMA_Period, ")filter:", (InpEnableMAFilter ? "ON" : "OFF"),
+         " | MA(", InpMA_Period, "):", (InpEnableMAFilter ? "ON" : "OFF"),
          " | Cooldown:", InpSignalCooldownMin, "min",
          " | PivotGap:", InpMinPivotGap);
 
@@ -283,9 +295,10 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    if(crossedUp && k1 <= InpOS_Level)
    {
       lastOS_pivot = k1;
+      lastOB_pivot = -1.0;   // invalidate sell pivot – trend has reversed
       state        = SIG_BUY;
       stateBar     = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2), " <= OS:", InpOS_Level, ")");
+      Print("[STATE ", TFName(tf), "] → BUY  (K=", DoubleToString(k1,2), " <= OS:", InpOS_Level, " | sell pivot cleared)");
       return true;
    }
 
@@ -294,9 +307,10 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
    if(crossedDown && k1 >= InpOB_Level)
    {
       lastOB_pivot = k1;
+      lastOS_pivot = -1.0;   // invalidate buy pivot – trend has reversed
       state        = SIG_SELL;
       stateBar     = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2), " >= OB:", InpOB_Level, ")");
+      Print("[STATE ", TFName(tf), "] → SELL  (K=", DoubleToString(k1,2), " >= OB:", InpOB_Level, " | buy pivot cleared)");
       return true;
    }
 
