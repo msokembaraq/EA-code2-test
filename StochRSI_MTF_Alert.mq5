@@ -2,7 +2,7 @@
 //|                    StochRSI_MTF_Alert.mq5                        |
 //|    Stochastic K/D Cross with K-Level Zone Filter + Pivots        |
 //|    Dual-TF State Machine – both TFs must agree, no expiry        |
-//|    v4.10 – separate TF2 Stoch params; pivot reset on reversal    |
+//|    v4.20 – separate MA period per TF                             |
 //|                                                                  |
 //|  SIGNAL LOGIC (zone = K level at the moment of cross):           |
 //|   BUY        – K crosses D UP   while K <= OS level  (e.g. 20)   |
@@ -18,7 +18,7 @@
 //|  state. No expiry – states persist until overwritten.            |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "4.10"
+#property version     "4.20"
 #property description "Stoch K/D cross filtered by K level – dual-TF state machine alerts"
 #property indicator_chart_window
 #property indicator_plots 0
@@ -53,8 +53,10 @@ input int    InpSignalCooldownMin = 60;   // Min minutes between same-type signa
 
 input group "══════ MA Trend Filter (re-entries only) ══════"
 input bool           InpEnableMAFilter = true;     // Require MA slope agreement for re-entries
-input int            InpMA_Period      = 200;      // MA period
+input int            InpMA_Period      = 200;      // TF1 MA period
 input ENUM_MA_METHOD InpMA_Method      = MODE_SMA; // MA method
+input bool           InpTF2UseOwnMA   = false;    // Use different MA period for TF2
+input int            InpMA_Period2    = 100;       // TF2 MA period (higher TF → shorter period)
 
 input group "══════ Timeframe Selection ══════"
 input ENUM_TIMEFRAMES InpTF1       = PERIOD_H1;  // Timeframe 1
@@ -137,21 +139,25 @@ int OnInit()
 
    if(InpEnableMAFilter)
    {
-      g_h_ma_1 = iMA(_Symbol, InpTF1, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
-      g_h_ma_2 = iMA(_Symbol, InpTF2, InpMA_Period, 0, InpMA_Method, PRICE_CLOSE);
+      int tf2MAPeriod = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
+      g_h_ma_1 = iMA(_Symbol, InpTF1, InpMA_Period,  0, InpMA_Method, PRICE_CLOSE);
+      g_h_ma_2 = iMA(_Symbol, InpTF2, tf2MAPeriod,   0, InpMA_Method, PRICE_CLOSE);
       if(g_h_ma_1 == INVALID_HANDLE){ Alert("StochRSI: Failed MA TF1 handle"); return INIT_FAILED; }
       if(g_h_ma_2 == INVALID_HANDLE){ Alert("StochRSI: Failed MA TF2 handle"); return INIT_FAILED; }
    }
 
    EventSetTimer(2);
 
-   Print("StochRSI v4.10 loaded  ", _Symbol,
+   int tf2MAPeriodLog = InpTF2UseOwnMA ? InpMA_Period2 : InpMA_Period;
+   Print("StochRSI v4.20 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1),
          " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
+         " MA(", InpMA_Period, ")",
          " | TF2:", TFName(InpTF2),
          " Stoch(", tf2K, ",", tf2D, ",", tf2Slow, ")",
+         " MA(", tf2MAPeriodLog, ")",
+         " | MAfilter:", (InpEnableMAFilter ? "ON" : "OFF"),
          " | OB:", InpOB_Level, " OS:", InpOS_Level,
-         " | MA(", InpMA_Period, "):", (InpEnableMAFilter ? "ON" : "OFF"),
          " | Cooldown:", InpSignalCooldownMin, "min",
          " | PivotGap:", InpMinPivotGap);
 
