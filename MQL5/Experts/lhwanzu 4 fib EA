@@ -1548,8 +1548,12 @@ void Fib_CheckWatch()
       zh=(hi1>=g_fibWatch.zoneBot&&hi1<=g_fibWatch.zoneTop&&cl1<=g_fibWatch.zoneTop);
    if(!zh) return;
 
-   // Score the entry — candle patterns + structural confluences
-   int score = Fib_ScoreZoneEntry(g_fibWatch.direction, cl1, 1);
+   // Score the entry — candle patterns + structural confluences.
+   // Use max(arm-time score, fresh score): arm-time score was computed while cascade flags
+   // were still active (RevL/RevH zone bonus intact); fresh score is more up-to-date on
+   // candle patterns. Taking the max avoids penalising cascade watches for the flag race.
+   int freshScore = Fib_ScoreZoneEntry(g_fibWatch.direction, cl1, 1);
+   int score = MathMax(g_fibWatch.score, freshScore);
 
    // Min score — cascade uses lower threshold (no PD zone bonus available).
    // wasCascade preserves the cascade context even after the re-anchor clears the shift flag
@@ -1869,12 +1873,43 @@ ENUM_FIB_FILTER Fib_FilterSignal(int direction, double price, string source, str
    { outLabel="❌ NO FIB ANCHOR";
      return FIB_BLOCKED; }
 
-   // ── ADVISORY: waiting states — pass counter-trend to scoring ─
-   if(g_fibWaitingNewCeiling && direction==-1)
-   { Log("⚠️ FIB ADVISORY|SELL during ceiling shift|blocked below EntryMinScore");
+   // ── CASCADE REVERSAL GATE ────────────────────────────────────
+   // During a ceiling shift (break UP waiting for new high at RevH):
+   //   SELL is the expected reversal when price reaches RevH.
+   //   Allow it if price is currently near RevH OR touched RevH within
+   //   the last 5 bars (ST flip is often 1-3 bars after the actual wick).
+   //   Block it everywhere else (still trending up toward RevH).
+   // Mirror logic for floor shift (break DOWN) and BUY at RevL.
+   if(g_fibWaitingNewCeiling && direction==-1 && g_fibRevH > 0)
+   { double revTol2 = MathMax(DeviationTolerancePts*ScaledPip(), Fib_PDBuffer*6.0*GetPointsize());
+     bool nearNow = (MathAbs(price - g_fibRevH) <= revTol2);
+     bool recentTouch = false;
+     for(int _b=1; _b<=5 && !recentTouch; _b++)
+        if(iHigh(_Symbol,PERIOD_CURRENT,_b) >= g_fibRevH - revTol2) recentTouch = true;
+     if(nearNow || recentTouch)
+     { outLabel = nearNow ? "📍CEILING-SELL@RevH" : "📍CEILING-SELL@RevH(recent)";
+       Log("✅ CASCADE REVERSAL|SELL near/at RevH during ceiling shift → FIB_EXEC_NOW");
+       return FIB_EXEC_NOW; }
+     Log("⚠️ FIB ADVISORY|SELL during ceiling shift|price not near RevH — blocked");
      outLabel="🚫CEILING↑"; return FIB_BLOCKED; }
-   if(g_fibWaitingNewFloor && direction==1)
-   { Log("⚠️ FIB ADVISORY|BUY during floor shift|blocked below EntryMinScore");
+   if(g_fibWaitingNewCeiling && direction==-1)   // RevH==0 edge case
+   { Log("⚠️ FIB ADVISORY|SELL during ceiling shift|no RevH — blocked");
+     outLabel="🚫CEILING↑"; return FIB_BLOCKED; }
+
+   if(g_fibWaitingNewFloor && direction==1 && g_fibRevL > 0)
+   { double revTol2 = MathMax(DeviationTolerancePts*ScaledPip(), Fib_PDBuffer*6.0*GetPointsize());
+     bool nearNow = (MathAbs(price - g_fibRevL) <= revTol2);
+     bool recentTouch = false;
+     for(int _b=1; _b<=5 && !recentTouch; _b++)
+        if(iLow(_Symbol,PERIOD_CURRENT,_b) <= g_fibRevL + revTol2) recentTouch = true;
+     if(nearNow || recentTouch)
+     { outLabel = nearNow ? "📍FLOOR-BUY@RevL" : "📍FLOOR-BUY@RevL(recent)";
+       Log("✅ CASCADE REVERSAL|BUY near/at RevL during floor shift → FIB_EXEC_NOW");
+       return FIB_EXEC_NOW; }
+     Log("⚠️ FIB ADVISORY|BUY during floor shift|price not near RevL — blocked");
+     outLabel="🚫FLOOR↓"; return FIB_BLOCKED; }
+   if(g_fibWaitingNewFloor && direction==1)   // RevL==0 edge case
+   { Log("⚠️ FIB ADVISORY|BUY during floor shift|no RevL — blocked");
      outLabel="🚫FLOOR↓"; return FIB_BLOCKED; }
 
    double buf=Fib_PDBuffer*GetPointsize();
@@ -2490,11 +2525,15 @@ void ExecuteSignal(int direction, double signalClose)
    if(g_fib.valid && entryScore < 9)
    { bool sellInDiscount = (direction==-1 && ep < g_fibLevel05);
      bool buyInPremium   = (direction== 1 && ep > g_fibLevel05);
-     if(sellInDiscount && !g_fibWaitingNewFloor)
+     // Also allow when fR signals a cascade reversal at RevH/RevL
+     // (outLabel set by Fib_FilterSignal to "📍CEILING-SELL@RevH*" or "📍FLOOR-BUY@RevL*")
+     bool cascadeRevSell = (StringFind(fPL,"CEILING-SELL@RevH")>=0);
+     bool cascadeRevBuy  = (StringFind(fPL,"FLOOR-BUY@RevL")>=0);
+     if(sellInDiscount && !g_fibWaitingNewFloor && !cascadeRevSell)
      { string bl=StringFormat("🚫 SELL BLOCKED|price %.5f below 0.5(%.5f)|DISCOUNT|score=%d < GOLDMINE",
                   ep,g_fibLevel05,entryScore);
        Log(bl); Notify(bl); return; }
-     if(buyInPremium && !g_fibWaitingNewCeiling)
+     if(buyInPremium && !g_fibWaitingNewCeiling && !cascadeRevBuy)
      { string bl=StringFormat("🚫 BUY BLOCKED|price %.5f above 0.5(%.5f)|PREMIUM|score=%d < GOLDMINE",
                   ep,g_fibLevel05,entryScore);
        Log(bl); Notify(bl); return; }
