@@ -1651,7 +1651,6 @@ int OnInit()
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(Slippage);
    trade.SetAsyncMode(false);
-   trade.SetLogLevel(LOG_LEVEL_NO);  // suppress CTrade verbose output (deal/modify confirmations)
 
    // Reset globals
    g_st_up=0; g_st_dn=0; g_st_up_prev=0; g_st_dn_prev=0; g_st_trend=0;
