@@ -886,7 +886,8 @@ void OpenPositions(int direction, double signalClose, double sl, double tp1, dou
    double ls  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double lot = NormalizeDouble(MathMax(ml, MathMin(mx, MathFloor(LotSize/ls)*ls)), 2);
 
-   // Same-direction count check
+   // Same-direction count check — runners (tpBucket==0) are excluded so they
+   // don't permanently block new signals in the same direction
    int sameDirCount=0;
    for(int i=0; i<PositionsTotal(); i++)
    {
@@ -894,10 +895,14 @@ void OpenPositions(int direction, double signalClose, double sl, double tp1, dou
       if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC)!=(ulong)MagicNumber) continue;
       int pt2=(int)PositionGetInteger(POSITION_TYPE);
-      if((direction==1&&pt2==POSITION_TYPE_BUY)||(direction==-1&&pt2==POSITION_TYPE_SELL)) sameDirCount++;
+      if((direction==1&&pt2==POSITION_TYPE_BUY)||(direction==-1&&pt2==POSITION_TYPE_SELL))
+      {
+         if(GetTrackedTpBucket(t)==0) continue; // runner — managed by trail, doesn't block new entries
+         sameDirCount++;
+      }
    }
    if(sameDirCount>0)
-   { Log(StringFormat("⏭️ %s skipped — %d open same-dir", direction==1?"BUY":"SELL", sameDirCount)); return; }
+   { Log(StringFormat("⏭️ %s skipped — %d open same-dir (runners excluded)", direction==1?"BUY":"SELL", sameDirCount)); return; }
 
    // Clear pending queue if opposite direction
    if(CloseOnOpposite && g_pendingCount>0 && g_pendingQueue[0].direction!=direction)
