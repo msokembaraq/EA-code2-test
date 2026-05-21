@@ -28,10 +28,10 @@
 //════════════════════════════════════════════════════════════════════
 input group "══════ RSI Settings ══════"
 input int    InpRSI_Period     = 1;      // RSI Period
-input double InpRSI_OB_High   = 98.0;   // OB Upper Bound
+input double InpRSI_OB_High   = 100.0;  // OB Upper Bound
 input double InpRSI_OB_Low    = 90.0;   // OB Lower Bound
 input double InpRSI_OS_High   = 8.0;    // OS Upper Bound
-input double InpRSI_OS_Low    = 1.0;    // OS Lower Bound
+input double InpRSI_OS_Low    = 0.0;    // OS Lower Bound
 
 input group "══════ Stochastic Settings ══════"
 input int    InpStoch_K       = 50;     // %K Period
@@ -221,6 +221,13 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
 
    bool crossedUp   = (k2 <= d2) && (k1 > d1);
    bool crossedDown = (k2 >= d2) && (k1 < d1);
+
+   Print(TFName(tf), " bar=", TimeToString(barTimes[1]),
+         " RSI=", DoubleToString(rsi, 2),
+         " K1=", DoubleToString(k1, 2), " D1=", DoubleToString(d1, 2),
+         " K2=", DoubleToString(k2, 2), " D2=", DoubleToString(d2, 2),
+         " crossUp=", crossedUp, " crossDn=", crossedDown);
+
    if(!crossedUp && !crossedDown) return false;
 
    //--- ══ PRIMARY BUY ══════════════════════════════════════════════
