@@ -85,6 +85,13 @@ int g_arrowCount = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   //--- Reset state (handles param changes without process restart)
+   g_lastBar_m4 = g_lastBar_m6 = 0;
+   g_lastOB_pivot_m4 = g_lastOS_pivot_m4 = -1.0;
+   g_lastOB_pivot_m6 = g_lastOS_pivot_m6 = -1.0;
+   g_last_signal_m4  = g_last_signal_m6  = "–";
+   g_arrowCount = 0;
+
    //--- Create indicator handles
    g_h_rsi_m4   = iRSI      (_Symbol, PERIOD_M4, InpRSI_Period, PRICE_CLOSE);
    g_h_stoch_m4 = iStochastic(_Symbol, PERIOD_M4, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
@@ -121,8 +128,10 @@ void OnDeinit(const int reason)
    if(g_h_rsi_m6   != INVALID_HANDLE) IndicatorRelease(g_h_rsi_m6);
    if(g_h_stoch_m6 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_m6);
 
-   //--- Remove dashboard label
-   ObjectDelete(0, "StochRSI_Dashboard");
+   //--- Remove all signal arrows
+   for(int i = 1; i <= g_arrowCount; i++)
+      ObjectDelete(0, StringFormat("StochRSI_Arrow_%d", i));
+
    Comment("");
 }
 
@@ -241,7 +250,7 @@ void ProcessTimeframe(ENUM_TIMEFRAMES tf,
 
    //--- ══ SELL AGAIN ════════════════════════════════════════════════
    //    K crosses D downward in the 60–80 RSI zone
-   //    Pivot condition: current cross K < previous OB pivot K  (lower high = trend continuation)
+   //    Pivot condition: current cross K < previous OB pivot K  (lower low = trend continuation)
    if(crossedDown && rsi >= InpSellAgain_Low && rsi <= InpSellAgain_High)
    {
       if(lastOB_pivot > 0.0 && k1 < lastOB_pivot)
@@ -256,7 +265,7 @@ void ProcessTimeframe(ENUM_TIMEFRAMES tf,
 
    //--- ══ BUY AGAIN ═════════════════════════════════════════════════
    //    K crosses D upward in the 15–40 RSI zone
-   //    Pivot condition: current cross K > previous OS pivot K  (higher low = trend continuation)
+   //    Pivot condition: current cross K > previous OS pivot K  (higher high = trend continuation)
    if(crossedUp && rsi >= InpBuyAgain_Low && rsi <= InpBuyAgain_High)
    {
       if(lastOS_pivot > 0.0 && k1 > lastOS_pivot)
@@ -323,9 +332,12 @@ void DrawSignalArrow(datetime arrowTime, int arrowCode, color clr, string toolti
    g_arrowCount++;
    string objName = StringFormat("StochRSI_Arrow_%d", g_arrowCount);
 
+   int shift = iBarShift(_Symbol, PERIOD_CURRENT, arrowTime);
+   if(shift < 0) return;
+
    double price = (arrowCode == OBJ_ARROW_BUY)
-                  ? iLow (_Symbol, PERIOD_CURRENT, iBarShift(_Symbol, PERIOD_CURRENT, arrowTime)) * 0.9998
-                  : iHigh(_Symbol, PERIOD_CURRENT, iBarShift(_Symbol, PERIOD_CURRENT, arrowTime)) * 1.0002;
+                  ? iLow (_Symbol, PERIOD_CURRENT, shift) * 0.9998
+                  : iHigh(_Symbol, PERIOD_CURRENT, shift) * 1.0002;
 
    ObjectCreate(0, objName, (ENUM_OBJECT)arrowCode, 0, arrowTime, price);
    ObjectSetInteger(0, objName, OBJPROP_COLOR,  clr);
@@ -342,7 +354,7 @@ void DrawDashboard()
 {
    string dash = "\n"
       + "╔══════════════════════════════════════════╗\n"
-      + "║     StochRSI MTF Alert  |  " + _Symbol + "        ║\n"
+      + "║  StochRSI MTF Alert  |  " + _Symbol + "\n"
       + "╠══════════════════════════════════════════╣\n"
       + "║  RSI(" + IntegerToString(InpRSI_Period) + ")   OB: "
          + DoubleToString(InpRSI_OB_Low,  0) + "–" + DoubleToString(InpRSI_OB_High, 0)
