@@ -1412,6 +1412,10 @@ void ExecuteSignal(int direction)
    bool nearFlip1L     = (g_fFlip1L>0 && MathAbs(ep-g_fFlip1L) <= buf*3);
    bool nearRevH       = (g_fRevH>0  && MathAbs(ep-g_fRevH)  <= buf*3);
    bool nearFlip1H     = (g_fFlip1H>0 && MathAbs(ep-g_fFlip1H) <= buf*3);
+   // f0382 as SELL resistance: discount-zone-ceiling rejection when ST flips down
+   bool atF0382Reject  = (g_f0382>0 && ep >= g_f0382 - buf*3 && ep <= g_f0382 + buf*3);
+   // f0618 as BUY support: premium-zone-floor bounce when ST flips up
+   bool atF0618Bounce  = (g_f0618>0 && ep >= g_f0618 - buf*3 && ep <= g_f0618 + buf*3);
 
    // Check role-flip levels
    bool atRoleFlipBuy  = false;
@@ -1435,6 +1439,7 @@ void ExecuteSignal(int direction)
       if(nearRevL)       { zoneOK=true; zoneTag="RevL"; isCascadeLevel=true; }
       if(nearFlip1L)     { zoneOK=true; zoneTag="FLIP-1"; isCascadeLevel=true; }
       if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
+      if(atF0618Bounce)  { zoneOK=true; zoneTag="F0618-SUPP"; }          // premium floor bounce
       // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0)
       if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0-(g_f0-g_fRevL)*0.5 && ep>=g_fRevL-buf*3)
          { zoneOK=true; zoneTag="CASCADE-LOWER"; isCascadeLevel=true; }
@@ -1445,6 +1450,7 @@ void ExecuteSignal(int direction)
       if(nearRevH)        { zoneOK=true; zoneTag="RevH"; isCascadeLevel=true; }
       if(nearFlip1H)      { zoneOK=true; zoneTag="FLIP1H"; isCascadeLevel=true; }
       if(atRoleFlipSell)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
+      if(atF0382Reject)   { zoneOK=true; zoneTag="F0382-REJ"; }          // discount ceiling rejection
       // Cascade UP: upper half of the extension range (midpoint between f1 and RevH)
       if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1+(g_fRevH-g_f1)*0.5 && ep<=g_fRevH+buf*3)
          { zoneOK=true; zoneTag="CASCADE-UPPER"; isCascadeLevel=true; }
@@ -1753,10 +1759,12 @@ void OnTick()
          bool inPrem=(epCheck>=g_f0618-buf&&epCheck<=g_f1+buf);
          bool nearRevL=(g_fRevL>0&&MathAbs(epCheck-g_fRevL)<=buf*3);
          bool nearRevH=(g_fRevH>0&&MathAbs(epCheck-g_fRevH)<=buf*3);
+         bool at382=(g_f0382>0&&MathAbs(epCheck-g_f0382)<=buf*3);
+         bool at618=(g_f0618>0&&MathAbs(epCheck-g_f0618)<=buf*3);
          if(stFlip==1)
-            zoneTag=inDisc?"📗DISCOUNT":nearRevL?"📍RevL":(g_po3BuyArmed?"🎯PO3":"📕OUT-OF-ZONE");
+            zoneTag=inDisc?"📗DISCOUNT":nearRevL?"📍RevL":at618?"📍F0618-SUPP":(g_po3BuyArmed?"🎯PO3":"📕OUT-OF-ZONE");
          else
-            zoneTag=inPrem?"📕PREMIUM":nearRevH?"📍RevH":(g_po3SellArmed?"🎯PO3":"📗OUT-OF-ZONE");
+            zoneTag=inPrem?"📕PREMIUM":nearRevH?"📍RevH":at382?"📍F0382-REJ":(g_po3SellArmed?"🎯PO3":"📗OUT-OF-ZONE");
       }
       Log(StringFormat("📡 ST FLIP %s | bar=%d | @%.5f | %s",
           stFlip==1?"BUY":"SELL", g_barCount, epCheck, zoneTag));
