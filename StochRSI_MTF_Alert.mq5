@@ -332,15 +332,17 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          return false;
       }
       double gap = MathMax(InpMinPivotGap, 0.0);
-      if(lastOB_pivot > 0.0 && k1 < lastOB_pivot - gap)
+      // Pass if: no prior pivot in this cycle (first re-entry), OR lower low with gap
+      if(lastOB_pivot < 0.0 || k1 < lastOB_pivot - gap)
       {
          double oldPivot = lastOB_pivot;
          lastOB_pivot    = k1;
          state           = SIG_SELL_AGAIN;
          stateBar        = barTimes[1];
          Print("[STATE ", TFName(tf), "] → SELL AGAIN  (K=", DoubleToString(k1,2),
-               " < prev pivot:", DoubleToString(oldPivot,2),
-               " - gap:", gap, " → new pivot:", DoubleToString(k1,2), ")");
+               (oldPivot < 0.0 ? " first re-entry this cycle" :
+                StringFormat(" < prev pivot:%.2f - gap:%.1f", oldPivot, gap)),
+               " → new pivot:", DoubleToString(k1,2), ")");
          return true;
       }
       Print("[REJECT ", TFName(tf), "] SELL AGAIN – pivot check failed",
@@ -362,15 +364,17 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES  tf,
          return false;
       }
       double gap = MathMax(InpMinPivotGap, 0.0);
-      if(lastOS_pivot > 0.0 && k1 > lastOS_pivot + gap)
+      // Pass if: no prior pivot in this cycle (first re-entry), OR higher high with gap
+      if(lastOS_pivot < 0.0 || k1 > lastOS_pivot + gap)
       {
          double oldPivot = lastOS_pivot;
          lastOS_pivot    = k1;
          state           = SIG_BUY_AGAIN;
          stateBar        = barTimes[1];
          Print("[STATE ", TFName(tf), "] → BUY AGAIN  (K=", DoubleToString(k1,2),
-               " > prev pivot:", DoubleToString(oldPivot,2),
-               " + gap:", gap, " → new pivot:", DoubleToString(k1,2), ")");
+               (oldPivot < 0.0 ? " first re-entry this cycle" :
+                StringFormat(" > prev pivot:%.2f + gap:%.1f", oldPivot, gap)),
+               " → new pivot:", DoubleToString(k1,2), ")");
          return true;
       }
       Print("[REJECT ", TFName(tf), "] BUY AGAIN – pivot check failed",
