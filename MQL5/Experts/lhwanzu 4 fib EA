@@ -1455,7 +1455,8 @@ void ExecuteSignal(int direction)
       if(inDiscountZone && !g_waitFloor) { zoneOK=true; zoneTag="DISCOUNT"; }
       if(nearRevL)       { zoneOK=true; zoneTag="RevL"; isCascadeLevel=true; }
       if(nearFlip1L)     { zoneOK=true; zoneTag="FLIP-1"; isCascadeLevel=true; }
-      if(atRoleFlipBuy)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
+      // Block ROLE-FLIP-BUY during cascade DOWN — bearish structure means old BUY flips are invalidated
+      if(atRoleFlipBuy && !g_waitFloor)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
       // F0618 bounce: blocked during any active cascade AND must not overwrite a cascade-level match
       if(atF0618Bounce && !g_waitCeil && !g_waitFloor && !isCascadeLevel)
          { zoneOK=true; zoneTag="F0618-SUPP"; }
@@ -1473,7 +1474,8 @@ void ExecuteSignal(int direction)
       if(inPremiumZone && !g_waitCeil)  { zoneOK=true; zoneTag="PREMIUM"; }
       if(nearRevH)        { zoneOK=true; zoneTag="RevH"; isCascadeLevel=true; }
       if(nearFlip1H)      { zoneOK=true; zoneTag="FLIP1H"; isCascadeLevel=true; }
-      if(atRoleFlipSell)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
+      // Block ROLE-FLIP-SELL during cascade UP — bullish structure means old SELL flips are invalidated
+      if(atRoleFlipSell && !g_waitCeil)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
       // F0382 rejection: blocked during any active cascade AND must not overwrite a cascade-level match
       if(atF0382Reject && !g_waitFloor && !g_waitCeil && !isCascadeLevel)
          { zoneOK=true; zoneTag="F0382-REJ"; }
@@ -1510,6 +1512,23 @@ void ExecuteSignal(int direction)
    }
 
    // ── Entry passed all checks ────────────────────────────────────
+   // PREMIUM SELL confirms bearish structure → clear all bullish role-flip levels (old resistance ≠ support)
+   // DISCOUNT BUY confirms bullish structure → clear all bearish role-flip levels (old support ≠ resistance)
+   if(direction == -1 && zoneTag == "PREMIUM")
+   {
+      int cleared = 0;
+      for(int i = 0; i < g_flippedCount; i++)
+         if(g_flippedDir[i] == -1) { g_flippedLevels[i] = 0; cleared++; }
+      if(cleared > 0) Log(StringFormat("🔄 PREMIUM SELL: cleared %d bullish role-flip level(s)", cleared));
+   }
+   else if(direction == 1 && zoneTag == "DISCOUNT")
+   {
+      int cleared = 0;
+      for(int i = 0; i < g_flippedCount; i++)
+         if(g_flippedDir[i] == +1) { g_flippedLevels[i] = 0; cleared++; }
+      if(cleared > 0) Log(StringFormat("🔄 DISCOUNT BUY: cleared %d bearish role-flip level(s)", cleared));
+   }
+
    double sl,tp1,tp2,tp3;
    CalcTP(direction, ep, sl, tp1, tp2, tp3);
    string emoji=(direction==1)?"🟢":"🔴";
