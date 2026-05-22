@@ -121,6 +121,10 @@ datetime g_fibBar       = 0;
 bool     g_riskyBuyFired  = false, g_riskySellFired  = false;
 string   g_riskyBuyTag    = "",    g_riskySellTag    = "";
 double   g_riskyBuyFibPos = 0.0,  g_riskySellFibPos = 0.0;
+double   g_riskyBuyK      = 0.0,  g_riskySellK      = 0.0;  // K at cross time
+
+// Live K – updated every bar for silent tracking
+double   g_liveK_1 = 0.0, g_liveK_2 = 0.0;
 
 //+------------------------------------------------------------------+
 //  OnInit
@@ -139,6 +143,8 @@ int OnInit()
    g_hasOldHigh   = g_hasOldLow  = false;
    g_fibBar       = 0;
    g_riskyBuyFired = g_riskySellFired = false;
+   g_riskyBuyK     = g_riskySellK    = 0.0;
+   g_liveK_1       = g_liveK_2       = 0.0;
 
    // Restore fib state from last session (survives MT5 restarts)
    LoadFibState();
@@ -216,22 +222,62 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 }
 
 //+------------------------------------------------------------------+
+//  UpdateLiveK – read current (forming-bar) K on both TFs each tick
+//+------------------------------------------------------------------+
+void UpdateLiveK()
+{
+   double k[1];
+   if(g_h_stoch_1 != INVALID_HANDLE && CopyBuffer(g_h_stoch_1, MAIN_LINE, 0, 1, k) == 1)
+      g_liveK_1 = k[0];
+   if(g_h_stoch_2 != INVALID_HANDLE && CopyBuffer(g_h_stoch_2, MAIN_LINE, 0, 1, k) == 1)
+      g_liveK_2 = k[0];
+}
+
+//+------------------------------------------------------------------+
+//  SilentWatch – journal-only bar-change state snapshot
+//+------------------------------------------------------------------+
+void SilentWatch()
+{
+   if(!InpEnablePrint) return;
+   if(g_state_1 == SIG_NONE && !g_riskyBuyFired && !g_riskySellFired) return;
+
+   double range  = g_fibSwingHigh - g_fibSwingLow;
+   double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double fibPos = (range > 0) ? (price - g_fibSwingLow) / range : -1.0;
+
+   string zone = (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax)   ? "BUY ZONE"  :
+                 (fibPos >= InpFibSellZoneMin && fibPos <= 1.0)   ? "SELL ZONE" : "DEAD ZONE";
+
+   string armed = (g_riskyBuyFired  ? "BUY ARMED @FIB " + FibPosLabel(g_riskyBuyFibPos)   + " K_entry=" + DoubleToString(g_riskyBuyK,  1) :
+                   g_riskySellFired ? "SELL ARMED @FIB " + FibPosLabel(g_riskySellFibPos) + " K_entry=" + DoubleToString(g_riskySellK, 1) :
+                   "no pending");
+
+   Print("[WATCH] ",
+         TFName(InpTF1), " K=", DoubleToString(g_liveK_1, 1),
+         " | ", TFName(InpTF2), " K=", DoubleToString(g_liveK_2, 1),
+         " | fib=", FibPosLabel(fibPos), " (", zone, ")",
+         " | ", armed);
+}
+
+//+------------------------------------------------------------------+
 //  CheckAllTimeframes – main dispatch
 //+------------------------------------------------------------------+
 void CheckAllTimeframes()
 {
    UpdateFibSwing();
+   UpdateLiveK();
    CheckMACross();
 
    if(!InpEnableTF1) return;
 
+   double crossK1 = 0.0, crossK2 = 0.0;
    bool changed1 = ProcessTimeframe(InpTF1, g_h_stoch_1,
-                                    g_lastBar_1, g_state_1, g_bar_1, true);
+                                    g_lastBar_1, g_state_1, g_bar_1, true, crossK1);
 
    bool changed2 = false;
    if(InpEnableTF2)
       changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2,
-                                  g_lastBar_2, g_state_2, g_bar_2, InpTF2StrictZones);
+                                  g_lastBar_2, g_state_2, g_bar_2, InpTF2StrictZones, crossK2);
 
    // TF1 state changed → attempt RISKY (fib zone gated)
    if(changed1 && g_state_1 != SIG_NONE)
@@ -243,20 +289,24 @@ void CheckAllTimeframes()
       double fibPos; string fibTag;
       if(CheckFibZone(g_state_1, fibPos, fibTag))
       {
-         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         FireArmedAlert(g_state_1, price, fibPos, fibTag);
+         FireArmedAlert(g_state_1, fibPos, fibTag);
          if(IsBullish(g_state_1))
-         { g_riskyBuyFired  = true; g_riskyBuyTag  = fibTag; g_riskyBuyFibPos  = fibPos; }
+         { g_riskyBuyFired  = true; g_riskyBuyTag  = fibTag; g_riskyBuyFibPos  = fibPos; g_riskyBuyK  = crossK1; }
          else
-         { g_riskySellFired = true; g_riskySellTag = fibTag; g_riskySellFibPos = fibPos; }
+         { g_riskySellFired = true; g_riskySellTag = fibTag; g_riskySellFibPos = fibPos; g_riskySellK = crossK1; }
       }
       else
          Print("[FIB BLOCK] RISKY ", SignalTypeName(g_state_1),
-               " blocked – fibPos=", DoubleToString(fibPos,3));
+               " blocked – fibPos=", DoubleToString(fibPos, 3),
+               " K=", DoubleToString(crossK1, 1));
    }
 
    if(changed1 || changed2)
       CheckConfirmation();
+
+   // Silent bar-change snapshot (only when TF1 bar changed)
+   if(changed1 || changed2)
+      SilentWatch();
 }
 
 //════════════════════════════════════════════════════════════════════
@@ -469,17 +519,16 @@ void CalcTPSL(int sigType, double entry,
 
 //+------------------------------------------------------------------+
 //  FireArmedAlert – Stage 1 RISKY
-//  🟢 BUY RISKY XAUUSD.p @ FIB 0.236  Price:4527.00
-//  🟢 BUY RISKY (SBR) XAUUSD.p @ FIB 0.236  Price:4527.00
+//  🟢 BUY RISKY XAUUSD.p @ FIB 0.236
+//  🟢 BUY RISKY (SBR) XAUUSD.p @ FIB 0.236
 //+------------------------------------------------------------------+
-void FireArmedAlert(int sigType, double price, double fibPos, string fibTag)
+void FireArmedAlert(int sigType, double fibPos, string fibTag)
 {
    string emoji = IsBullish(sigType) ? "🟢" : "🔴";
    string tag   = fibTag == "" ? "" : " (" + fibTag + ")";
    string msg   = emoji + " " + SignalTypeName(sigType) + " RISKY" + tag
                 + " " + _Symbol
-                + " @ FIB " + FibPosLabel(fibPos)
-                + "  Price:" + DoubleToString(price, _Digits);
+                + " @ FIB " + FibPosLabel(fibPos);
 
    if(InpEnablePush && !SendNotification(msg)) Print("Push failed.");
    if(InpEnablePopup) Alert(msg);
@@ -548,8 +597,10 @@ void CheckMACross()
 //+------------------------------------------------------------------+
 bool ProcessTimeframe(ENUM_TIMEFRAMES tf, int h_stoch,
                       datetime &lastBar, int &state, datetime &stateBar,
-                      bool strictZones)
+                      bool strictZones, double &crossK)
 {
+   crossK = 0.0;
+
    datetime barTimes[3];
    if(CopyTime(_Symbol, tf, 0, 3, barTimes) < 3) return false;
    if(barTimes[1] == lastBar)                     return false;
@@ -568,6 +619,8 @@ bool ProcessTimeframe(ENUM_TIMEFRAMES tf, int h_stoch,
    bool crossedUp   = (k2 <= d2) && (k1 > d1);
    bool crossedDown = (k2 >= d2) && (k1 < d1);
    if(!crossedUp && !crossedDown) return false;
+
+   crossK = k1;  // capture K value at the cross bar
 
    //--- Loose mode (TF2 default): any cross sets direction
    if(!strictZones)
@@ -667,14 +720,16 @@ void CheckConfirmation()
    if(bearish && !g_riskySellFired)
    { Print("[FIB BLOCK] SAFE SELL skipped – no RISKY preceded it"); return; }
 
-   // Re-check fib zone at confirmation time (price may have moved)
-   double fibPos; string fibTag;
-   if(!CheckFibZone(g_state_1, fibPos, fibTag))
-   {
-      Print("[FIB BLOCK] SAFE ", SignalTypeName(g_state_1),
-            " blocked at confirmation – fibPos=", DoubleToString(fibPos,3));
-      return;
-   }
+   // Use the fib context stored at RISKY time – price moving after the cross is
+   // the trade working, not a reason to block SAFE
+   double fibPos = bullish ? g_riskyBuyFibPos  : g_riskySellFibPos;
+   string fibTag = bullish ? g_riskyBuyTag     : g_riskySellTag;
+   double kEntry = bullish ? g_riskyBuyK       : g_riskySellK;
+
+   Print("[SAFE CONTEXT] entry fib=", FibPosLabel(fibPos),
+         " K_at_entry=", DoubleToString(kEntry, 1),
+         " TF1 K_now=",  DoubleToString(g_liveK_1, 1),
+         " TF2 K_now=",  DoubleToString(g_liveK_2, 1));
 
    FireConfirmedAlert(g_state_1, fibPos, fibTag);
 
