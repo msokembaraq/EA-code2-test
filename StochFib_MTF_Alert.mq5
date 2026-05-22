@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                   StochFib_MTF_Alert.mq5                         |
 //|  Dual-TF Stochastic + Dynamic Fib Zone Gate + EMA Cross Signal   |
-//|  v1.0                                                            |
+//|  v1.1  – SBR/RBS direction-enforced + rejection candle gate      |
 //|                                                                  |
 //|  SIGNAL LOGIC (TF1 – strict):                                    |
 //|   BUY  – K crosses D UP   AND K touched OS within N bars         |
@@ -19,7 +19,7 @@
 //|  EMA CROSS: independent secondary signal (re-entry replacement)  |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "1.00"
+#property version     "1.10"
 #property description "Stoch + Fib zone gate + EMA cross – dual independent signal streams"
 #property indicator_chart_window
 #property indicator_plots 0
@@ -75,7 +75,12 @@ input ENUM_TIMEFRAMES InpFibTF          = PERIOD_M30;   // TF for swing high/low
 input int             InpFibLookback    = 100;           // Bars to scan for swing anchor
 input double          InpFibBuyZoneMax  = 0.382;         // BUY zone upper bound (0 → this)
 input double          InpFibSellZoneMin = 0.618;         // SELL zone lower bound (this → 1)
-input double          InpSBR_Tol        = 0.05;          // Proximity band for SBR/RBS tag (% of range)
+input double          InpSBR_Tol          = 0.05;  // ± band around old level for SBR/RBS detection (fraction of range)
+
+input group "══════ SBR / RBS Rejection ══════"
+input double          InpSBR_DeepExt      = 0.382; // SBR zone extends this far below old swing-low (fraction of range)
+input double          InpRBS_DeepExt      = 0.382; // RBS zone extends this far above old swing-high (fraction of range)
+input int             InpRejectionLookback = 5;    // Bars on TF1 to scan for textbook rejection candle
 
 input group "══════ TP / SL Targets ══════"
 input int    InpSLLookback  = 20;
@@ -184,7 +189,7 @@ int OnInit()
    int tf2K = InpTF2UseOwnStoch ? InpStoch_K2    : InpStoch_K;
    int tf2D = InpTF2UseOwnStoch ? InpStoch_D2    : InpStoch_D;
    int tf2S = InpTF2UseOwnStoch ? InpStoch_Slow2 : InpStoch_Slow;
-   Print("StochFib v1.0 loaded  ", _Symbol,
+   Print("StochFib v1.1 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1), " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
          " | TF2:", TFName(InpTF2), " Stoch(", tf2K, ",", tf2D, ",", tf2S, ")",
          " | FibTF:", TFName(InpFibTF), " Lookback:", InpFibLookback,
@@ -286,8 +291,30 @@ void CheckAllTimeframes()
       if(IsBullish(g_state_1)) g_riskySellFired = false;
       if(IsBearish(g_state_1)) g_riskyBuyFired  = false;
 
-      double fibPos; string fibTag;
+      double fibPos = -1.0; string fibTag = "";
+      bool   zonePassed = false;
+
+      // 1. Normal fib zone: BUY→[0, BuyZoneMax], SELL→[SellZoneMin, 1]
       if(CheckFibZone(g_state_1, fibPos, fibTag))
+      {
+         zonePassed = true;
+      }
+      // 2. SBR/RBS: direction-enforced + requires rejection candle on TF1
+      else
+      {
+         double levelPrice;
+         if(CheckSBRRBS(g_state_1, fibPos, fibTag, levelPrice))
+         {
+            if(HasRejectionCandle(IsBearish(g_state_1), levelPrice, InpTF1, InpRejectionLookback))
+               zonePassed = true;
+            else
+               Print("[SBR/RBS BLOCK] No rejection candle at ",
+                     DoubleToString(levelPrice, _Digits),
+                     " for ", fibTag, " ", SignalTypeName(g_state_1));
+         }
+      }
+
+      if(zonePassed)
       {
          FireArmedAlert(g_state_1, fibPos, fibTag);
          if(IsBullish(g_state_1))
@@ -443,14 +470,15 @@ void UpdateFibSwing()
 }
 
 //+------------------------------------------------------------------+
-//  CheckFibZone – gate signals by fib position and tag SBR/RBS
-//  Returns true if price is in the valid zone for sigType
-//  Populates fibPos (0.0–1.0) and fibTag ("SBR", "RBS", or "")
+//  CheckFibZone – normal zone gate (no role-flip tagging here)
+//  BUY:  fibPos in [0, InpFibBuyZoneMax]
+//  SELL: fibPos in [InpFibSellZoneMin, 1]
+//  SBR/RBS signals handled separately by CheckSBRRBS
 //+------------------------------------------------------------------+
 bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
 {
    fibPos = -1.0;
-   fibTag = "";
+   fibTag = "";  // normal zone signals carry no role-flip tag
 
    double range = g_fibSwingHigh - g_fibSwingLow;
    if(range <= 0.0) return false;
@@ -458,19 +486,174 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    fibPos = (price - g_fibSwingLow) / range;
 
-   // SBR: price near the old swing low (was support, now resistance after break)
-   if(g_hasOldLow && MathAbs(price - g_oldSwingLow) / range <= InpSBR_Tol)
-      fibTag = "SBR";
-
-   // RBS: price near the old swing high (was resistance, now support after break)
-   if(g_hasOldHigh && MathAbs(price - g_oldSwingHigh) / range <= InpSBR_Tol)
-      fibTag = "RBS";
-
-   // Zone gate
+   // SBR/RBS direction enforcement and tagging handled by CheckSBRRBS; not applied here
    if(IsBullish(sigType))
       return (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax);
    else
       return (fibPos >= InpFibSellZoneMin && fibPos <= 1.0);
+}
+
+//+------------------------------------------------------------------+
+//  CheckSBRRBS – direction-enforced role-flip zone check
+//  SBR: SELL only – price testing old swing low (broken support → resistance)
+//       zone: [old_swing_low - DeepExt*range, old_swing_low + Tol*range]
+//  RBS: BUY  only – price testing old swing high (broken resistance → support)
+//       zone: [old_swing_high - Tol*range, old_swing_high + DeepExt*range]
+//+------------------------------------------------------------------+
+bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelPrice)
+{
+   fibPos = -1.0; roleTag = ""; levelPrice = 0.0;
+
+   double range = g_fibSwingHigh - g_fibSwingLow;
+   if(range <= 0.0) return false;
+
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(IsBearish(stochState) && g_hasOldLow)
+   {
+      // SBR SELL: price came back up to test old swing low (now resistance)
+      double zoneLo = g_oldSwingLow - InpSBR_DeepExt * range;
+      double zoneHi = g_oldSwingLow + InpSBR_Tol     * range;
+      if(price >= zoneLo && price <= zoneHi)
+      {
+         fibPos     = (price - g_fibSwingLow) / range;
+         roleTag    = "SBR";
+         levelPrice = g_oldSwingLow;
+         Print("[SBR] price=", DoubleToString(price, _Digits),
+               " zone=[", DoubleToString(zoneLo, _Digits), ",", DoubleToString(zoneHi, _Digits), "]",
+               " fibPos=", DoubleToString(fibPos, 3));
+         return true;
+      }
+   }
+
+   if(IsBullish(stochState) && g_hasOldHigh)
+   {
+      // RBS BUY: price came back down to test old swing high (now support)
+      double zoneLo = g_oldSwingHigh - InpSBR_Tol     * range;
+      double zoneHi = g_oldSwingHigh + InpRBS_DeepExt * range;
+      if(price >= zoneLo && price <= zoneHi)
+      {
+         fibPos     = (price - g_fibSwingLow) / range;
+         roleTag    = "RBS";
+         levelPrice = g_oldSwingHigh;
+         Print("[RBS] price=", DoubleToString(price, _Digits),
+               " zone=[", DoubleToString(zoneLo, _Digits), ",", DoubleToString(zoneHi, _Digits), "]",
+               " fibPos=", DoubleToString(fibPos, 3));
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//  HasRejectionCandle – scan TF1 bars for textbook rejection pattern
+//  bearish=true  → SBR SELL: shooting star, bearish engulf, outside bar, doji
+//  bearish=false → RBS BUY:  hammer, bullish engulf, outside bar, doji
+//  Candle high must reach SBR zone (bearish) / low must reach RBS zone (bullish).
+//  No qualifying candle found = manipulation / liquidity grab → signal skipped.
+//+------------------------------------------------------------------+
+bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int lookback)
+{
+   double opens[], highs[], lows[], closes[];
+   if(CopyOpen (_Symbol, tf, 1, lookback, opens)  < lookback) return false;
+   if(CopyHigh (_Symbol, tf, 1, lookback, highs)  < lookback) return false;
+   if(CopyLow  (_Symbol, tf, 1, lookback, lows)   < lookback) return false;
+   if(CopyClose(_Symbol, tf, 1, lookback, closes) < lookback) return false;
+   // [0] = most recent closed bar (shift 1); [lookback-1] = oldest
+
+   double range    = g_fibSwingHigh - g_fibSwingLow;
+   double priceTol = InpSBR_Tol * range;
+
+   for(int i = 0; i < lookback; i++)
+   {
+      double o = opens[i], h = highs[i], l = lows[i], c = closes[i];
+      double cRange = h - l;
+      if(cRange <= 0.0) continue;
+      double body = MathAbs(c - o);
+
+      if(bearish)
+      {
+         // Candle high must reach into or above the SBR zone
+         if(h < levelPrice - priceTol) continue;
+
+         double upperWick = h - MathMax(o, c);
+
+         // Shooting star / bearish pin bar: upper wick >= 2× body, closes in lower half
+         bool shootingStar = (body > 0)
+                          && (upperWick >= 2.0 * body)
+                          && (c < (h + l) * 0.5);
+
+         // Doji: body <= 10% of candle range — ambiguous candle at resistance = rejection hint
+         bool doji = (body <= 0.10 * cRange);
+
+         bool outsideBar = false, engulfing = false;
+         if(i + 1 < lookback)
+         {
+            double ph = highs[i+1], pl = lows[i+1];
+            double pO = opens[i+1], pC = closes[i+1];
+            // Outside bar: breaks both prev extremes, closes bearish
+            outsideBar = (h > ph) && (l < pl) && (c < o);
+            // Bearish engulfing: opens at/above prev body top, closes at/below prev body bottom
+            engulfing  = (c < o)
+                      && (o >= MathMax(pO, pC))
+                      && (c <= MathMin(pO, pC));
+         }
+
+         if(shootingStar || doji || outsideBar || engulfing)
+         {
+            string ptype = shootingStar ? "ShootingStar" :
+                           doji         ? "Doji"         :
+                           outsideBar   ? "OutsideBar"   : "BearEngulf";
+            Print("[REJECT-SBR] ", ptype,
+                  " H=", DoubleToString(h, _Digits),
+                  " level=", DoubleToString(levelPrice, _Digits),
+                  " bar=", i+1, " ago");
+            return true;
+         }
+      }
+      else
+      {
+         // Candle low must reach into or below the RBS zone
+         if(l > levelPrice + priceTol) continue;
+
+         double lowerWick = MathMin(o, c) - l;
+
+         // Hammer / bullish pin bar: lower wick >= 2× body, closes in upper half
+         bool hammer = (body > 0)
+                    && (lowerWick >= 2.0 * body)
+                    && (c > (h + l) * 0.5);
+
+         bool doji = (body <= 0.10 * cRange);
+
+         bool outsideBar = false, engulfing = false;
+         if(i + 1 < lookback)
+         {
+            double ph = highs[i+1], pl = lows[i+1];
+            double pO = opens[i+1], pC = closes[i+1];
+            // Outside bar: breaks both prev extremes, closes bullish
+            outsideBar = (h > ph) && (l < pl) && (c > o);
+            // Bullish engulfing: opens at/below prev body bottom, closes at/above prev body top
+            engulfing  = (c > o)
+                      && (o <= MathMin(pO, pC))
+                      && (c >= MathMax(pO, pC));
+         }
+
+         if(hammer || doji || outsideBar || engulfing)
+         {
+            string ptype = hammer     ? "Hammer"     :
+                           doji       ? "Doji"       :
+                           outsideBar ? "OutsideBar" : "BullEngulf";
+            Print("[REJECT-RBS] ", ptype,
+                  " L=", DoubleToString(l, _Digits),
+                  " level=", DoubleToString(levelPrice, _Digits),
+                  " bar=", i+1, " ago");
+            return true;
+         }
+      }
+   }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
