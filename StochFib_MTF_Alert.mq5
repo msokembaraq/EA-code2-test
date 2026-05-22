@@ -76,6 +76,7 @@ input int             InpFibLookback    = 100;           // Bars to scan for swi
 input double          InpFibBuyZoneMax  = 0.382;         // BUY zone upper bound (0 → this)
 input double          InpFibSellZoneMin = 0.618;         // SELL zone lower bound (this → 1)
 input double          InpSBR_Tol          = 0.05;  // ± band around old level for SBR/RBS detection (fraction of range)
+input bool            InpTrendFilter    = true;     // Block counter-trend fib-zone signals (SELL blocked in uptrend, BUY blocked in downtrend)
 
 input group "══════ SBR / RBS Rejection ══════"
 input double          InpSBR_DeepExt      = 0.10;  // SBR zone extends this far ABOVE old swing-low (fraction of range) – catches overshoots above resistance
@@ -120,6 +121,7 @@ datetime g_lastMACrossBar = 0;
 double   g_fibSwingHigh = 0.0, g_fibSwingLow  = 0.0;
 double   g_oldSwingHigh = 0.0, g_oldSwingLow  = 0.0;
 bool     g_hasOldHigh   = false, g_hasOldLow  = false;
+int      g_trendBias    = 0;   // +1=uptrend (last break was swing HIGH), -1=downtrend (last break was swing LOW)
 datetime g_fibBar       = 0;
 
 // RISKY-fired tracking – SAFE only fires when RISKY preceded it
@@ -147,6 +149,7 @@ int OnInit()
    g_fibSwingHigh = g_fibSwingLow = 0.0;
    g_oldSwingHigh = g_oldSwingLow = 0.0;
    g_hasOldHigh   = g_hasOldLow  = false;
+   g_trendBias    = 0;
    g_fibBar       = 0;
    g_riskyBuyFired = g_riskySellFired = false;
    g_riskyBuyK     = g_riskySellK    = 0.0;
@@ -373,6 +376,7 @@ void SaveFibState()
    GlobalVariableSet(GVName("OSL"), g_oldSwingLow);
    GlobalVariableSet(GVName("HOH"), g_hasOldHigh ? 1.0 : 0.0);
    GlobalVariableSet(GVName("HOL"), g_hasOldLow  ? 1.0 : 0.0);
+   GlobalVariableSet(GVName("TRB"), (double)g_trendBias);
 }
 
 //+------------------------------------------------------------------+
@@ -389,16 +393,18 @@ bool LoadFibState()
    g_fibSwingHigh = sh;
    g_fibSwingLow  = sl;
 
-   double osh = 0, osl = 0, hoh = 0, hol = 0;
+   double osh = 0, osl = 0, hoh = 0, hol = 0, trb = 0;
    GlobalVariableGet(GVName("OSH"), osh); g_oldSwingHigh = osh;
    GlobalVariableGet(GVName("OSL"), osl); g_oldSwingLow  = osl;
    GlobalVariableGet(GVName("HOH"), hoh); g_hasOldHigh   = (hoh > 0.5);
    GlobalVariableGet(GVName("HOL"), hol); g_hasOldLow    = (hol > 0.5);
+   GlobalVariableGet(GVName("TRB"), trb); g_trendBias    = (int)MathRound(trb);
 
    Print("[FIB] Restored: High=", DoubleToString(g_fibSwingHigh, _Digits),
          "  Low=",  DoubleToString(g_fibSwingLow,  _Digits),
          "  SBR:", (g_hasOldLow  ? DoubleToString(g_oldSwingLow,  _Digits) : "none"),
-         "  RBS:", (g_hasOldHigh ? DoubleToString(g_oldSwingHigh, _Digits) : "none"));
+         "  RBS:", (g_hasOldHigh ? DoubleToString(g_oldSwingHigh, _Digits) : "none"),
+         "  TrendBias:", (g_trendBias == 1 ? "UP" : g_trendBias == -1 ? "DOWN" : "none"));
    return true;
 }
 
@@ -452,6 +458,7 @@ void UpdateFibSwing()
    {
       g_oldSwingLow = g_fibSwingLow;
       g_hasOldLow   = true;
+      g_trendBias   = -1;   // downtrend: last structural break was to the downside
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
@@ -467,6 +474,7 @@ void UpdateFibSwing()
    {
       g_oldSwingHigh = g_fibSwingHigh;
       g_hasOldHigh   = true;
+      g_trendBias    = +1;  // uptrend: last structural break was to the upside
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
@@ -494,6 +502,14 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
 
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    fibPos = (price - g_fibSwingLow) / range;
+
+   // Trend bias filter: block fib-zone signals that go against the last swing-break direction
+   // (counter-trend entries are handled exclusively by CheckSBRRBS)
+   if(InpTrendFilter && g_trendBias != 0)
+   {
+      if(IsBearish(sigType) && g_trendBias ==  1) return false; // uptrend active – no fib-zone SELL
+      if(IsBullish(sigType) && g_trendBias == -1) return false; // downtrend active – no fib-zone BUY
+   }
 
    // SBR/RBS direction enforcement and tagging handled by CheckSBRRBS; not applied here
    if(IsBullish(sigType))
