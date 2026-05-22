@@ -78,8 +78,8 @@ input double          InpFibSellZoneMin = 0.618;         // SELL zone lower boun
 input double          InpSBR_Tol          = 0.05;  // ± band around old level for SBR/RBS detection (fraction of range)
 
 input group "══════ SBR / RBS Rejection ══════"
-input double          InpSBR_DeepExt      = 0.382; // SBR zone extends this far below old swing-low (fraction of range)
-input double          InpRBS_DeepExt      = 0.382; // RBS zone extends this far above old swing-high (fraction of range)
+input double          InpSBR_DeepExt      = 0.10;  // SBR zone extends this far ABOVE old swing-low (fraction of range) – catches overshoots above resistance
+input double          InpRBS_DeepExt      = 0.10;  // RBS zone extends this far BELOW old swing-high (fraction of range) – catches dips below support
 input int             InpRejectionLookback = 5;    // Bars on TF1 to scan for textbook rejection candle
 
 input group "══════ TP / SL Targets ══════"
@@ -511,9 +511,11 @@ bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelP
 
    if(IsBearish(stochState) && g_hasOldLow)
    {
-      // SBR SELL: price came back up to test old swing low (now resistance)
-      double zoneLo = g_oldSwingLow - InpSBR_DeepExt * range;
-      double zoneHi = g_oldSwingLow + InpSBR_Tol     * range;
+      // SBR SELL: price came back UP to test old swing low (now resistance)
+      // zoneLo – Tol below level: price approaching from below, K fires before reaching level
+      // zoneHi – DeepExt above level: price overshot above old resistance before K fires
+      double zoneLo = g_oldSwingLow - InpSBR_Tol     * range;
+      double zoneHi = g_oldSwingLow + InpSBR_DeepExt * range;
       if(price >= zoneLo && price <= zoneHi)
       {
          fibPos     = (price - g_fibSwingLow) / range;
@@ -528,9 +530,11 @@ bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelP
 
    if(IsBullish(stochState) && g_hasOldHigh)
    {
-      // RBS BUY: price came back down to test old swing high (now support)
-      double zoneLo = g_oldSwingHigh - InpSBR_Tol     * range;
-      double zoneHi = g_oldSwingHigh + InpRBS_DeepExt * range;
+      // RBS BUY: price came back DOWN to test old swing high (now support)
+      // zoneLo – DeepExt below level: price dipped below old support before K fires
+      // zoneHi – Tol above level: price approaching from above, K fires before reaching level
+      double zoneLo = g_oldSwingHigh - InpRBS_DeepExt * range;
+      double zoneHi = g_oldSwingHigh + InpSBR_Tol     * range;
       if(price >= zoneLo && price <= zoneHi)
       {
          fibPos     = (price - g_fibSwingLow) / range;
@@ -574,8 +578,11 @@ bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int
 
       if(bearish)
       {
-         // Candle high must reach into or above the SBR zone
-         if(h < levelPrice - priceTol) continue;
+         // Candle must overlap the SBR zone (high reaches zone, candle is not entirely above it,
+         // and body is not floating far above the level – filters long-wick false positives)
+         if(h < levelPrice - priceTol)              continue;  // high never reached zone
+         if(l > levelPrice + priceTol * 2)          continue;  // candle entirely above zone
+         if(MathMin(o, c) > levelPrice + priceTol * 2) continue; // body floating above zone
 
          double upperWick = h - MathMax(o, c);
 
@@ -614,8 +621,11 @@ bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int
       }
       else
       {
-         // Candle low must reach into or below the RBS zone
-         if(l > levelPrice + priceTol) continue;
+         // Candle must overlap the RBS zone (low reaches zone, candle is not entirely below it,
+         // and body is not floating far below the level – filters long-wick false positives)
+         if(l > levelPrice + priceTol)              continue;  // low never reached zone
+         if(h < levelPrice - priceTol * 2)          continue;  // candle entirely below zone
+         if(MathMax(o, c) < levelPrice - priceTol * 2) continue; // body floating below zone
 
          double lowerWick = MathMin(o, c) - l;
 
