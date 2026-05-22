@@ -459,6 +459,12 @@ void UpdateFibSwing()
       g_oldSwingLow = g_fibSwingLow;
       g_hasOldLow   = true;
       g_trendBias   = -1;   // downtrend: last structural break was to the downside
+      // Price proved any pending BUY RISKY wrong – cancel it so stale context can't fire SAFE
+      if(g_riskyBuyFired)
+      {
+         g_riskyBuyFired = false;
+         Print("[FIB] Swing LOW broke pending BUY RISKY – cancelled stale signal");
+      }
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
@@ -475,6 +481,12 @@ void UpdateFibSwing()
       g_oldSwingHigh = g_fibSwingHigh;
       g_hasOldHigh   = true;
       g_trendBias    = +1;  // uptrend: last structural break was to the upside
+      // Price proved any pending SELL RISKY wrong – cancel it so stale context can't fire SAFE
+      if(g_riskySellFired)
+      {
+         g_riskySellFired = false;
+         Print("[FIB] Swing HIGH broke pending SELL RISKY – cancelled stale signal");
+      }
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
