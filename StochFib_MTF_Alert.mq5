@@ -127,6 +127,7 @@ bool     g_riskyBuyFired  = false, g_riskySellFired  = false;
 string   g_riskyBuyTag    = "",    g_riskySellTag    = "";
 double   g_riskyBuyFibPos = 0.0,  g_riskySellFibPos = 0.0;
 double   g_riskyBuyK      = 0.0,  g_riskySellK      = 0.0;  // K at cross time
+datetime g_riskyFiredBar  = 0;    // g_bar_1 when last RISKY fired – TF2 must be >= this
 
 // Live K – updated every bar for silent tracking
 double   g_liveK_1 = 0.0, g_liveK_2 = 0.0;
@@ -149,6 +150,7 @@ int OnInit()
    g_fibBar       = 0;
    g_riskyBuyFired = g_riskySellFired = false;
    g_riskyBuyK     = g_riskySellK    = 0.0;
+   g_riskyFiredBar = 0;
    g_liveK_1       = g_liveK_2       = 0.0;
 
    // Restore fib state from last session (survives MT5 restarts)
@@ -317,6 +319,7 @@ void CheckAllTimeframes()
       if(zonePassed)
       {
          FireArmedAlert(g_state_1, fibPos, fibTag);
+         g_riskyFiredBar = g_bar_1;  // TF2 must have a cross at or after this bar
          if(IsBullish(g_state_1))
          { g_riskyBuyFired  = true; g_riskyBuyTag  = fibTag; g_riskyBuyFibPos  = fibPos; g_riskyBuyK  = crossK1; }
          else
@@ -443,27 +446,33 @@ void UpdateFibSwing()
    if(CopyClose(_Symbol, InpFibTF, 1, 1, cls) < 1) return;
    double close = cls[0];
 
-   // Swing LOW broken → old low becomes SBR, anchor resets
+   // Swing LOW broken → old low becomes SBR; rescan BOTH anchors to keep range current
    // Note: g_hasOldHigh is NOT cleared — both SBR and RBS can be active simultaneously
    if(close < g_fibSwingLow)
    {
       g_oldSwingLow = g_fibSwingLow;
       g_hasOldLow   = true;
-      int loIdx = iLowest(_Symbol, InpFibTF, MODE_LOW, InpFibLookback, 1);
-      if(loIdx >= 0) g_fibSwingLow = iLow(_Symbol, InpFibTF, loIdx);
-      Print("[FIB] Swing LOW broken → new 0=", DoubleToString(g_fibSwingLow, _Digits),
+      int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
+      int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
+      if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
+      if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
+      Print("[FIB] Swing LOW broken → range=[", DoubleToString(g_fibSwingLow, _Digits),
+            ",", DoubleToString(g_fibSwingHigh, _Digits), "]",
             "  SBR level=", DoubleToString(g_oldSwingLow, _Digits));
       SaveFibState();
    }
-   // Swing HIGH broken → old high becomes RBS, anchor resets
+   // Swing HIGH broken → old high becomes RBS; rescan BOTH anchors to keep range current
    // Note: g_hasOldLow is NOT cleared — both SBR and RBS can be active simultaneously
    else if(close > g_fibSwingHigh)
    {
       g_oldSwingHigh = g_fibSwingHigh;
       g_hasOldHigh   = true;
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
+      int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
-      Print("[FIB] Swing HIGH broken → new 1=", DoubleToString(g_fibSwingHigh, _Digits),
+      if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
+      Print("[FIB] Swing HIGH broken → range=[", DoubleToString(g_fibSwingLow, _Digits),
+            ",", DoubleToString(g_fibSwingHigh, _Digits), "]",
             "  RBS level=", DoubleToString(g_oldSwingHigh, _Digits));
       SaveFibState();
    }
@@ -896,7 +905,9 @@ void CheckConfirmation()
       return;
    }
 
-   if(g_bar_1 == g_fired_bar_1 && g_bar_2 == g_fired_bar_2) return;
+   // Require BOTH TFs to have a cross newer than the last SAFE fire
+   // OR (not AND): one stale TF is enough to block – prevents re-using exhausted state
+   if(g_bar_1 == g_fired_bar_1 || g_bar_2 == g_fired_bar_2) return;
 
    datetime confirmedTime = MathMax(g_bar_1, g_bar_2);
    if(!PassesCooldown(g_state_1, confirmedTime))
@@ -912,6 +923,16 @@ void CheckConfirmation()
    { Print("[FIB BLOCK] SAFE BUY skipped – no RISKY preceded it"); return; }
    if(bearish && !g_riskySellFired)
    { Print("[FIB BLOCK] SAFE SELL skipped – no RISKY preceded it"); return; }
+
+   // Temporal ordering: TF2 bar must be at or after the bar that fired RISKY.
+   // Prevents a pre-existing TF2 cross from immediately confirming a fresh RISKY
+   // without waiting for genuine TF2 momentum after the TF1 signal.
+   if(g_bar_2 < g_riskyFiredBar)
+   {
+      Print("[WAIT] TF2 bar ", TimeToString(g_bar_2), " predates RISKY bar ",
+            TimeToString(g_riskyFiredBar), " – waiting for fresh TF2 cross");
+      return;
+   }
 
    // Use the fib context stored at RISKY time – price moving after the cross is
    // the trade working, not a reason to block SAFE
@@ -931,9 +952,10 @@ void CheckConfirmation()
    g_lastCooldownSig  = g_state_1;
    g_lastCooldownTime = confirmedTime;
 
-   // Reset risky flags after SAFE fires
+   // Reset risky flags and TF1 state after SAFE fires
    if(bullish) g_riskyBuyFired  = false;
    if(bearish) g_riskySellFired = false;
+   g_state_1 = SIG_NONE;  // clean lifecycle; SilentWatch goes idle until next TF1 cross
 }
 
 //+------------------------------------------------------------------+
