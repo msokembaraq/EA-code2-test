@@ -784,8 +784,8 @@ void CheckMACross()
    bool crossDown = (fast[2] >= slow[2]) && (fast[1] < slow[1]);
    if(!crossUp && !crossDown) return;
 
-   string dir    = crossUp ? "BUY" : "SELL";
-   string emoji2 = crossUp ? "🟢" : "🔴";
+   string dir    = crossDown ? "BUY" : "SELL";
+   string emoji2 = crossDown ? "🟢" : "🔴";
    string msg    = emoji2 + " EMA CROSS " + TFName(InpEMACross_TF) + " " + dir + " " + _Symbol;
 
    if(InpEnablePush && !SendNotification(msg)) Print("Push failed.");
