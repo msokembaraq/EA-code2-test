@@ -140,6 +140,9 @@ int OnInit()
    g_fibBar       = 0;
    g_riskyBuyFired = g_riskySellFired = false;
 
+   // Restore fib state from last session (survives MT5 restarts)
+   LoadFibState();
+
    // TF1 stochastic
    if(InpEnableTF1)
    {
@@ -272,6 +275,54 @@ bool IsBullish(int s) { return s == SIG_BUY;  }
 bool IsBearish(int s) { return s == SIG_SELL; }
 
 //+------------------------------------------------------------------+
+//  GlobalVariable key builder – unique per symbol + fib TF
+//+------------------------------------------------------------------+
+string GVName(string suffix)
+{
+   return "SF_" + _Symbol + "_" + TFName(InpFibTF) + "_" + suffix;
+}
+
+//+------------------------------------------------------------------+
+//  SaveFibState – persist fib anchors to GlobalVariables
+//+------------------------------------------------------------------+
+void SaveFibState()
+{
+   GlobalVariableSet(GVName("SH"),  g_fibSwingHigh);
+   GlobalVariableSet(GVName("SL"),  g_fibSwingLow);
+   GlobalVariableSet(GVName("OSH"), g_oldSwingHigh);
+   GlobalVariableSet(GVName("OSL"), g_oldSwingLow);
+   GlobalVariableSet(GVName("HOH"), g_hasOldHigh ? 1.0 : 0.0);
+   GlobalVariableSet(GVName("HOL"), g_hasOldLow  ? 1.0 : 0.0);
+}
+
+//+------------------------------------------------------------------+
+//  LoadFibState – restore fib anchors from GlobalVariables on restart
+//  Returns true if valid saved state was found
+//+------------------------------------------------------------------+
+bool LoadFibState()
+{
+   double sh = 0, sl = 0;
+   if(!GlobalVariableGet(GVName("SH"), sh)) return false;
+   if(!GlobalVariableGet(GVName("SL"), sl)) return false;
+   if(sh <= 0 || sl <= 0 || sh <= sl)       return false;
+
+   g_fibSwingHigh = sh;
+   g_fibSwingLow  = sl;
+
+   double osh = 0, osl = 0, hoh = 0, hol = 0;
+   GlobalVariableGet(GVName("OSH"), osh); g_oldSwingHigh = osh;
+   GlobalVariableGet(GVName("OSL"), osl); g_oldSwingLow  = osl;
+   GlobalVariableGet(GVName("HOH"), hoh); g_hasOldHigh   = (hoh > 0.5);
+   GlobalVariableGet(GVName("HOL"), hol); g_hasOldLow    = (hol > 0.5);
+
+   Print("[FIB] Restored: High=", DoubleToString(g_fibSwingHigh, _Digits),
+         "  Low=",  DoubleToString(g_fibSwingLow,  _Digits),
+         "  SBR:", (g_hasOldLow  ? DoubleToString(g_oldSwingLow,  _Digits) : "none"),
+         "  RBS:", (g_hasOldHigh ? DoubleToString(g_oldSwingHigh, _Digits) : "none"));
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //  FibPosLabel – nearest standard fib label for a 0.0→1.0 ratio
 //+------------------------------------------------------------------+
 string FibPosLabel(double pos)
@@ -296,7 +347,7 @@ void UpdateFibSwing()
    if(barTimes[1] == g_fibBar) return;
    g_fibBar = barTimes[1];
 
-   // First call: initialise from lookback
+   // First call: initialise from lookback (only if LoadFibState did not restore)
    if(g_fibSwingHigh == 0.0 && g_fibSwingLow == 0.0)
    {
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
@@ -304,8 +355,9 @@ void UpdateFibSwing()
       if(hiIdx < 0 || loIdx < 0) return;
       g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
       g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
-      Print("[FIB] Initialised: High=", DoubleToString(g_fibSwingHigh, _Digits),
+      Print("[FIB] Initialised from lookback: High=", DoubleToString(g_fibSwingHigh, _Digits),
             "  Low=", DoubleToString(g_fibSwingLow, _Digits));
+      SaveFibState();
       return;
    }
 
@@ -315,26 +367,28 @@ void UpdateFibSwing()
    double close = cls[0];
 
    // Swing LOW broken → old low becomes SBR, anchor resets
+   // Note: g_hasOldHigh is NOT cleared — both SBR and RBS can be active simultaneously
    if(close < g_fibSwingLow)
    {
       g_oldSwingLow = g_fibSwingLow;
       g_hasOldLow   = true;
-      g_hasOldHigh  = false;
       int loIdx = iLowest(_Symbol, InpFibTF, MODE_LOW, InpFibLookback, 1);
       if(loIdx >= 0) g_fibSwingLow = iLow(_Symbol, InpFibTF, loIdx);
       Print("[FIB] Swing LOW broken → new 0=", DoubleToString(g_fibSwingLow, _Digits),
             "  SBR level=", DoubleToString(g_oldSwingLow, _Digits));
+      SaveFibState();
    }
    // Swing HIGH broken → old high becomes RBS, anchor resets
+   // Note: g_hasOldLow is NOT cleared — both SBR and RBS can be active simultaneously
    else if(close > g_fibSwingHigh)
    {
       g_oldSwingHigh = g_fibSwingHigh;
       g_hasOldHigh   = true;
-      g_hasOldLow    = false;
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
       Print("[FIB] Swing HIGH broken → new 1=", DoubleToString(g_fibSwingHigh, _Digits),
             "  RBS level=", DoubleToString(g_oldSwingHigh, _Digits));
+      SaveFibState();
    }
 }
 
