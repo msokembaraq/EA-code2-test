@@ -820,13 +820,17 @@ void CheckTF1Signal()
 
    int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
 
-   // ── Structural SBR/RBS path (independent of TF2 direction and zone filter) ──
-   // Fires on any stoch cross when price is at a broken-level zone + rejection candle.
-   // TF2 is irrelevant: the structural level IS the directional confirmation.
+   // ── Structural SBR/RBS path ──
+   // Fires when price retests a broken structural level with a rejection candle.
+   // TF2 must NOT actively oppose: RBS BUY allowed when TF2 is BUY or NONE;
+   // SBR SELL allowed when TF2 is SELL or NONE. Prevents trading against live TF2 bias.
    if(InpFibZoneEnable)
    {
+      bool tf2Compatible = (tf1sig == SIG_BUY) ? (g_tf2_dir != SIG_SELL)
+                                                : (g_tf2_dir != SIG_BUY);
       double sbrPos = -1.0; string sbrTag = ""; double sbrLevel = 0.0;
-      if(CheckSBRRBS(tf1sig, sbrPos, sbrTag, sbrLevel)
+      if(tf2Compatible
+         && CheckSBRRBS(tf1sig, sbrPos, sbrTag, sbrLevel)
          && HasRejectionCandle(IsBearish(tf1sig), sbrLevel, InpTF1, InpRejectionLookback)
          && PassesCooldown(tf1sig, barTimes[1]))
       {
@@ -838,6 +842,11 @@ void CheckTF1Signal()
          g_lastCooldownSig  = tf1sig;
          g_lastCooldownTime = barTimes[1];
          return;  // one signal per bar
+      }
+      else if(!tf2Compatible && InpEnablePrint)
+      {
+         Print("[SBR/RBS SKIP] TF2 actively opposes: tf1sig=", SignalTypeName(tf1sig),
+               " TF2=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"));
       }
    }
 
