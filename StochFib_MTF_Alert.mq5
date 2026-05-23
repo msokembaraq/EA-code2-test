@@ -566,8 +566,7 @@ void CalcTPSL(int sigType, double entry,
 //  FireSignal – single alert with SL/TP
 //  🟢 BUY (SBR) XAUUSD.p @ FIB 0.236 [M4:OS H1:BUY]  SL:...  TP1:...
 //+------------------------------------------------------------------+
-void FireSignal(int sigType, double fibPos, string fibTag,
-                string tf1Zone)
+void FireSignal(int sigType, double fibPos, string fibTag)
 {
    double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl, tp1, tp2, tp3;
@@ -575,12 +574,9 @@ void FireSignal(int sigType, double fibPos, string fibTag,
 
    string emoji  = IsBullish(sigType) ? "🟢" : "🔴";
    string tag    = fibTag == "" ? "" : " (" + fibTag + ")";
-   string tf2str = IsBullish(g_tf2_dir) ? "BUY" : "SELL";
 
    string msg = emoji + " " + SignalTypeName(sigType) + tag
               + " " + _Symbol
-              + " @ FIB " + FibPosLabel(fibPos)
-              + " [" + TFName(InpTF1) + ":" + tf1Zone + " " + TFName(InpTF2) + ":" + tf2str + "]"
               + "  SL:"  + DoubleToString(sl,  _Digits)
               + "  TP1:" + DoubleToString(tp1, _Digits)
               + "  TP2:" + DoubleToString(tp2, _Digits)
@@ -758,7 +754,7 @@ void CheckTF1Signal()
    }
 
    // Fire
-   FireSignal(tf1sig, fibPos, fibTag, tf1Zone);
+   FireSignal(tf1sig, fibPos, fibTag);
 
    g_fired_bar        = barTimes[1];
    g_lastCooldownSig  = tf1sig;
