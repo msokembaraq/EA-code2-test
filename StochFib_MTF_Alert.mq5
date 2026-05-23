@@ -1,26 +1,22 @@
 //+------------------------------------------------------------------+
 //|                   StochFib_MTF_Alert.mq5                         |
-//|  Dual-TF Stochastic + Dynamic Fib Zone Gate + EMA Cross Signal   |
-//|  v1.1  – SBR/RBS direction-enforced + rejection candle gate      |
+//|  Dual-TF Stochastic + Dynamic Fib Zone Gate                      |
+//|  v2.0  – TF2 sets direction (OB/OS), TF1 triggers (any zone)    |
 //|                                                                  |
-//|  SIGNAL LOGIC (TF1 – strict):                                    |
-//|   BUY  – K crosses D UP   AND K touched OS within N bars         |
-//|           AND price in fib 0 → 0.382 zone                       |
-//|   SELL – K crosses D DOWN AND K touched OB within N bars         |
-//|           AND price in fib 0.618 → 1 zone                       |
-//|                                                                  |
-//|  STAGE 1: TF1 arms → 🟢/🔴 BUY/SELL RISKY @ FIB x.xxx         |
-//|  STAGE 2: TF2 confirms → 🟢/🔴 BUY/SELL SAFE @ FIB x.xxx      |
-//|           with SL at swing + TP1/TP2/TP3 via R:R                |
+//|  SIGNAL LOGIC:                                                   |
+//|   TF2 (slow): K/D cross from OB → SELL direction                |
+//|               K/D cross from OS → BUY  direction                |
+//|               Mid-zone TF2 crosses are ignored                   |
+//|   TF1 (fast): K/D cross in any zone (OB / OS / mid 30-70)      |
+//|               Fires if TF1 direction == TF2 direction            |
+//|               + price in fib zone or SBR/RBS level              |
 //|                                                                  |
 //|  SBR tag: price near old swing low after break (was support)     |
 //|  RBS tag: price near old swing high after break (was resistance) |
-//|                                                                  |
-//|  EMA CROSS: independent secondary signal (re-entry replacement)  |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
-#property version     "1.10"
-#property description "Stoch + Fib zone gate + EMA cross – dual independent signal streams"
+#property version     "2.00"
+#property description "Dual-TF Stoch: TF2 direction + TF1 trigger + Fib/SBR gate"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -37,55 +33,44 @@ const string FIB_LABEL[7] = {"0", "0.236", "0.382", "0.5", "0.618", "0.786", "1"
 //════════════════════════════════════════════════════════════════════
 //  INPUT PARAMETERS
 //════════════════════════════════════════════════════════════════════
-input group "══════ Stochastic Settings – TF1 ══════"
-input int    InpStoch_K    = 50;
+input group "══════ Timeframe Selection ══════"
+input ENUM_TIMEFRAMES InpTF1 = PERIOD_M4;   // TF1 – trigger (faster)
+input ENUM_TIMEFRAMES InpTF2 = PERIOD_H1;   // TF2 – direction (slower)
+
+input group "══════ Stochastic – TF1 (trigger) ══════"
+input int    InpStoch_K    = 26;
 input int    InpStoch_D    = 7;
 input int    InpStoch_Slow = 11;
 
-input group "══════ Stochastic Settings – TF2 Override ══════"
-input bool   InpTF2UseOwnStoch = true;
-input int    InpStoch_K2       = 24;
-input int    InpStoch_D2       = 3;
-input int    InpStoch_Slow2    = 9;
+input group "══════ Stochastic – TF2 (direction) ══════"
+input int    InpStoch_K2    = 14;
+input int    InpStoch_D2    = 3;
+input int    InpStoch_Slow2 = 9;
 
 input group "══════ OB / OS Levels ══════"
 input double InpOB_Level   = 80.0;
 input double InpOS_Level   = 20.0;
-input int    InpOSLookback = 20;
+input int    InpOSLookback = 20;   // bars to scan for OB/OS touch on both TFs
 
 input group "══════ Signal Cooldown ══════"
 input int    InpSignalCooldownMin = 60;
 
-input group "══════ EMA Cross Signal (independent) ══════"
-input bool            InpEMACrossEnable = true;
-input ENUM_TIMEFRAMES InpEMACross_TF    = PERIOD_M5;
-input int             InpMA_Period      = 34;
-input int             InpMA_Period2     = 9;
-input ENUM_MA_METHOD  InpMA_Method      = MODE_EMA;
-
-input group "══════ Timeframe Selection ══════"
-input ENUM_TIMEFRAMES InpTF1            = PERIOD_M5;
-input bool            InpEnableTF1      = true;
-input ENUM_TIMEFRAMES InpTF2            = PERIOD_M15;
-input bool            InpEnableTF2      = true;
-input bool            InpTF2StrictZones = false;
-
 input group "══════ Fib Zone Filter ══════"
-input ENUM_TIMEFRAMES InpFibTF          = PERIOD_M30;   // TF for swing high/low detection
-input int             InpFibLookback    = 100;           // Bars to scan for swing anchor
-input double          InpFibBuyZoneMax  = 0.382;         // BUY zone upper bound (0 → this)
-input double          InpFibSellZoneMin = 0.618;         // SELL zone lower bound (this → 1)
-input double          InpSBR_Tol          = 0.05;  // ± band around old level for SBR/RBS detection (fraction of range)
-input bool            InpTrendFilter    = true;     // Block counter-trend fib-zone signals (SELL blocked in uptrend, BUY blocked in downtrend)
+input ENUM_TIMEFRAMES InpFibTF         = PERIOD_M30;
+input int             InpFibLookback   = 100;
+input double          InpFibBuyZoneMax  = 0.382;
+input double          InpFibSellZoneMin = 0.618;
+input double          InpSBR_Tol       = 0.05;
+input bool            InpTrendFilter   = true;
 
 input group "══════ SBR / RBS Rejection ══════"
-input double          InpSBR_DeepExt      = 0.10;  // SBR zone extends this far ABOVE old swing-low (fraction of range) – catches overshoots above resistance
-input double          InpRBS_DeepExt      = 0.10;  // RBS zone extends this far BELOW old swing-high (fraction of range) – catches dips below support
-input int             InpRejectionLookback = 5;    // Bars on TF1 to scan for textbook rejection candle
+input double InpSBR_DeepExt       = 0.10;
+input double InpRBS_DeepExt       = 0.10;
+input int    InpRejectionLookback = 5;
 
 input group "══════ TP / SL Targets ══════"
 input int    InpSLLookback  = 20;
-input int    InpSLFallback  = 500;  // Fallback SL distance in points if swing history insufficient
+input int    InpSLFallback  = 500;
 input double InpTP1_RR      = 1.0;
 input double InpTP2_RR      = 2.0;
 input double InpTP3_RR      = 3.0;
@@ -98,41 +83,30 @@ input bool InpEnablePrint = true;
 //════════════════════════════════════════════════════════════════════
 //  GLOBALS
 //════════════════════════════════════════════════════════════════════
-// Indicator handles
 int g_h_stoch_1 = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
-int g_h_ma_slow = INVALID_HANDLE;  // EMA(InpMA_Period)  on InpEMACross_TF – slow side of cross
-int g_h_ma_fast = INVALID_HANDLE;  // EMA(InpMA_Period2) on InpEMACross_TF – fast side of cross
 
-// TF state
-datetime g_lastBar_1 = 0, g_lastBar_2 = 0;
-int      g_state_1   = SIG_NONE, g_state_2 = SIG_NONE;
-datetime g_bar_1     = 0, g_bar_2 = 0;
-datetime g_fired_bar_1 = 0, g_fired_bar_2 = 0;
+// TF bar guards
+datetime g_lastBar_1 = 0;
+datetime g_lastBar_2 = 0;
+
+// TF2 direction – set by OB/OS crosses only; persists until opposite OB/OS cross
+int g_tf2_dir = SIG_NONE;
 
 // Cooldown
 int      g_lastCooldownSig  = SIG_NONE;
 datetime g_lastCooldownTime = 0;
-
-// EMA cross bar guard
-datetime g_lastMACrossBar = 0;
+datetime g_fired_bar        = 0;   // last TF1 bar that fired a signal
 
 // Fib anchor
 double   g_fibSwingHigh = 0.0, g_fibSwingLow  = 0.0;
 double   g_oldSwingHigh = 0.0, g_oldSwingLow  = 0.0;
 bool     g_hasOldHigh   = false, g_hasOldLow  = false;
-int      g_trendBias    = 0;   // +1=uptrend (last break was swing HIGH), -1=downtrend (last break was swing LOW)
+int      g_trendBias    = 0;   // +1=uptrend, -1=downtrend
 datetime g_fibBar       = 0;
 
-// RISKY-fired tracking – SAFE only fires when RISKY preceded it
-bool     g_riskyBuyFired  = false, g_riskySellFired  = false;
-string   g_riskyBuyTag    = "",    g_riskySellTag    = "";
-double   g_riskyBuyFibPos = 0.0,  g_riskySellFibPos = 0.0;
-double   g_riskyBuyK      = 0.0,  g_riskySellK      = 0.0;  // K at cross time
-datetime g_riskyFiredBar  = 0;    // g_bar_1 when last RISKY fired – TF2 must be >= this
-
-// Live K – updated every bar for silent tracking
-double   g_liveK_1 = 0.0, g_liveK_2 = 0.0;
+// Live K – silent tracking
+double g_liveK_1 = 0.0, g_liveK_2 = 0.0;
 
 //+------------------------------------------------------------------+
 //  OnInit
@@ -140,66 +114,38 @@ double   g_liveK_1 = 0.0, g_liveK_2 = 0.0;
 int OnInit()
 {
    g_lastBar_1 = g_lastBar_2 = 0;
-   g_state_1 = g_state_2 = SIG_NONE;
-   g_bar_1   = g_bar_2   = 0;
-   g_fired_bar_1 = g_fired_bar_2 = 0;
+   g_tf2_dir   = SIG_NONE;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
-   g_lastMACrossBar   = 0;
+   g_fired_bar        = 0;
    g_fibSwingHigh = g_fibSwingLow = 0.0;
    g_oldSwingHigh = g_oldSwingLow = 0.0;
    g_hasOldHigh   = g_hasOldLow  = false;
    g_trendBias    = 0;
    g_fibBar       = 0;
-   g_riskyBuyFired = g_riskySellFired = false;
-   g_riskyBuyK     = g_riskySellK    = 0.0;
-   g_riskyFiredBar = 0;
-   g_liveK_1       = g_liveK_2       = 0.0;
+   g_liveK_1      = g_liveK_2    = 0.0;
 
-   // Restore fib state from last session (survives MT5 restarts)
    LoadFibState();
 
-   // TF1 stochastic
-   if(InpEnableTF1)
-   {
-      g_h_stoch_1 = iStochastic(_Symbol, InpTF1,
-                                 InpStoch_K, InpStoch_D, InpStoch_Slow,
-                                 MODE_SMA, STO_LOWHIGH);
-      if(g_h_stoch_1 == INVALID_HANDLE)
-      { Alert("StochFib: Failed Stoch TF1 handle"); return INIT_FAILED; }
-   }
+   g_h_stoch_1 = iStochastic(_Symbol, InpTF1,
+                              InpStoch_K, InpStoch_D, InpStoch_Slow,
+                              MODE_SMA, STO_LOWHIGH);
+   if(g_h_stoch_1 == INVALID_HANDLE)
+   { Alert("StochFib: Failed Stoch TF1 handle"); return INIT_FAILED; }
 
-   // TF2 stochastic
-   if(InpEnableTF2)
-   {
-      int k2 = InpTF2UseOwnStoch ? InpStoch_K2    : InpStoch_K;
-      int d2 = InpTF2UseOwnStoch ? InpStoch_D2    : InpStoch_D;
-      int s2 = InpTF2UseOwnStoch ? InpStoch_Slow2 : InpStoch_Slow;
-      g_h_stoch_2 = iStochastic(_Symbol, InpTF2, k2, d2, s2, MODE_SMA, STO_LOWHIGH);
-      if(g_h_stoch_2 == INVALID_HANDLE)
-      { Alert("StochFib: Failed Stoch TF2 handle"); return INIT_FAILED; }
-   }
-
-   // Both EMA handles on InpEMACross_TF – fixes cross-TF mismatch
-   if(InpEMACrossEnable)
-   {
-      g_h_ma_slow = iMA(_Symbol, InpEMACross_TF, InpMA_Period,  0, InpMA_Method, PRICE_CLOSE);
-      g_h_ma_fast = iMA(_Symbol, InpEMACross_TF, InpMA_Period2, 0, InpMA_Method, PRICE_CLOSE);
-      if(g_h_ma_slow == INVALID_HANDLE || g_h_ma_fast == INVALID_HANDLE)
-      { Alert("StochFib: Failed EMA handles"); return INIT_FAILED; }
-   }
+   g_h_stoch_2 = iStochastic(_Symbol, InpTF2,
+                              InpStoch_K2, InpStoch_D2, InpStoch_Slow2,
+                              MODE_SMA, STO_LOWHIGH);
+   if(g_h_stoch_2 == INVALID_HANDLE)
+   { Alert("StochFib: Failed Stoch TF2 handle"); return INIT_FAILED; }
 
    EventSetTimer(2);
 
-   int tf2K = InpTF2UseOwnStoch ? InpStoch_K2    : InpStoch_K;
-   int tf2D = InpTF2UseOwnStoch ? InpStoch_D2    : InpStoch_D;
-   int tf2S = InpTF2UseOwnStoch ? InpStoch_Slow2 : InpStoch_Slow;
-   Print("StochFib v1.1 loaded  ", _Symbol,
+   Print("StochFib v2.0 loaded  ", _Symbol,
          " | TF1:", TFName(InpTF1), " Stoch(", InpStoch_K, ",", InpStoch_D, ",", InpStoch_Slow, ")",
-         " | TF2:", TFName(InpTF2), " Stoch(", tf2K, ",", tf2D, ",", tf2S, ")",
+         " | TF2:", TFName(InpTF2), " Stoch(", InpStoch_K2, ",", InpStoch_D2, ",", InpStoch_Slow2, ")",
          " | FibTF:", TFName(InpFibTF), " Lookback:", InpFibLookback,
-         " BuyZone:0→", InpFibBuyZoneMax, " SellZone:", InpFibSellZoneMin, "→1",
-         " | EMA cross:", TFName(InpEMACross_TF), " EMA", InpMA_Period2, "/EMA", InpMA_Period);
+         " BuyZone:0→", InpFibBuyZoneMax, " SellZone:", InpFibSellZoneMin, "→1");
 
    return INIT_SUCCEEDED;
 }
@@ -212,8 +158,6 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(g_h_stoch_1 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_1);
    if(g_h_stoch_2 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_2);
-   if(g_h_ma_slow != INVALID_HANDLE) IndicatorRelease(g_h_ma_slow);
-   if(g_h_ma_fast != INVALID_HANDLE) IndicatorRelease(g_h_ma_fast);
 }
 
 //+------------------------------------------------------------------+
@@ -232,41 +176,34 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 }
 
 //+------------------------------------------------------------------+
-//  UpdateLiveK – read current (forming-bar) K on both TFs each tick
+//  UpdateLiveK – current forming-bar K on both TFs
 //+------------------------------------------------------------------+
 void UpdateLiveK()
 {
    double k[1];
-   if(g_h_stoch_1 != INVALID_HANDLE && CopyBuffer(g_h_stoch_1, MAIN_LINE, 0, 1, k) == 1)
-      g_liveK_1 = k[0];
-   if(g_h_stoch_2 != INVALID_HANDLE && CopyBuffer(g_h_stoch_2, MAIN_LINE, 0, 1, k) == 1)
-      g_liveK_2 = k[0];
+   if(CopyBuffer(g_h_stoch_1, MAIN_LINE, 0, 1, k) == 1) g_liveK_1 = k[0];
+   if(CopyBuffer(g_h_stoch_2, MAIN_LINE, 0, 1, k) == 1) g_liveK_2 = k[0];
 }
 
 //+------------------------------------------------------------------+
-//  SilentWatch – journal-only bar-change state snapshot
+//  SilentWatch – journal snapshot every TF1/TF2 bar change
 //+------------------------------------------------------------------+
 void SilentWatch()
 {
    if(!InpEnablePrint) return;
-   if(g_state_1 == SIG_NONE && !g_riskyBuyFired && !g_riskySellFired) return;
 
    double range  = g_fibSwingHigh - g_fibSwingLow;
    double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double fibPos = (range > 0) ? (price - g_fibSwingLow) / range : -1.0;
 
-   string zone = (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax)   ? "BUY ZONE"  :
-                 (fibPos >= InpFibSellZoneMin && fibPos <= 1.0)   ? "SELL ZONE" : "DEAD ZONE";
-
-   string armed = (g_riskyBuyFired  ? "BUY ARMED @FIB " + FibPosLabel(g_riskyBuyFibPos)   + " K_entry=" + DoubleToString(g_riskyBuyK,  1) :
-                   g_riskySellFired ? "SELL ARMED @FIB " + FibPosLabel(g_riskySellFibPos) + " K_entry=" + DoubleToString(g_riskySellK, 1) :
-                   "no pending");
+   string zone  = (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax)   ? "BUY ZONE"  :
+                  (fibPos >= InpFibSellZoneMin && fibPos <= 1.0)   ? "SELL ZONE" : "DEAD ZONE";
+   string tf2st = (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none");
 
    Print("[WATCH] ",
          TFName(InpTF1), " K=", DoubleToString(g_liveK_1, 1),
-         " | ", TFName(InpTF2), " K=", DoubleToString(g_liveK_2, 1),
-         " | fib=", FibPosLabel(fibPos), " (", zone, ")",
-         " | ", armed);
+         " | ", TFName(InpTF2), " K=", DoubleToString(g_liveK_2, 1), " dir=", tf2st,
+         " | fib=", FibPosLabel(fibPos), " (", zone, ")");
 }
 
 //+------------------------------------------------------------------+
@@ -276,70 +213,8 @@ void CheckAllTimeframes()
 {
    UpdateFibSwing();
    UpdateLiveK();
-   CheckMACross();
-
-   if(!InpEnableTF1) return;
-
-   double crossK1 = 0.0, crossK2 = 0.0;
-   bool changed1 = ProcessTimeframe(InpTF1, g_h_stoch_1,
-                                    g_lastBar_1, g_state_1, g_bar_1, true, crossK1);
-
-   bool changed2 = false;
-   if(InpEnableTF2)
-      changed2 = ProcessTimeframe(InpTF2, g_h_stoch_2,
-                                  g_lastBar_2, g_state_2, g_bar_2, InpTF2StrictZones, crossK2);
-
-   // TF1 state changed → attempt RISKY (fib zone gated)
-   if(changed1 && g_state_1 != SIG_NONE)
-   {
-      // Cancel any pending RISKY in the opposite direction
-      if(IsBullish(g_state_1)) g_riskySellFired = false;
-      if(IsBearish(g_state_1)) g_riskyBuyFired  = false;
-
-      double fibPos = -1.0; string fibTag = "";
-      bool   zonePassed = false;
-
-      // 1. Normal fib zone: BUY→[0, BuyZoneMax], SELL→[SellZoneMin, 1]
-      if(CheckFibZone(g_state_1, fibPos, fibTag))
-      {
-         zonePassed = true;
-      }
-      // 2. SBR/RBS: direction-enforced + requires rejection candle on TF1
-      else
-      {
-         double levelPrice;
-         if(CheckSBRRBS(g_state_1, fibPos, fibTag, levelPrice))
-         {
-            if(HasRejectionCandle(IsBearish(g_state_1), levelPrice, InpTF1, InpRejectionLookback))
-               zonePassed = true;
-            else
-               Print("[SBR/RBS BLOCK] No rejection candle at ",
-                     DoubleToString(levelPrice, _Digits),
-                     " for ", fibTag, " ", SignalTypeName(g_state_1));
-         }
-      }
-
-      if(zonePassed)
-      {
-         FireArmedAlert(g_state_1, fibPos, fibTag);
-         g_riskyFiredBar = g_bar_1;  // TF2 must have a cross at or after this bar
-         if(IsBullish(g_state_1))
-         { g_riskyBuyFired  = true; g_riskyBuyTag  = fibTag; g_riskyBuyFibPos  = fibPos; g_riskyBuyK  = crossK1; }
-         else
-         { g_riskySellFired = true; g_riskySellTag = fibTag; g_riskySellFibPos = fibPos; g_riskySellK = crossK1; }
-      }
-      else
-         Print("[FIB BLOCK] RISKY ", SignalTypeName(g_state_1),
-               " blocked – fibPos=", DoubleToString(fibPos, 3),
-               " K=", DoubleToString(crossK1, 1));
-   }
-
-   if(changed1 || changed2)
-      CheckConfirmation();
-
-   // Silent bar-change snapshot (only when TF1 bar changed)
-   if(changed1 || changed2)
-      SilentWatch();
+   UpdateTF2Direction();
+   CheckTF1Signal();
 }
 
 //════════════════════════════════════════════════════════════════════
@@ -358,7 +233,7 @@ bool IsBullish(int s) { return s == SIG_BUY;  }
 bool IsBearish(int s) { return s == SIG_SELL; }
 
 //+------------------------------------------------------------------+
-//  GlobalVariable key builder – unique per symbol + fib TF
+//  GlobalVariable key builder
 //+------------------------------------------------------------------+
 string GVName(string suffix)
 {
@@ -366,7 +241,7 @@ string GVName(string suffix)
 }
 
 //+------------------------------------------------------------------+
-//  SaveFibState – persist fib anchors to GlobalVariables
+//  SaveFibState – persist fib anchors + TF2 direction to GlobalVariables
 //+------------------------------------------------------------------+
 void SaveFibState()
 {
@@ -377,11 +252,11 @@ void SaveFibState()
    GlobalVariableSet(GVName("HOH"), g_hasOldHigh ? 1.0 : 0.0);
    GlobalVariableSet(GVName("HOL"), g_hasOldLow  ? 1.0 : 0.0);
    GlobalVariableSet(GVName("TRB"), (double)g_trendBias);
+   GlobalVariableSet(GVName("TD2"), (double)g_tf2_dir);
 }
 
 //+------------------------------------------------------------------+
-//  LoadFibState – restore fib anchors from GlobalVariables on restart
-//  Returns true if valid saved state was found
+//  LoadFibState – restore state from GlobalVariables on restart
 //+------------------------------------------------------------------+
 bool LoadFibState()
 {
@@ -393,18 +268,20 @@ bool LoadFibState()
    g_fibSwingHigh = sh;
    g_fibSwingLow  = sl;
 
-   double osh = 0, osl = 0, hoh = 0, hol = 0, trb = 0;
+   double osh = 0, osl = 0, hoh = 0, hol = 0, trb = 0, td2 = 0;
    GlobalVariableGet(GVName("OSH"), osh); g_oldSwingHigh = osh;
    GlobalVariableGet(GVName("OSL"), osl); g_oldSwingLow  = osl;
    GlobalVariableGet(GVName("HOH"), hoh); g_hasOldHigh   = (hoh > 0.5);
    GlobalVariableGet(GVName("HOL"), hol); g_hasOldLow    = (hol > 0.5);
    GlobalVariableGet(GVName("TRB"), trb); g_trendBias    = (int)MathRound(trb);
+   GlobalVariableGet(GVName("TD2"), td2); g_tf2_dir      = (int)MathRound(td2);
 
    Print("[FIB] Restored: High=", DoubleToString(g_fibSwingHigh, _Digits),
          "  Low=",  DoubleToString(g_fibSwingLow,  _Digits),
          "  SBR:", (g_hasOldLow  ? DoubleToString(g_oldSwingLow,  _Digits) : "none"),
          "  RBS:", (g_hasOldHigh ? DoubleToString(g_oldSwingHigh, _Digits) : "none"),
-         "  TrendBias:", (g_trendBias == 1 ? "UP" : g_trendBias == -1 ? "DOWN" : "none"));
+         "  TrendBias:", (g_trendBias == 1 ? "UP" : g_trendBias == -1 ? "DOWN" : "none"),
+         "  TF2dir:", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"));
    return true;
 }
 
@@ -433,7 +310,6 @@ void UpdateFibSwing()
    if(barTimes[1] == g_fibBar) return;
    g_fibBar = barTimes[1];
 
-   // First call: initialise from lookback (only if LoadFibState did not restore)
    if(g_fibSwingHigh == 0.0 && g_fibSwingLow == 0.0)
    {
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
@@ -447,24 +323,16 @@ void UpdateFibSwing()
       return;
    }
 
-   // Last closed bar close
    double cls[1];
    if(CopyClose(_Symbol, InpFibTF, 1, 1, cls) < 1) return;
    double close = cls[0];
 
-   // Swing LOW broken → old low becomes SBR; rescan BOTH anchors to keep range current
-   // Note: g_hasOldHigh is NOT cleared — both SBR and RBS can be active simultaneously
+   // Swing LOW broken → old low becomes SBR; rescan both anchors
    if(close < g_fibSwingLow)
    {
       g_oldSwingLow = g_fibSwingLow;
       g_hasOldLow   = true;
-      g_trendBias   = -1;   // downtrend: last structural break was to the downside
-      // Price proved any pending BUY RISKY wrong – cancel it so stale context can't fire SAFE
-      if(g_riskyBuyFired)
-      {
-         g_riskyBuyFired = false;
-         Print("[FIB] Swing LOW broke pending BUY RISKY – cancelled stale signal");
-      }
+      g_trendBias   = -1;
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
@@ -474,19 +342,12 @@ void UpdateFibSwing()
             "  SBR level=", DoubleToString(g_oldSwingLow, _Digits));
       SaveFibState();
    }
-   // Swing HIGH broken → old high becomes RBS; rescan BOTH anchors to keep range current
-   // Note: g_hasOldLow is NOT cleared — both SBR and RBS can be active simultaneously
+   // Swing HIGH broken → old high becomes RBS; rescan both anchors
    else if(close > g_fibSwingHigh)
    {
       g_oldSwingHigh = g_fibSwingHigh;
       g_hasOldHigh   = true;
-      g_trendBias    = +1;  // uptrend: last structural break was to the upside
-      // Price proved any pending SELL RISKY wrong – cancel it so stale context can't fire SAFE
-      if(g_riskySellFired)
-      {
-         g_riskySellFired = false;
-         Print("[FIB] Swing HIGH broke pending SELL RISKY – cancelled stale signal");
-      }
+      g_trendBias    = +1;
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
@@ -499,15 +360,14 @@ void UpdateFibSwing()
 }
 
 //+------------------------------------------------------------------+
-//  CheckFibZone – normal zone gate (no role-flip tagging here)
+//  CheckFibZone – normal fib zone gate
 //  BUY:  fibPos in [0, InpFibBuyZoneMax]
 //  SELL: fibPos in [InpFibSellZoneMin, 1]
-//  SBR/RBS signals handled separately by CheckSBRRBS
 //+------------------------------------------------------------------+
 bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
 {
    fibPos = -1.0;
-   fibTag = "";  // normal zone signals carry no role-flip tag
+   fibTag = "";
 
    double range = g_fibSwingHigh - g_fibSwingLow;
    if(range <= 0.0) return false;
@@ -515,15 +375,13 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    fibPos = (price - g_fibSwingLow) / range;
 
-   // Trend bias filter: block fib-zone signals that go against the last swing-break direction
-   // (counter-trend entries are handled exclusively by CheckSBRRBS)
+   // Trend bias filter: block fib-zone signals against the last swing-break direction
    if(InpTrendFilter && g_trendBias != 0)
    {
-      if(IsBearish(sigType) && g_trendBias ==  1) return false; // uptrend active – no fib-zone SELL
-      if(IsBullish(sigType) && g_trendBias == -1) return false; // downtrend active – no fib-zone BUY
+      if(IsBearish(sigType) && g_trendBias ==  1) return false; // uptrend – no fib-zone SELL
+      if(IsBullish(sigType) && g_trendBias == -1) return false; // downtrend – no fib-zone BUY
    }
 
-   // SBR/RBS direction enforcement and tagging handled by CheckSBRRBS; not applied here
    if(IsBullish(sigType))
       return (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax);
    else
@@ -533,9 +391,7 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
 //+------------------------------------------------------------------+
 //  CheckSBRRBS – direction-enforced role-flip zone check
 //  SBR: SELL only – price testing old swing low (broken support → resistance)
-//       zone: [old_swing_low - DeepExt*range, old_swing_low + Tol*range]
 //  RBS: BUY  only – price testing old swing high (broken resistance → support)
-//       zone: [old_swing_high - Tol*range, old_swing_high + DeepExt*range]
 //+------------------------------------------------------------------+
 bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelPrice)
 {
@@ -548,9 +404,6 @@ bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelP
 
    if(IsBearish(stochState) && g_hasOldLow)
    {
-      // SBR SELL: price came back UP to test old swing low (now resistance)
-      // zoneLo – Tol below level: price approaching from below, K fires before reaching level
-      // zoneHi – DeepExt above level: price overshot above old resistance before K fires
       double zoneLo = g_oldSwingLow - InpSBR_Tol     * range;
       double zoneHi = g_oldSwingLow + InpSBR_DeepExt * range;
       if(price >= zoneLo && price <= zoneHi)
@@ -567,9 +420,6 @@ bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelP
 
    if(IsBullish(stochState) && g_hasOldHigh)
    {
-      // RBS BUY: price came back DOWN to test old swing high (now support)
-      // zoneLo – DeepExt below level: price dipped below old support before K fires
-      // zoneHi – Tol above level: price approaching from above, K fires before reaching level
       double zoneLo = g_oldSwingHigh - InpRBS_DeepExt * range;
       double zoneHi = g_oldSwingHigh + InpSBR_Tol     * range;
       if(price >= zoneLo && price <= zoneHi)
@@ -588,11 +438,7 @@ bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelP
 }
 
 //+------------------------------------------------------------------+
-//  HasRejectionCandle – scan TF1 bars for textbook rejection pattern
-//  bearish=true  → SBR SELL: shooting star, bearish engulf, outside bar, doji
-//  bearish=false → RBS BUY:  hammer, bullish engulf, outside bar, doji
-//  Candle high must reach SBR zone (bearish) / low must reach RBS zone (bullish).
-//  No qualifying candle found = manipulation / liquidity grab → signal skipped.
+//  HasRejectionCandle – scan TF1 bars for rejection pattern at level
 //+------------------------------------------------------------------+
 bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int lookback)
 {
@@ -601,7 +447,6 @@ bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int
    if(CopyHigh (_Symbol, tf, 1, lookback, highs)  < lookback) return false;
    if(CopyLow  (_Symbol, tf, 1, lookback, lows)   < lookback) return false;
    if(CopyClose(_Symbol, tf, 1, lookback, closes) < lookback) return false;
-   // [0] = most recent closed bar (shift 1); [lookback-1] = oldest
 
    double range    = g_fibSwingHigh - g_fibSwingLow;
    double priceTol = InpSBR_Tol * range;
@@ -615,91 +460,53 @@ bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int
 
       if(bearish)
       {
-         // Candle must overlap the SBR zone (high reaches zone, candle is not entirely above it,
-         // and body is not floating far above the level – filters long-wick false positives)
-         if(h < levelPrice - priceTol)              continue;  // high never reached zone
-         if(l > levelPrice + priceTol * 2)          continue;  // candle entirely above zone
-         if(MathMin(o, c) > levelPrice + priceTol * 2) continue; // body floating above zone
+         if(h < levelPrice - priceTol)                 continue;
+         if(l > levelPrice + priceTol * 2)             continue;
+         if(MathMin(o, c) > levelPrice + priceTol * 2) continue;
 
-         double upperWick = h - MathMax(o, c);
-
-         // Shooting star / bearish pin bar: upper wick >= 2× body, closes in lower half
-         bool shootingStar = (body > 0)
-                          && (upperWick >= 2.0 * body)
-                          && (c < (h + l) * 0.5);
-
-         // Doji: body <= 10% of candle range — ambiguous candle at resistance = rejection hint
-         bool doji = (body <= 0.10 * cRange);
-
-         bool outsideBar = false, engulfing = false;
+         double upperWick  = h - MathMax(o, c);
+         bool shootingStar = (body > 0) && (upperWick >= 2.0 * body) && (c < (h + l) * 0.5);
+         bool doji         = (body <= 0.10 * cRange);
+         bool outsideBar   = false, engulfing = false;
          if(i + 1 < lookback)
          {
-            double ph = highs[i+1], pl = lows[i+1];
-            double pO = opens[i+1], pC = closes[i+1];
-            // Outside bar: breaks both prev extremes, closes bearish
+            double ph = highs[i+1], pl = lows[i+1], pO = opens[i+1], pC = closes[i+1];
             outsideBar = (h > ph) && (l < pl) && (c < o);
-            // Bearish engulfing: opens at/above prev body top, closes at/below prev body bottom
-            engulfing  = (c < o)
-                      && (o >= MathMax(pO, pC))
-                      && (c <= MathMin(pO, pC));
+            engulfing  = (c < o) && (o >= MathMax(pO, pC)) && (c <= MathMin(pO, pC));
          }
-
          if(shootingStar || doji || outsideBar || engulfing)
          {
-            string ptype = shootingStar ? "ShootingStar" :
-                           doji         ? "Doji"         :
-                           outsideBar   ? "OutsideBar"   : "BearEngulf";
-            Print("[REJECT-SBR] ", ptype,
-                  " H=", DoubleToString(h, _Digits),
-                  " level=", DoubleToString(levelPrice, _Digits),
-                  " bar=", i+1, " ago");
+            string pt = shootingStar ? "ShootingStar" : doji ? "Doji" : outsideBar ? "OutsideBar" : "BearEngulf";
+            Print("[REJECT-SBR] ", pt, " H=", DoubleToString(h, _Digits),
+                  " level=", DoubleToString(levelPrice, _Digits), " bar=", i+1, " ago");
             return true;
          }
       }
       else
       {
-         // Candle must overlap the RBS zone (low reaches zone, candle is not entirely below it,
-         // and body is not floating far below the level – filters long-wick false positives)
-         if(l > levelPrice + priceTol)              continue;  // low never reached zone
-         if(h < levelPrice - priceTol * 2)          continue;  // candle entirely below zone
-         if(MathMax(o, c) < levelPrice - priceTol * 2) continue; // body floating below zone
+         if(l > levelPrice + priceTol)                 continue;
+         if(h < levelPrice - priceTol * 2)             continue;
+         if(MathMax(o, c) < levelPrice - priceTol * 2) continue;
 
          double lowerWick = MathMin(o, c) - l;
-
-         // Hammer / bullish pin bar: lower wick >= 2× body, closes in upper half
-         bool hammer = (body > 0)
-                    && (lowerWick >= 2.0 * body)
-                    && (c > (h + l) * 0.5);
-
-         bool doji = (body <= 0.10 * cRange);
-
-         bool outsideBar = false, engulfing = false;
+         bool hammer      = (body > 0) && (lowerWick >= 2.0 * body) && (c > (h + l) * 0.5);
+         bool doji        = (body <= 0.10 * cRange);
+         bool outsideBar  = false, engulfing = false;
          if(i + 1 < lookback)
          {
-            double ph = highs[i+1], pl = lows[i+1];
-            double pO = opens[i+1], pC = closes[i+1];
-            // Outside bar: breaks both prev extremes, closes bullish
+            double ph = highs[i+1], pl = lows[i+1], pO = opens[i+1], pC = closes[i+1];
             outsideBar = (h > ph) && (l < pl) && (c > o);
-            // Bullish engulfing: opens at/below prev body bottom, closes at/above prev body top
-            engulfing  = (c > o)
-                      && (o <= MathMin(pO, pC))
-                      && (c >= MathMax(pO, pC));
+            engulfing  = (c > o) && (o <= MathMin(pO, pC)) && (c >= MathMax(pO, pC));
          }
-
          if(hammer || doji || outsideBar || engulfing)
          {
-            string ptype = hammer     ? "Hammer"     :
-                           doji       ? "Doji"       :
-                           outsideBar ? "OutsideBar" : "BullEngulf";
-            Print("[REJECT-RBS] ", ptype,
-                  " L=", DoubleToString(l, _Digits),
-                  " level=", DoubleToString(levelPrice, _Digits),
-                  " bar=", i+1, " ago");
+            string pt = hammer ? "Hammer" : doji ? "Doji" : outsideBar ? "OutsideBar" : "BullEngulf";
+            Print("[REJECT-RBS] ", pt, " L=", DoubleToString(l, _Digits),
+                  " level=", DoubleToString(levelPrice, _Digits), " bar=", i+1, " ago");
             return true;
          }
       }
    }
-
    return false;
 }
 
@@ -748,42 +555,28 @@ void CalcTPSL(int sigType, double entry,
 }
 
 //+------------------------------------------------------------------+
-//  FireArmedAlert – Stage 1 RISKY
-//  🟢 BUY RISKY XAUUSD.p @ FIB 0.236
-//  🟢 BUY RISKY (SBR) XAUUSD.p @ FIB 0.236
+//  FireSignal – single alert with SL/TP
+//  🟢 BUY (SBR) XAUUSD.p @ FIB 0.236 [M4:OS H1:BUY]  SL:...  TP1:...
 //+------------------------------------------------------------------+
-void FireArmedAlert(int sigType, double fibPos, string fibTag)
-{
-   string emoji = IsBullish(sigType) ? "🟢" : "🔴";
-   string tag   = fibTag == "" ? "" : " (" + fibTag + ")";
-   string msg   = emoji + " " + SignalTypeName(sigType) + " RISKY" + tag
-                + " " + _Symbol
-                + " @ FIB " + FibPosLabel(fibPos);
-
-   if(InpEnablePush && !SendNotification(msg)) Print("Push failed.");
-   if(InpEnablePopup) Alert(msg);
-   if(InpEnablePrint) Print(msg);
-}
-
-//+------------------------------------------------------------------+
-//  FireConfirmedAlert – Stage 2 SAFE
-//  🟢 BUY SAFE XAUUSD.p @ FIB 0.236  SL:4510  TP1:4544  TP2:4578  TP3:4612
-//+------------------------------------------------------------------+
-void FireConfirmedAlert(int sigType, double fibPos, string fibTag)
+void FireSignal(int sigType, double fibPos, string fibTag,
+                string tf1Zone)
 {
    double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl, tp1, tp2, tp3;
    CalcTPSL(sigType, entry, sl, tp1, tp2, tp3);
 
-   string emoji = IsBullish(sigType) ? "🟢" : "🔴";
-   string tag   = fibTag == "" ? "" : " (" + fibTag + ")";
-   string msg   = emoji + " " + SignalTypeName(sigType) + " SAFE" + tag
-                + " " + _Symbol
-                + " @ FIB " + FibPosLabel(fibPos)
-                + "  SL:"  + DoubleToString(sl,  _Digits)
-                + "  TP1:" + DoubleToString(tp1, _Digits)
-                + "  TP2:" + DoubleToString(tp2, _Digits)
-                + "  TP3:" + DoubleToString(tp3, _Digits);
+   string emoji  = IsBullish(sigType) ? "🟢" : "🔴";
+   string tag    = fibTag == "" ? "" : " (" + fibTag + ")";
+   string tf2str = IsBullish(g_tf2_dir) ? "BUY" : "SELL";
+
+   string msg = emoji + " " + SignalTypeName(sigType) + tag
+              + " " + _Symbol
+              + " @ FIB " + FibPosLabel(fibPos)
+              + " [" + TFName(InpTF1) + ":" + tf1Zone + " " + TFName(InpTF2) + ":" + tf2str + "]"
+              + "  SL:"  + DoubleToString(sl,  _Digits)
+              + "  TP1:" + DoubleToString(tp1, _Digits)
+              + "  TP2:" + DoubleToString(tp2, _Digits)
+              + "  TP3:" + DoubleToString(tp3, _Digits);
 
    if(InpEnablePush && !SendNotification(msg)) Print("Push failed.");
    if(InpEnablePopup) Alert(msg);
@@ -791,199 +584,161 @@ void FireConfirmedAlert(int sigType, double fibPos, string fibTag)
 }
 
 //+------------------------------------------------------------------+
-//  CheckMACross – independent EMA cross secondary signal
-//  Both EMAs on InpEMACross_TF (no cross-TF mismatch)
+//  UpdateTF2Direction – OB/OS crosses on TF2 set the market direction.
+//  Mid-zone TF2 crosses are ignored – they don't change direction.
 //+------------------------------------------------------------------+
-void CheckMACross()
+void UpdateTF2Direction()
 {
-   if(!InpEMACrossEnable) return;
-   if(g_h_ma_slow == INVALID_HANDLE || g_h_ma_fast == INVALID_HANDLE) return;
-
    datetime barTimes[3];
-   if(CopyTime(_Symbol, InpEMACross_TF, 0, 3, barTimes) < 3) return;
-   if(barTimes[1] == g_lastMACrossBar) return;
-   g_lastMACrossBar = barTimes[1];
-
-   double slow[3], fast[3];
-   if(CopyBuffer(g_h_ma_slow, 0, 0, 3, slow) < 3) return;
-   if(CopyBuffer(g_h_ma_fast, 0, 0, 3, fast) < 3) return;
-
-   bool crossUp   = (fast[2] <= slow[2]) && (fast[1] > slow[1]);
-   bool crossDown = (fast[2] >= slow[2]) && (fast[1] < slow[1]);
-   if(!crossUp && !crossDown) return;
-
-   string dir    = crossDown ? "BUY" : "SELL";
-   string emoji2 = crossDown ? "🟢" : "🔴";
-   string msg    = emoji2 + " EMA CROSS " + TFName(InpEMACross_TF) + " " + dir + " " + _Symbol;
-
-   if(InpEnablePush && !SendNotification(msg)) Print("Push failed.");
-   if(InpEnablePopup) Alert(msg);
-   if(InpEnablePrint) Print(msg);
-}
-
-//+------------------------------------------------------------------+
-//  ProcessTimeframe – bar-change gated state update
-//  Returns true if state changed (does NOT fire alerts)
-//+------------------------------------------------------------------+
-bool ProcessTimeframe(ENUM_TIMEFRAMES tf, int h_stoch,
-                      datetime &lastBar, int &state, datetime &stateBar,
-                      bool strictZones, double &crossK)
-{
-   crossK = 0.0;
-
-   datetime barTimes[3];
-   if(CopyTime(_Symbol, tf, 0, 3, barTimes) < 3) return false;
-   if(barTimes[1] == lastBar)                     return false;
-   lastBar = barTimes[1];
+   if(CopyTime(_Symbol, InpTF2, 0, 3, barTimes) < 3) return;
+   if(barTimes[1] == g_lastBar_2) return;
+   g_lastBar_2 = barTimes[1];
 
    int    kCopy = InpOSLookback + 2;
    double k_buf[];
    double d_buf[3];
    ArrayResize(k_buf, kCopy);
-   if(CopyBuffer(h_stoch, MAIN_LINE,   0, kCopy, k_buf) < kCopy) return false;
-   if(CopyBuffer(h_stoch, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return false;
+   if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   0, kCopy, k_buf) < kCopy) return;
+   if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return;
 
-   double k1 = k_buf[1], d1 = d_buf[1];  // last closed bar
-   double k2 = k_buf[2], d2 = d_buf[2];  // 2 bars ago
+   double k1 = k_buf[1], d1 = d_buf[1];
+   double k2 = k_buf[2], d2 = d_buf[2];
 
-   bool crossedUp   = (k2 <= d2) && (k1 > d1);
-   bool crossedDown = (k2 >= d2) && (k1 < d1);
-   if(!crossedUp && !crossedDown) return false;
+   bool crossUp   = (k2 <= d2) && (k1 > d1);
+   bool crossDown = (k2 >= d2) && (k1 < d1);
+   if(!crossUp && !crossDown) return;
 
-   crossK = k1;  // capture K value at the cross bar
-
-   //--- Loose mode (TF2 default): any cross sets direction
-   if(!strictZones)
-   {
-      if(crossedUp)
-      {
-         state = SIG_BUY; stateBar = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → BUY (confirm K=", DoubleToString(k1,2), " cross UP)");
-         return true;
-      }
-      if(crossedDown)
-      {
-         state = SIG_SELL; stateBar = barTimes[1];
-         Print("[STATE ", TFName(tf), "] → SELL (confirm K=", DoubleToString(k1,2), " cross DN)");
-         return true;
-      }
-      return false;
-   }
-
-   //--- Strict mode (TF1): cross must originate from OS/OB zone within lookback
-   bool recentlyOS = false, recentlyOB = false;
+   // Check OB/OS within lookback – TF2 direction only set from extremes
+   bool recentOS = false, recentOB = false;
    for(int i = 1; i < kCopy; i++)
    {
-      if(k_buf[i] <= InpOS_Level) recentlyOS = true;
-      if(k_buf[i] >= InpOB_Level) recentlyOB = true;
+      if(k_buf[i] <= InpOS_Level) recentOS = true;
+      if(k_buf[i] >= InpOB_Level) recentOB = true;
    }
 
-   if(crossedUp && recentlyOS)
+   if(crossUp && recentOS)
    {
-      state = SIG_BUY; stateBar = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → BUY from OS  K=", DoubleToString(k1,2));
-      return true;
+      g_tf2_dir = SIG_BUY;
+      Print("[TF2 DIR] → BUY from OS  K=", DoubleToString(k1, 2));
+      SaveFibState();
+      SilentWatch();
    }
-   if(crossedDown && recentlyOB)
+   else if(crossDown && recentOB)
    {
-      state = SIG_SELL; stateBar = barTimes[1];
-      Print("[STATE ", TFName(tf), "] → SELL from OB  K=", DoubleToString(k1,2));
-      return true;
+      g_tf2_dir = SIG_SELL;
+      Print("[TF2 DIR] → SELL from OB  K=", DoubleToString(k1, 2));
+      SaveFibState();
+      SilentWatch();
    }
-
-   return false;
+   else
+   {
+      Print("[TF2 MID] cross ignored K=", DoubleToString(k1, 2),
+            " (dir stays ", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"), ")");
+      SilentWatch();
+   }
 }
 
 //+------------------------------------------------------------------+
-//  CheckConfirmation – TF1 armed + TF2 agrees → fire SAFE
-//  SAFE only fires if RISKY was previously fired (fib zone passed)
+//  CheckTF1Signal – TF1 bar cross; fires when aligned with TF2 direction
+//  Any zone cross (OB / OS / mid 30-70) is valid if TF2 agrees.
+//  Signal message labels TF1 zone so user can gauge signal quality.
 //+------------------------------------------------------------------+
-void CheckConfirmation()
+void CheckTF1Signal()
 {
-   // Single TF mode: treat TF1 state as both armed and confirmed
-   if(!InpEnableTF1 || !InpEnableTF2)
+   datetime barTimes[3];
+   if(CopyTime(_Symbol, InpTF1, 0, 3, barTimes) < 3) return;
+   if(barTimes[1] == g_lastBar_1) return;
+   g_lastBar_1 = barTimes[1];
+
+   // Always emit WATCH on TF1 bar change
+   SilentWatch();
+
+   if(g_tf2_dir == SIG_NONE) return;  // no TF2 direction established yet
+
+   int    kCopy = InpOSLookback + 2;
+   double k_buf[];
+   double d_buf[3];
+   ArrayResize(k_buf, kCopy);
+   if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, kCopy, k_buf) < kCopy) return;
+   if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return;
+
+   double k1 = k_buf[1], d1 = d_buf[1];
+   double k2 = k_buf[2], d2 = d_buf[2];
+
+   bool crossUp   = (k2 <= d2) && (k1 > d1);
+   bool crossDown = (k2 >= d2) && (k1 < d1);
+   if(!crossUp && !crossDown) return;
+
+   int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
+
+   // Zone label for signal message (quality indicator only – does not block)
+   string tf1Zone;
+   if(crossUp)
+      tf1Zone = (k1 <= InpOS_Level) ? "OS" : (k1 < 30.0) ? "nearOS" : "MID";
+   else
+      tf1Zone = (k1 >= InpOB_Level) ? "OB" : (k1 > 70.0) ? "nearOB" : "MID";
+
+   Print("[TF1] ", SignalTypeName(tf1sig), " cross ", tf1Zone,
+         "  K=", DoubleToString(k1, 2),
+         "  TF2 dir=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"));
+
+   // Must align with TF2 direction
+   if(tf1sig != g_tf2_dir)
    {
-      if(InpEnableTF1 && g_state_1 != SIG_NONE && g_bar_1 != g_fired_bar_1)
+      Print("[WAIT] TF1=", SignalTypeName(tf1sig),
+            " TF2=", SignalTypeName(g_tf2_dir), " – mismatch");
+      return;
+   }
+
+   // Same-bar guard (shouldn't happen but safety check)
+   if(barTimes[1] == g_fired_bar) return;
+
+   // Fib zone gate
+   double fibPos = -1.0; string fibTag = "";
+   bool   zonePassed = false;
+
+   if(CheckFibZone(tf1sig, fibPos, fibTag))
+   {
+      zonePassed = true;
+   }
+   else
+   {
+      double levelPrice;
+      if(CheckSBRRBS(tf1sig, fibPos, fibTag, levelPrice))
       {
-         if(PassesCooldown(g_state_1, g_bar_1))
-         {
-            double fibPos; string fibTag;
-            if(CheckFibZone(g_state_1, fibPos, fibTag))
-            {
-               FireConfirmedAlert(g_state_1, fibPos, fibTag);
-               g_fired_bar_1      = g_bar_1;
-               g_lastCooldownSig  = g_state_1;
-               g_lastCooldownTime = g_bar_1;
-            }
-         }
+         if(HasRejectionCandle(IsBearish(tf1sig), levelPrice, InpTF1, InpRejectionLookback))
+            zonePassed = true;
          else
-            Print("[COOLDOWN] ", SignalTypeName(g_state_1), " blocked");
+            Print("[SBR/RBS BLOCK] No rejection candle at ",
+                  DoubleToString(levelPrice, _Digits), " for ", fibTag);
       }
-      return;
    }
 
-   if(g_state_1 == SIG_NONE || g_state_2 == SIG_NONE) return;
-
-   bool bullish = IsBullish(g_state_1) && IsBullish(g_state_2);
-   bool bearish = IsBearish(g_state_1) && IsBearish(g_state_2);
-   if(!bullish && !bearish)
+   if(!zonePassed)
    {
-      Print("[WAIT] TF1=", SignalTypeName(g_state_1),
-            " TF2=", SignalTypeName(g_state_2), " – direction mismatch");
+      // Compute live fib pos for the block log
+      double range = g_fibSwingHigh - g_fibSwingLow;
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double lp    = (range > 0) ? (price - g_fibSwingLow) / range : -1.0;
+      Print("[FIB BLOCK] ", SignalTypeName(tf1sig),
+            " blocked  fib=", DoubleToString(lp, 3),
+            " K=", DoubleToString(k1, 1));
       return;
    }
 
-   // Require BOTH TFs to have a cross newer than the last SAFE fire
-   // OR (not AND): one stale TF is enough to block – prevents re-using exhausted state
-   if(g_bar_1 == g_fired_bar_1 || g_bar_2 == g_fired_bar_2) return;
-
-   datetime confirmedTime = MathMax(g_bar_1, g_bar_2);
-   if(!PassesCooldown(g_state_1, confirmedTime))
+   // Cooldown check
+   if(!PassesCooldown(tf1sig, barTimes[1]))
    {
-      Print("[COOLDOWN] ", SignalTypeName(g_state_1), " blocked – within ", InpSignalCooldownMin, "min");
-      g_fired_bar_1 = g_bar_1;
-      g_fired_bar_2 = g_bar_2;
+      Print("[COOLDOWN] ", SignalTypeName(tf1sig), " blocked – within ", InpSignalCooldownMin, "min");
       return;
    }
 
-   // SAFE requires RISKY to have fired first (fib zone must have passed at TF1 stage)
-   if(bullish && !g_riskyBuyFired)
-   { Print("[FIB BLOCK] SAFE BUY skipped – no RISKY preceded it"); return; }
-   if(bearish && !g_riskySellFired)
-   { Print("[FIB BLOCK] SAFE SELL skipped – no RISKY preceded it"); return; }
+   // Fire
+   FireSignal(tf1sig, fibPos, fibTag, tf1Zone);
 
-   // Temporal ordering: TF2 bar must be at or after the bar that fired RISKY.
-   // Prevents a pre-existing TF2 cross from immediately confirming a fresh RISKY
-   // without waiting for genuine TF2 momentum after the TF1 signal.
-   if(g_bar_2 < g_riskyFiredBar)
-   {
-      Print("[WAIT] TF2 bar ", TimeToString(g_bar_2), " predates RISKY bar ",
-            TimeToString(g_riskyFiredBar), " – waiting for fresh TF2 cross");
-      return;
-   }
-
-   // Use the fib context stored at RISKY time – price moving after the cross is
-   // the trade working, not a reason to block SAFE
-   double fibPos = bullish ? g_riskyBuyFibPos  : g_riskySellFibPos;
-   string fibTag = bullish ? g_riskyBuyTag     : g_riskySellTag;
-   double kEntry = bullish ? g_riskyBuyK       : g_riskySellK;
-
-   Print("[SAFE CONTEXT] entry fib=", FibPosLabel(fibPos),
-         " K_at_entry=", DoubleToString(kEntry, 1),
-         " TF1 K_now=",  DoubleToString(g_liveK_1, 1),
-         " TF2 K_now=",  DoubleToString(g_liveK_2, 1));
-
-   FireConfirmedAlert(g_state_1, fibPos, fibTag);
-
-   g_fired_bar_1 = g_bar_1;
-   g_fired_bar_2 = g_bar_2;
-   g_lastCooldownSig  = g_state_1;
-   g_lastCooldownTime = confirmedTime;
-
-   // Reset risky flags and TF1 state after SAFE fires
-   if(bullish) g_riskyBuyFired  = false;
-   if(bearish) g_riskySellFired = false;
-   g_state_1 = SIG_NONE;  // clean lifecycle; SilentWatch goes idle until next TF1 cross
+   g_fired_bar        = barTimes[1];
+   g_lastCooldownSig  = tf1sig;
+   g_lastCooldownTime = barTimes[1];
 }
 
 //+------------------------------------------------------------------+
