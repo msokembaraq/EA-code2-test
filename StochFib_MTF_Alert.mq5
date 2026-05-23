@@ -63,7 +63,8 @@ input double InpSellMinK = 70.0;  // SELL cross valid only if K >= this (OB or n
 input double InpBuyMaxK  = 40.0;  // BUY  cross valid only if K <= this (OS or near-OS bounce)
 
 input group "══════ Signal Cooldown ══════"
-input int    InpSignalCooldownMin = 60;
+input int    InpSignalCooldownMin  = 60;
+input int    InpTF2DirTimeoutHrs   = 48;  // TF2 direction expires after N hours without a fresh OB/OS cross (0 = never)
 
 input group "══════ Fib Zone Filter ══════"
 input ENUM_TIMEFRAMES InpFibTF         = PERIOD_M30;
@@ -105,8 +106,9 @@ int g_h_atr     = INVALID_HANDLE;
 datetime g_lastBar_1 = 0;
 datetime g_lastBar_2 = 0;
 
-// TF2 direction – set by OB/OS crosses only; persists until opposite OB/OS cross
-int g_tf2_dir = SIG_NONE;
+// TF2 direction – set by OB/OS crosses only; expires after InpTF2DirTimeoutHrs
+int      g_tf2_dir      = SIG_NONE;
+datetime g_tf2_dir_time = 0;   // Bar time when g_tf2_dir was last set
 
 // Cooldown
 int      g_lastCooldownSig  = SIG_NONE;
@@ -135,7 +137,8 @@ double   g_pendingBreakLevel = 0.0;
 int OnInit()
 {
    g_lastBar_1 = g_lastBar_2 = 0;
-   g_tf2_dir   = SIG_NONE;
+   g_tf2_dir      = SIG_NONE;
+   g_tf2_dir_time = 0;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
    g_fibSwingHigh = g_fibSwingLow = 0.0;
@@ -339,6 +342,7 @@ void SaveFibState()
    GlobalVariableSet(GVName("OLT"), (double)g_oldLowBreakTime);
    GlobalVariableSet(GVName("TRB"), (double)g_trendBias);
    GlobalVariableSet(GVName("TD2"), (double)g_tf2_dir);
+   GlobalVariableSet(GVName("T2T"), (double)g_tf2_dir_time);
 }
 
 //+------------------------------------------------------------------+
@@ -364,13 +368,29 @@ bool LoadFibState()
    GlobalVariableGet(GVName("OLT"), olt); g_oldLowBreakTime  = (datetime)olt;
    GlobalVariableGet(GVName("TRB"), trb); g_trendBias        = (int)MathRound(trb);
    GlobalVariableGet(GVName("TD2"), td2); g_tf2_dir          = (int)MathRound(td2);
+   double t2t = 0;
+   GlobalVariableGet(GVName("T2T"), t2t); g_tf2_dir_time     = (datetime)t2t;
+
+   // Immediately expire stale direction on load (protects against terminal-restart staleness)
+   if(InpTF2DirTimeoutHrs > 0 && g_tf2_dir != SIG_NONE && g_tf2_dir_time > 0)
+   {
+      int ageSecs = (int)(TimeCurrent() - g_tf2_dir_time);
+      if(ageSecs > InpTF2DirTimeoutHrs * 3600)
+      {
+         Print("[TF2 EXPIRE on load] dir=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"),
+               " was ", ageSecs / 3600, "h old (limit ", InpTF2DirTimeoutHrs, "h) – reset to NONE");
+         g_tf2_dir      = SIG_NONE;
+         g_tf2_dir_time = 0;
+      }
+   }
 
    Print("[FIB] Restored: High=", DoubleToString(g_fibSwingHigh, _Digits),
          "  Low=",  DoubleToString(g_fibSwingLow,  _Digits),
          "  SBR:", (g_hasOldLow  ? DoubleToString(g_oldSwingLow,  _Digits) : "none"),
          "  RBS:", (g_hasOldHigh ? DoubleToString(g_oldSwingHigh, _Digits) : "none"),
          "  TrendBias:", (g_trendBias == 1 ? "UP" : g_trendBias == -1 ? "DOWN" : "none"),
-         "  TF2dir:", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"));
+         "  TF2dir:", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"),
+         (g_tf2_dir != SIG_NONE ? "  set " + IntegerToString((int)(TimeCurrent() - g_tf2_dir_time) / 3600) + "h ago" : ""));
    return true;
 }
 
@@ -757,10 +777,24 @@ void UpdateTF2Direction()
    if(barTimes[1] == g_lastBar_2) return;
    g_lastBar_2 = barTimes[1];
 
+   // Expire stale direction: if no fresh OB/OS cross in InpTF2DirTimeoutHrs, reset to NONE.
+   if(InpTF2DirTimeoutHrs > 0 && g_tf2_dir != SIG_NONE && g_tf2_dir_time > 0)
+   {
+      int ageSecs = (int)(barTimes[1] - g_tf2_dir_time);
+      if(ageSecs > InpTF2DirTimeoutHrs * 3600)
+      {
+         Print("[TF2 EXPIRE] dir=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"),
+               " expired after ", ageSecs / 3600, "h (limit ", InpTF2DirTimeoutHrs, "h) – reset to NONE");
+         g_tf2_dir      = SIG_NONE;
+         g_tf2_dir_time = 0;
+         SaveFibState();
+      }
+   }
+
    double k_buf[3];
    double d_buf[3];
    if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   0, 3, k_buf) < 3) return;
-   if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return;
+   if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 0, 3, d_buf) < 3) return;
 
    double k1 = k_buf[1], d1 = d_buf[1];
    double k2 = k_buf[2], d2 = d_buf[2];
@@ -775,14 +809,16 @@ void UpdateTF2Direction()
    if(crossDown && k1 >= InpSellMinK)
    {
       string zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";
-      g_tf2_dir = SIG_SELL;
+      g_tf2_dir      = SIG_SELL;
+      g_tf2_dir_time = barTimes[1];
       Print("[TF2 DIR] → SELL from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
    }
    else if(crossUp && k1 <= InpBuyMaxK)
    {
       string zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";
-      g_tf2_dir = SIG_BUY;
+      g_tf2_dir      = SIG_BUY;
+      g_tf2_dir_time = barTimes[1];
       Print("[TF2 DIR] → BUY from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
    }
