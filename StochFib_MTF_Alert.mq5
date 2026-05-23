@@ -61,7 +61,6 @@ input int             InpFibLookback   = 100;
 input double          InpFibBuyZoneMax  = 0.382;
 input double          InpFibSellZoneMin = 0.618;
 input double          InpSBR_Tol       = 0.05;
-input bool            InpTrendFilter   = true;
 
 input group "══════ SBR / RBS Rejection ══════"
 input double InpSBR_DeepExt       = 0.10;
@@ -190,7 +189,8 @@ void UpdateLiveK()
 //+------------------------------------------------------------------+
 void SilentWatch()
 {
-   if(!InpEnablePrint) return;
+   if(!InpEnablePrint)          return;
+   if(g_tf2_dir == SIG_NONE)   return;  // no direction established yet – nothing to watch
 
    double range  = g_fibSwingHigh - g_fibSwingLow;
    double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -375,12 +375,8 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    fibPos = (price - g_fibSwingLow) / range;
 
-   // Trend bias filter: block fib-zone signals against the last swing-break direction
-   if(InpTrendFilter && g_trendBias != 0)
-   {
-      if(IsBearish(sigType) && g_trendBias ==  1) return false; // uptrend – no fib-zone SELL
-      if(IsBullish(sigType) && g_trendBias == -1) return false; // downtrend – no fib-zone BUY
-   }
+   // No trend filter: TF2 OB/OS gate already validates structural context.
+   // Blocking here would suppress valid OB/OS-confirmed signals during trending markets.
 
    if(IsBullish(sigType))
       return (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax);
@@ -536,7 +532,11 @@ void CalcTPSL(int sigType, double entry,
              ? arr[ArrayMinimum(arr)]
              : entry - InpSLFallback * _Point;
       risk = entry - sl;
-      if(risk <= 0) risk = InpSLFallback * _Point;
+      if(risk <= 0)
+      {
+         Print("[SL WARN] BUY SL at or above entry – using fallback ", InpSLFallback, " pts");
+         risk = InpSLFallback * _Point;
+      }
       tp1 = entry + risk * InpTP1_RR;
       tp2 = entry + risk * InpTP2_RR;
       tp3 = entry + risk * InpTP3_RR;
@@ -547,7 +547,11 @@ void CalcTPSL(int sigType, double entry,
              ? arr[ArrayMaximum(arr)]
              : entry + InpSLFallback * _Point;
       risk = sl - entry;
-      if(risk <= 0) risk = InpSLFallback * _Point;
+      if(risk <= 0)
+      {
+         Print("[SL WARN] SELL SL at or below entry – using fallback ", InpSLFallback, " pts");
+         risk = InpSLFallback * _Point;
+      }
       tp1 = entry - risk * InpTP1_RR;
       tp2 = entry - risk * InpTP2_RR;
       tp3 = entry - risk * InpTP3_RR;
