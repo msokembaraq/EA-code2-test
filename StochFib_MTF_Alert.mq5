@@ -89,6 +89,8 @@ bool g_touchedOB = false;
 bool g_alertedOB = false;   // fired once when K enters OB zone
 bool g_alertedOS = false;   // fired once when K enters OS zone
 
+int g_momLockDir = SIG_NONE; // locked after MOM signal; blocks opposite until K exits zone
+
 //+------------------------------------------------------------------+
 //  OnInit
 //+------------------------------------------------------------------+
@@ -99,10 +101,11 @@ int OnInit()
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
    g_liveK_1 = g_liveK_2 = 0.0;
-   g_touchedOS = false;
-   g_touchedOB = false;
-   g_alertedOB = false;
-   g_alertedOS = false;
+   g_touchedOS  = false;
+   g_touchedOB  = false;
+   g_alertedOB  = false;
+   g_alertedOS  = false;
+   g_momLockDir = SIG_NONE;
 
    g_h_stoch_1 = iStochastic(_Symbol, InpTF1,
                               InpStoch_K, InpStoch_D, InpStoch_Slow,
@@ -171,6 +174,10 @@ void UpdateLiveK()
       // Reset memory when cycle completes
       if(g_liveK_1 > 50.0) g_touchedOS = false;
       if(g_liveK_1 < 50.0) g_touchedOB = false;
+
+      // Clear MOM lock once K exits the locked zone
+      if(g_momLockDir == SIG_BUY  && g_liveK_1 < InpSellZoneLo) g_momLockDir = SIG_NONE;
+      if(g_momLockDir == SIG_SELL && g_liveK_1 > InpBuyZoneHi)  g_momLockDir = SIG_NONE;
    }
 
    if(InpEnableTF2 && g_h_stoch_2 != INVALID_HANDLE)
@@ -455,6 +462,17 @@ void CheckTF1Signal()
    }
 
    // ════════════════════════════════════════════════
+   //  MOM LOCK: block opposite direction until K exits zone
+   // ════════════════════════════════════════════════
+   if(g_momLockDir != SIG_NONE && tf1sig != g_momLockDir)
+   {
+      if(InpEnablePrint)
+         Print("[MOM LOCK] ", SignalTypeName(tf1sig), " blocked – MOM ",
+               SignalTypeName(g_momLockDir), " active, K=", DoubleToString(k_now,1));
+      return;
+   }
+
+   // ════════════════════════════════════════════════
    //  DUAL-TF AGREEMENT
    // ════════════════════════════════════════════════
    bool isMomentum = (StringFind(label, "MOM") >= 0);
@@ -502,7 +520,8 @@ void CheckTF1Signal()
    }
    else
    {
-      // MOM consumes the touch so the opposite reversal can't fire immediately
+      // MOM: lock direction + consume touch
+      g_momLockDir = tf1sig;
       if(tf1sig == SIG_BUY)  g_touchedOB = false;
       if(tf1sig == SIG_SELL) g_touchedOS = false;
    }
