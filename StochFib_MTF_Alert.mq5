@@ -215,18 +215,18 @@ void UpdateLiveK()
 
 //+------------------------------------------------------------------+
 //  GetTF2LiveBias – real-time TF2 directional state, no stored memory.
-//  Reads the last closed TF2 bar's K and D; returns live bias.
-//  SELL: K < D (K crossed below D) AND K >= InpSellMinK (in valid SELL zone)
-//  BUY:  K > D (K crossed above D) AND K <= InpBuyMaxK  (in valid BUY zone)
-//  NONE: mid-zone or K/D alignment contradicts zone – direction unclear
+//  Reads the last closed TF2 bar K and D; returns K/D alignment direction.
+//  K < D → SELL bias  |  K > D → BUY bias  |  K == D → NONE
+//  No zone filter here – zone filter is applied on the TF1 side.
+//  OB/OS stuck protection is handled separately by InpOBStuckLevel.
 //+------------------------------------------------------------------+
 int GetTF2LiveBias()
 {
    double k[1], d[1];
    if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   1, 1, k) < 1) return SIG_NONE;
    if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 1, 1, d) < 1) return SIG_NONE;
-   if(k[0] < d[0] && k[0] >= InpSellMinK) return SIG_SELL;
-   if(k[0] > d[0] && k[0] <= InpBuyMaxK)  return SIG_BUY;
+   if(k[0] < d[0]) return SIG_SELL;
+   if(k[0] > d[0]) return SIG_BUY;
    return SIG_NONE;
 }
 
