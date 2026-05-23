@@ -694,20 +694,19 @@ void UpdateTF2Direction()
    bool crossDown = (k2 >= d2) && (k1 < d1);
    if(!crossUp && !crossDown) return;
 
-   // Zone filter: OB/near-OB reversal OR OS continuation (momentum carry-through)
-   bool sellValid = (k1 >= InpSellMinK) || (k1 <= InpOS_Level);
-   bool buyValid  = (k1 <= InpBuyMaxK)  || (k1 >= InpOB_Level);
-
-   if(crossDown && sellValid)
+   // TF2 direction: reversal crosses only (OB/near-OB for SELL, OS/near-OS for BUY).
+   // OB cont (crossUp K>80) and OS cont (crossDown K<20) are excluded –
+   // they cause rapid direction flips when price grinds in extremes.
+   if(crossDown && k1 >= InpSellMinK)
    {
-      string zone = (k1 >= InpOB_Level) ? "OB" : (k1 >= InpSellMinK ? "nearOB" : "OS cont");
+      string zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";
       g_tf2_dir = SIG_SELL;
       Print("[TF2 DIR] → SELL from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
    }
-   else if(crossUp && buyValid)
+   else if(crossUp && k1 <= InpBuyMaxK)
    {
-      string zone = (k1 <= InpOS_Level) ? "OS" : (k1 <= InpBuyMaxK ? "nearOS" : "OB cont");
+      string zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";
       g_tf2_dir = SIG_BUY;
       Print("[TF2 DIR] → BUY from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
@@ -802,6 +801,10 @@ void CheckTF1Signal()
    if(!InpFibZoneEnable)
    {
       zonePassed = true;  // pure stochastic mode – K/D cross + TF2 agreement is enough
+   }
+   else if(tf1Zone == "OS cont" || tf1Zone == "OB cont")
+   {
+      zonePassed = true;  // momentum continuation – price in extreme, fib zone not applicable
    }
    else if(CheckFibZone(tf1sig, fibPos, fibTag))
    {
