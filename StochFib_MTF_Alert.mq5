@@ -1,18 +1,23 @@
 //+------------------------------------------------------------------+
 //|                   StochFib_MTF_Alert.mq5                         |
-//|  Dual-TF Stochastic + Dynamic Fib Zone Gate                      |
-//|  v2.0  – TF2 sets direction (OB/OS), TF1 triggers (any zone)    |
+//|  Dual-TF Stochastic + Fib Zone / SBR-RBS Gate                   |
+//|  v2.1                                                            |
 //|                                                                  |
 //|  SIGNAL LOGIC:                                                   |
-//|   TF2 (slow): K/D cross from OB → SELL direction                |
-//|               K/D cross from OS → BUY  direction                |
-//|               Mid-zone TF2 crosses are ignored                   |
-//|   TF1 (fast): K/D cross in any zone (OB / OS / mid 30-70)      |
-//|               Fires if TF1 direction == TF2 direction            |
-//|               + price in fib zone or SBR/RBS level              |
+//|   TF2 (slow): K/D cross in OB/OS or near-zone sets direction    |
+//|               Mid-zone (40-70) TF2 crosses are ignored           |
+//|   TF1 (fast): K/D cross valid if K>=InpSellMinK / K<=InpBuyMaxK |
+//|               Fires only when TF1 direction == TF2 direction     |
 //|                                                                  |
-//|  SBR tag: price near old swing low after break (was support)     |
-//|  RBS tag: price near old swing high after break (was resistance) |
+//|  PRICE GATE (when InpFibZoneEnable=true):                        |
+//|   Primary : price within fib 0–0.382 (BUY) / 0.618–∞ (SELL)   |
+//|   Fallback: SBR/RBS level ± 0.25×ATR with rejection candle      |
+//|             Level expires after InpRetestWindow TF1 bars         |
+//|  PRICE GATE (when InpFibZoneEnable=false):                       |
+//|   Pure stochastic – K/D cross + TF2 agreement only              |
+//|                                                                  |
+//|  SBR: broken swing low retested as resistance → SELL             |
+//|  RBS: broken swing high retested as support   → BUY             |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
 #property version     "2.00"
@@ -247,7 +252,8 @@ bool IsBearish(int s) { return s == SIG_SELL; }
 //+------------------------------------------------------------------+
 string GVName(string suffix)
 {
-   return "SF_" + _Symbol + "_" + TFName(InpFibTF) + "_" + suffix;
+   return "SF_" + _Symbol + "_" + TFName(InpFibTF)
+          + "_K" + IntegerToString(InpStoch_K) + "_" + suffix;
 }
 
 //+------------------------------------------------------------------+
@@ -447,8 +453,13 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
    {
       if(g_oldLowBreakTime > 0 && (curTime - g_oldLowBreakTime) > windowSecs)
       {
-         Print("[SBR STALE] ", (int)((curTime - g_oldLowBreakTime) / PeriodSeconds(InpTF1)),
-               " bars since break – window=", InpRetestWindow);
+         Print("[SBR STALE] Expired after ",
+               (int)((curTime - g_oldLowBreakTime) / PeriodSeconds(InpTF1)),
+               " bars – clearing");
+         g_hasOldLow       = false;
+         g_oldSwingLow     = 0.0;
+         g_oldLowBreakTime = 0;
+         SaveFibState();
       }
       else
       {
@@ -471,8 +482,13 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
    {
       if(g_oldHighBreakTime > 0 && (curTime - g_oldHighBreakTime) > windowSecs)
       {
-         Print("[RBS STALE] ", (int)((curTime - g_oldHighBreakTime) / PeriodSeconds(InpTF1)),
-               " bars since break – window=", InpRetestWindow);
+         Print("[RBS STALE] Expired after ",
+               (int)((curTime - g_oldHighBreakTime) / PeriodSeconds(InpTF1)),
+               " bars – clearing");
+         g_hasOldHigh       = false;
+         g_oldSwingHigh     = 0.0;
+         g_oldHighBreakTime = 0;
+         SaveFibState();
       }
       else
       {
@@ -506,9 +522,14 @@ bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int
    if(CopyClose(_Symbol, tf, 1, lookback, closes) < lookback) return false;
 
    double atrBuf[1];
-   double priceTol = (CopyBuffer(g_h_atr, 0, 1, 1, atrBuf) == 1 && atrBuf[0] > 0)
-                     ? 0.25 * atrBuf[0]
-                     : MathAbs(levelPrice) * 0.001;   // fallback 0.1% of price
+   double priceTol;
+   if(CopyBuffer(g_h_atr, 0, 1, 1, atrBuf) == 1 && atrBuf[0] > 0)
+      priceTol = 0.25 * atrBuf[0];
+   else
+   {
+      Print("[ATR WARN] CopyBuffer failed in HasRejectionCandle – using price fallback");
+      priceTol = MathAbs(levelPrice) * 0.001;
+   }
 
    for(int i = 0; i < lookback; i++)
    {
@@ -680,7 +701,6 @@ void UpdateTF2Direction()
       g_tf2_dir = SIG_SELL;
       Print("[TF2 DIR] → SELL from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
-      SilentWatch();
    }
    else if(crossUp && k1 <= InpBuyMaxK)
    {
@@ -688,7 +708,6 @@ void UpdateTF2Direction()
       g_tf2_dir = SIG_BUY;
       Print("[TF2 DIR] → BUY from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
-      SilentWatch();
    }
    else
    {
