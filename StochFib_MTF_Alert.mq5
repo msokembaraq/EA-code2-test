@@ -122,10 +122,11 @@ datetime g_fibBar       = 0;
 // Live K – silent tracking
 double g_liveK_1 = 0.0, g_liveK_2 = 0.0;
 
-// Swing break pending confirmation
+// Swing break: pending retest setup state
 int      g_pendingBreakDir   = SIG_NONE;
 datetime g_pendingBreakTime  = 0;
 double   g_pendingBreakLevel = 0.0;
+bool     g_retestArmed       = false;   // true after N-bar hold; waiting for price to return + reject
 
 //+------------------------------------------------------------------+
 //  OnInit
@@ -142,9 +143,10 @@ int OnInit()
    g_trendBias        = 0;
    g_fibBar           = 0;
    g_liveK_1          = g_liveK_2        = 0.0;
-   g_pendingBreakDir  = SIG_NONE;
-   g_pendingBreakTime = 0;
-   g_pendingBreakLevel= 0.0;
+   g_pendingBreakDir   = SIG_NONE;
+   g_pendingBreakTime  = 0;
+   g_pendingBreakLevel = 0.0;
+   g_retestArmed       = false;
 
    LoadFibState();
 
@@ -251,13 +253,15 @@ void SilentWatch()
 }
 
 //+------------------------------------------------------------------+
-//  CheckSwingBreakConfirm – fire alert once N FibTF bars have held
-//  after a swing break; cancels silently if price recovers.
+//  CheckSwingBreakArm – confirm swing break after N-bar hold then arm
+//  the retest setup. Sends an informational alert only – the trade
+//  signal fires later when price returns and shows a rejection candle.
 //+------------------------------------------------------------------+
-void CheckSwingBreakConfirm()
+void CheckSwingBreakArm()
 {
    if(!InpSwingBreakEnable)          return;
    if(g_pendingBreakDir == SIG_NONE) return;
+   if(g_retestArmed)                 return;  // already armed
 
    datetime barTimes[2];
    if(CopyTime(_Symbol, InpFibTF, 0, 2, barTimes) < 2) return;
@@ -270,36 +274,72 @@ void CheckSwingBreakConfirm()
    if(CopyClose(_Symbol, InpFibTF, 1, 1, cls) < 1) return;
    double closePrice = cls[0];
 
-   // Cancel if price has recovered back through the broken level
+   // Cancel if price has already recovered back through the broken level
    if(g_pendingBreakDir == SIG_SELL && closePrice >= g_pendingBreakLevel)
    {
-      Print("[SWING BREAK CANCEL] SELL – price recovered above ",
-            DoubleToString(g_pendingBreakLevel, _Digits));
+      Print("[SETUP CANCEL] SELL – price recovered above ", DoubleToString(g_pendingBreakLevel, _Digits));
       g_pendingBreakDir = SIG_NONE; g_pendingBreakTime = 0;
       return;
    }
    if(g_pendingBreakDir == SIG_BUY && closePrice <= g_pendingBreakLevel)
    {
-      Print("[SWING BREAK CANCEL] BUY – price recovered below ",
-            DoubleToString(g_pendingBreakLevel, _Digits));
+      Print("[SETUP CANCEL] BUY – price recovered below ", DoubleToString(g_pendingBreakLevel, _Digits));
       g_pendingBreakDir = SIG_NONE; g_pendingBreakTime = 0;
       return;
    }
 
-   string dir   = (g_pendingBreakDir == SIG_BUY) ? "BUY"  : "SELL";
-   string emoji = (g_pendingBreakDir == SIG_BUY) ? "🔵"   : "🟠";
-   string msg   = emoji + " " + dir + " SWING BREAK"
-                + "  " + _Symbol
-                + "  Level:" + DoubleToString(g_pendingBreakLevel, _Digits)
-                + "  Close:" + DoubleToString(closePrice, _Digits)
-                + "  [" + IntegerToString(barsSince) + "bar hold on " + TFName(InpFibTF) + "]";
+   // Break confirmed and held – arm the retest setup
+   g_retestArmed = true;
+
+   string dir = (g_pendingBreakDir == SIG_BUY) ? "BUY" : "SELL";
+   string msg = "⏳ " + dir + " RETEST SETUP ARMED"
+              + "  " + _Symbol
+              + "  Level:" + DoubleToString(g_pendingBreakLevel, _Digits)
+              + "  [" + IntegerToString(barsSince) + "bar hold]"
+              + "  waiting for retest + rejection";
+
+   if(InpEnablePush  && !SendNotification(msg)) Print("Push failed.");
+   if(InpEnablePopup) Alert(msg);
+   if(InpEnablePrint) Print(msg);
+}
+
+//+------------------------------------------------------------------+
+//  CheckRetestExpiry – fire SETUP FAILED when price never returns to
+//  the broken level within the retest window.
+//+------------------------------------------------------------------+
+void CheckRetestExpiry()
+{
+   if(g_pendingBreakDir == SIG_NONE) return;
+   if(!g_retestArmed)                return;
+
+   datetime fibTimes[1];
+   datetime curTime = (CopyTime(_Symbol, InpFibTF, 1, 1, fibTimes) == 1)
+                      ? fibTimes[0] : TimeCurrent();
+   int windowSecs = InpRetestWindow * (int)PeriodSeconds(InpFibTF);
+   if((int)(curTime - g_pendingBreakTime) <= windowSecs) return;
+
+   // Window expired without a retest – cancel the setup
+   string dir = (g_pendingBreakDir == SIG_BUY) ? "BUY" : "SELL";
+   string msg = "❌ SETUP FAILED: " + dir
+              + "  " + _Symbol
+              + "  Level:" + DoubleToString(g_pendingBreakLevel, _Digits)
+              + "  no retest in " + IntegerToString(InpRetestWindow)
+              + " " + TFName(InpFibTF) + " bars";
 
    if(InpEnablePush  && !SendNotification(msg)) Print("Push failed.");
    if(InpEnablePopup) Alert(msg);
    if(InpEnablePrint) Print(msg);
 
+   // Clear pending state – also clear the corresponding old-level so SBR/RBS won't re-fire
+   if(g_pendingBreakDir == SIG_BUY)
+   { g_hasOldHigh = false; g_oldSwingHigh = 0.0; g_oldHighBreakTime = 0; }
+   else
+   { g_hasOldLow  = false; g_oldSwingLow  = 0.0; g_oldLowBreakTime  = 0; }
+
    g_pendingBreakDir  = SIG_NONE;
    g_pendingBreakTime = 0;
+   g_retestArmed      = false;
+   SaveFibState();
 }
 
 //+------------------------------------------------------------------+
@@ -308,7 +348,8 @@ void CheckSwingBreakConfirm()
 void CheckAllTimeframes()
 {
    UpdateFibSwing();
-   CheckSwingBreakConfirm();
+   CheckSwingBreakArm();
+   CheckRetestExpiry();
    UpdateLiveK();
    CheckTF1Signal();
 }
@@ -809,6 +850,9 @@ void CheckTF1Signal()
          FireSignal(tf1sig, sbrPos, sbrTag, "");
          g_lastCooldownSig  = tf1sig;
          g_lastCooldownTime = barTimes[1];
+         // Retest successful – clear pending setup so SETUP FAILED won't fire later
+         if(tf1sig == g_pendingBreakDir)
+         { g_pendingBreakDir = SIG_NONE; g_pendingBreakTime = 0; g_retestArmed = false; }
          return;
       }
       else if(InpEnablePrint)
