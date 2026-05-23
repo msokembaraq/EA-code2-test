@@ -53,8 +53,10 @@ input int    InpStoch_D2    = 3;
 input int    InpStoch_Slow2 = 9;
 
 input group "══════ OB / OS Levels ══════"
-input double InpOB_Level   = 80.0;
-input double InpOS_Level   = 20.0;
+input double InpOB_Level     = 80.0;
+input double InpOS_Level     = 20.0;
+input double InpOBStuckLevel = 90.0;  // Block signals when TF2 K >= this (price grinding OB – wait for retrace)
+input double InpOSStuckLevel = 10.0;  // Block signals when TF2 K <= this (price grinding OS – wait for retrace)
 
 input group "══════ Cross Zone Filter (both TFs) ══════"
 input double InpSellMinK = 70.0;  // SELL cross valid only if K >= this (OB or near-OB pullback)
@@ -828,8 +830,10 @@ void CheckTF1Signal()
    {
       bool tf2Compatible = (tf1sig == SIG_BUY) ? (g_tf2_dir != SIG_SELL)
                                                 : (g_tf2_dir != SIG_BUY);
+      bool tf2NotStuck   = (tf1sig == SIG_SELL) ? (g_liveK_2 < InpOBStuckLevel)
+                                                 : (g_liveK_2 > InpOSStuckLevel);
       double sbrPos = -1.0; string sbrTag = ""; double sbrLevel = 0.0;
-      if(tf2Compatible
+      if(tf2Compatible && tf2NotStuck
          && CheckSBRRBS(tf1sig, sbrPos, sbrTag, sbrLevel)
          && HasRejectionCandle(IsBearish(tf1sig), sbrLevel, InpTF1, InpRejectionLookback)
          && PassesCooldown(tf1sig, barTimes[1]))
@@ -843,10 +847,16 @@ void CheckTF1Signal()
          g_lastCooldownTime = barTimes[1];
          return;  // one signal per bar
       }
-      else if(!tf2Compatible && InpEnablePrint)
+      else if(InpEnablePrint)
       {
-         Print("[SBR/RBS SKIP] TF2 actively opposes: tf1sig=", SignalTypeName(tf1sig),
-               " TF2=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"));
+         if(!tf2Compatible)
+            Print("[SBR/RBS SKIP] TF2 actively opposes: tf1sig=", SignalTypeName(tf1sig),
+                  " TF2=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"));
+         else if(!tf2NotStuck)
+            Print("[SBR/RBS SKIP] TF2 K stuck: tf1sig=", SignalTypeName(tf1sig),
+                  " TF2 K=", DoubleToString(g_liveK_2, 1),
+                  (tf1sig == SIG_SELL ? " >= " : " <= "),
+                  (tf1sig == SIG_SELL ? InpOBStuckLevel : InpOSStuckLevel));
       }
    }
 
@@ -888,6 +898,21 @@ void CheckTF1Signal()
    {
       Print("[WAIT] TF1=", SignalTypeName(tf1sig),
             " TF2=", SignalTypeName(g_tf2_dir), " – mismatch");
+      return;
+   }
+
+   // Stuck OB/OS: TF2 K is grinding at extreme – market is trending, not reversing.
+   // Block and wait for K to retrace below InpOBStuckLevel / above InpOSStuckLevel.
+   if(tf1sig == SIG_SELL && g_liveK_2 >= InpOBStuckLevel)
+   {
+      Print("[OB STUCK] SELL blocked – TF2 K=", DoubleToString(g_liveK_2, 1),
+            " >= ", InpOBStuckLevel, "  wait for retrace");
+      return;
+   }
+   if(tf1sig == SIG_BUY && g_liveK_2 <= InpOSStuckLevel)
+   {
+      Print("[OS STUCK] BUY blocked – TF2 K=", DoubleToString(g_liveK_2, 1),
+            " <= ", InpOSStuckLevel, "  wait for retrace");
       return;
    }
 
