@@ -67,6 +67,7 @@ input group "══════ Fib Zone Filter ══════"
 input ENUM_TIMEFRAMES InpFibTF         = PERIOD_M30;
 input int             InpFibLookback   = 50;
 input bool            InpFibZoneEnable  = true;   // Enable fib zone gate for entries
+input bool            InpFibGateOnStoch = false;  // Also require fib zone when TF1+TF2 stoch agree (default off)
 input double          InpFibBuyZoneMax  = 0.382;
 input double          InpFibSellZoneMin = 0.618;
 
@@ -888,48 +889,26 @@ void CheckTF1Signal()
       return;
    }
 
-   // Fib zone gate
+   // Fib zone gate – optional on stoch path. Off by default (InpFibGateOnStoch=false):
+   // TF1+TF2 stoch agreement is sufficient; structural trades use the independent SBR/RBS path.
+   // Enable InpFibGateOnStoch=true to also require price to be in a fib zone here.
    double fibPos = -1.0; string fibTag = "";
-   bool   zonePassed = false;
-
-   if(!InpFibZoneEnable)
+   if(InpFibZoneEnable && InpFibGateOnStoch)
    {
-      zonePassed = true;  // pure stochastic mode – K/D cross + TF2 agreement is enough
-   }
-   else if(tf1Zone == "OS cont" || tf1Zone == "OB cont")
-   {
-      zonePassed = true;  // momentum continuation – price in extreme, fib zone not applicable
-   }
-   else if(CheckFibZone(tf1sig, fibPos, fibTag))
-   {
-      zonePassed = true;
-   }
-   else
-   {
-      double levelPrice;
-      if(CheckSBRRBS(tf1sig, fibPos, fibTag, levelPrice))
+      bool zonePassed = (tf1Zone == "OS cont" || tf1Zone == "OB cont")
+                        || CheckFibZone(tf1sig, fibPos, fibTag);
+      if(!zonePassed)
       {
-         if(HasRejectionCandle(IsBearish(tf1sig), levelPrice, InpTF1, InpRejectionLookback))
-            zonePassed = true;
-         else
-            Print("[SBR/RBS BLOCK] No rejection candle at ",
-                  DoubleToString(levelPrice, _Digits), " for ", fibTag);
+         double range = g_fibSwingHigh - g_fibSwingLow;
+         double lp    = (range > 0)
+                        ? (SymbolInfoDouble(_Symbol, SYMBOL_BID) - g_fibSwingLow) / range
+                        : -1.0;
+         Print("[FIB BLOCK] ", SignalTypeName(tf1sig),
+               " blocked  fib=", DoubleToString(lp, 3), " K=", DoubleToString(k1, 1));
+         return;
       }
    }
 
-   if(!zonePassed)
-   {
-      // Compute live fib pos for the block log
-      double range = g_fibSwingHigh - g_fibSwingLow;
-      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double lp    = (range > 0) ? (price - g_fibSwingLow) / range : -1.0;
-      Print("[FIB BLOCK] ", SignalTypeName(tf1sig),
-            " blocked  fib=", DoubleToString(lp, 3),
-            " K=", DoubleToString(k1, 1));
-      return;
-   }
-
-   // Fire
    FireSignal(tf1sig, fibPos, fibTag, tf1Zone);
 
    g_lastCooldownSig  = tf1sig;
