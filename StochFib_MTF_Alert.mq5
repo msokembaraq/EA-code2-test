@@ -75,9 +75,8 @@ input bool InpEnablePrint = true;
 int g_h_stoch_1 = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
 
-datetime g_lastBar_1       = 0;
-datetime g_lastMomentumBar = 0;   // prevent momentum spam on same bar
-datetime g_lastBlockedBar  = 0;   // prevent blocked-log spam on same bar
+datetime g_lastBar_1        = 0;
+datetime g_lastZoneAlertBar = 0;
 
 int      g_lastCooldownSig  = SIG_NONE;
 datetime g_lastCooldownTime = 0;
@@ -95,9 +94,8 @@ bool g_alertedOS = false;   // fired once when K enters OS zone
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   g_lastBar_1       = 0;
-   g_lastMomentumBar = 0;
-   g_lastBlockedBar  = 0;
+   g_lastBar_1        = 0;
+   g_lastZoneAlertBar = 0;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
    g_liveK_1 = g_liveK_2 = 0.0;
@@ -227,38 +225,47 @@ void SilentWatch()
 }
 
 //+------------------------------------------------------------------+
-//  CheckZoneEntry – alert once on OB/OS entry, reset on exit
+//  CheckZoneEntry – alert once per bar when closed bar K enters OB/OS
 //+------------------------------------------------------------------+
 void CheckZoneEntry()
 {
+   datetime barTimes[2];
+   if(CopyTime(_Symbol, InpTF1, 0, 2, barTimes) < 2) return;
+   if(barTimes[1] == g_lastZoneAlertBar) return;
+   g_lastZoneAlertBar = barTimes[1];
+
+   double k[1];
+   if(CopyBuffer(g_h_stoch_1, MAIN_LINE, 1, 1, k) < 1) return;
+   double k1 = k[0];
+
    // OB entry
-   if(g_liveK_1 >= InpOB_Level)
+   if(k1 >= InpOB_Level)
    {
       if(!g_alertedOB)
       {
          string msg = "⚠️ OB ZONE  " + _Symbol + "  " + TFName(InpTF1)
-                    + "  K=" + DoubleToString(g_liveK_1, 1);
+                    + "  K=" + DoubleToString(k1, 1);
          if(InpEnablePrint) Print(msg);
          if(InpEnablePush)  SendNotification(msg);
          g_alertedOB = true;
       }
    }
-   else if(g_liveK_1 < InpOB_Level - 2.0)
+   else
       g_alertedOB = false;
 
    // OS entry
-   if(g_liveK_1 <= InpOS_Level)
+   if(k1 <= InpOS_Level)
    {
       if(!g_alertedOS)
       {
          string msg = "⚠️ OS ZONE  " + _Symbol + "  " + TFName(InpTF1)
-                    + "  K=" + DoubleToString(g_liveK_1, 1);
+                    + "  K=" + DoubleToString(k1, 1);
          if(InpEnablePrint) Print(msg);
          if(InpEnablePush)  SendNotification(msg);
          g_alertedOS = true;
       }
    }
-   else if(g_liveK_1 > InpOS_Level + 2.0)
+   else
       g_alertedOS = false;
 }
 
@@ -365,7 +372,12 @@ void CheckTF1Signal()
    datetime barTimes[3];
    if(CopyTime(_Symbol, InpTF1, 0, 3, barTimes) < 3) return;
 
-   // ── TF1 K/D data ──
+   // ── Bar guard at top: each closed bar evaluated exactly once ──
+   if(barTimes[1] == g_lastBar_1) return;
+   g_lastBar_1 = barTimes[1];
+
+   SilentWatch();
+
    double k_buf[3], d_buf[3];
    if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, 3, k_buf) < 3) return;
    if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3, d_buf) < 3) return;
@@ -375,38 +387,27 @@ void CheckTF1Signal()
 
    bool crossUp   = (k_prev <= d_prev) && (k_now > d_now);
    bool crossDown = (k_prev >= d_prev) && (k_now < d_now);
+   if(!crossUp && !crossDown) return;
 
-   // ── TF2 (if enabled) ──
+   int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
+   string label       = "";
+   string blockReason = "";
+
    int tf2Strength = 0;
    int tf2Bias = SIG_NONE;
    if(InpEnableTF2) tf2Bias = GetTF2LiveBias(tf2Strength);
 
-   int    tf1sig      = SIG_NONE;
-   string label       = "";
-   string blockReason = "";
-
    // ════════════════════════════════════════════════
-   //  MOMENTUM SIGNALS (no cross needed, each bar)
+   //  MOM: cross while inside OB / OS zone
    // ════════════════════════════════════════════════
-   if(k_now <= InpOS_Level && k_now > d_now)
-   {
-      tf1sig = SIG_BUY;
-      label  = "BUY MOM";
-   }
-   else if(k_now >= InpOB_Level && k_now < d_now)
-   {
-      tf1sig = SIG_SELL;
-      label  = "SELL MOM";
-   }
+   if(crossUp   && k_now >= InpOB_Level) label = "BUY MOM";
+   else if(crossDown && k_now <= InpOS_Level) label = "SELL MOM";
 
    // ════════════════════════════════════════════════
    //  CROSS-BASED SIGNALS
    // ════════════════════════════════════════════════
-   if(tf1sig == SIG_NONE && (crossUp || crossDown))
+   if(label == "")
    {
-      tf1sig = crossUp ? SIG_BUY : SIG_SELL;
-
-      // Relaxed zone when TF2 on correct side
       bool relaxed = false;
       if(InpEnableTF2 && tf2Bias != SIG_NONE)
       {
@@ -416,88 +417,47 @@ void CheckTF1Signal()
 
       if(tf1sig == SIG_BUY)
       {
-         // BUY: OS touched + recovered above 15 + cross in 15-30
          if(g_touchedOS && k_now > InpOS_Recover && k_now >= InpBuyZoneLo && k_now <= InpBuyZoneHi)
-         {
             label = "BUY";
-         }
-         // BUY AGAIN: cross in 10-30 (no OS touch needed for continuation)
          else if(k_now >= InpBuyZoneLo && k_now <= InpBuyZoneHi)
-         {
             label = "BUY AGAIN";
-         }
-         // Relaxed: any cross up with K <= 50
          else if(relaxed && k_now <= 50.0 && k_now > InpOS_Recover)
-         {
             label = "BUY AGAIN";
-         }
          else
          {
-            if(k_now < InpBuyZoneLo)   blockReason = "K=" + DoubleToString(k_now,1) + " too low (<" + DoubleToString(InpBuyZoneLo,0) + ")";
+            if(k_now < InpBuyZoneLo)            blockReason = "K=" + DoubleToString(k_now,1) + " too low (<"  + DoubleToString(InpBuyZoneLo,0)  + ")";
             else if(k_now > InpBuyZoneHi && !relaxed) blockReason = "K=" + DoubleToString(k_now,1) + " too high (>" + DoubleToString(InpBuyZoneHi,0) + ") no OS recovery";
-            else if(!g_touchedOS && k_now <= InpOS_Recover) blockReason = "OS not touched, K still <= " + DoubleToString(InpOS_Recover,0);
             else blockReason = "no BUY zone match";
          }
       }
-      else // SELL
+      else
       {
-         // SELL: OB touched + rejected below 90 + cross down in 80-90
          if(g_touchedOB && k_now < InpOB_Reject && k_now >= InpSellZoneLo && k_now <= InpSellZoneHi)
-         {
             label = "SELL";
-         }
-         // SELL AGAIN: cross down in 80-90 (no OB touch needed for continuation)
          else if(k_now >= InpSellZoneLo && k_now <= InpSellZoneHi)
-         {
             label = "SELL AGAIN";
-         }
-         // Relaxed: any cross down with K >= 50
          else if(relaxed && k_now >= 50.0 && k_now < InpOB_Reject)
-         {
             label = "SELL AGAIN";
-         }
          else
          {
-            if(k_now > InpSellZoneHi)    blockReason = "K=" + DoubleToString(k_now,1) + " too high (>" + DoubleToString(InpSellZoneHi,0) + ")";
-            else if(k_now < InpSellZoneLo && !relaxed) blockReason = "K=" + DoubleToString(k_now,1) + " too low (<" + DoubleToString(InpSellZoneLo,0) + ") no OB rejection";
-            else if(!g_touchedOB && k_now >= InpOB_Reject) blockReason = "OB not touched, K still >= " + DoubleToString(InpOB_Reject,0);
+            if(k_now > InpSellZoneHi)             blockReason = "K=" + DoubleToString(k_now,1) + " too high (>" + DoubleToString(InpSellZoneHi,0) + ")";
+            else if(k_now < InpSellZoneLo && !relaxed) blockReason = "K=" + DoubleToString(k_now,1) + " too low (<"  + DoubleToString(InpSellZoneLo,0) + ") no OB rejection";
             else blockReason = "no SELL zone match";
          }
       }
    }
 
-   // ════════════════════════════════════════════════
-   //  NO VALID SIGNAL
-   // ════════════════════════════════════════════════
-   if(tf1sig == SIG_NONE || label == "")
+   if(label == "")
    {
-      if(InpEnablePrint && (crossUp || crossDown) && blockReason != "" && barTimes[1] != g_lastBlockedBar)
-      {
+      if(InpEnablePrint && blockReason != "")
          Print("[BLOCKED] ", crossUp ? "BUY" : "SELL", " cross K=", DoubleToString(k_now,1), " – ", blockReason);
-         g_lastBlockedBar = barTimes[1];
-      }
       return;
    }
 
    // ════════════════════════════════════════════════
-   //  MOMENTUM: only fire once per bar
-   // ════════════════════════════════════════════════
-   bool isMomentum = (StringFind(label, "MOM") >= 0);
-   if(isMomentum)
-   {
-      if(barTimes[1] == g_lastMomentumBar) return;
-   }
-
-   // ════════════════════════════════════════════════
-   //  BAR GUARD (non-momentum)
-   // ════════════════════════════════════════════════
-   if(!isMomentum && barTimes[1] == g_lastBar_1) return;
-
-   SilentWatch();
-
-   // ════════════════════════════════════════════════
    //  DUAL-TF AGREEMENT
    // ════════════════════════════════════════════════
+   bool isMomentum = (StringFind(label, "MOM") >= 0);
    if(InpEnableTF2)
    {
       if(tf2Bias == SIG_NONE)
@@ -510,13 +470,12 @@ void CheckTF1Signal()
          if(InpEnablePrint) Print("[WAIT] TF1=", SignalTypeName(tf1sig), " TF2=", SignalTypeName(tf2Bias), " – no agreement");
          return;
       }
-      // Append AGAIN if TF2 mid-zone and not already AGAIN/MOM
-      if(tf2Strength == 0 && StringFind(label, "AGAIN") < 0 && StringFind(label, "MOM") < 0)
+      if(tf2Strength == 0 && StringFind(label, "AGAIN") < 0 && !isMomentum)
          label = label + " AGAIN";
    }
 
    // ════════════════════════════════════════════════
-   //  COOLDOWN (skip for momentum)
+   //  COOLDOWN (skip for MOM)
    // ════════════════════════════════════════════════
    if(!isMomentum && !PassesCooldown(tf1sig, barTimes[1]))
    {
@@ -534,15 +493,10 @@ void CheckTF1Signal()
 
    FireSignal(tf1sig, label);
 
-   // Update guards
-   if(isMomentum)
-      g_lastMomentumBar = barTimes[1];
-   else
+   if(!isMomentum)
    {
-      g_lastBar_1 = barTimes[1];
       g_lastCooldownSig  = tf1sig;
       g_lastCooldownTime = barTimes[1];
-      // Reset touch memory after firing recovery signal
       if(label == "BUY")  g_touchedOS = false;
       if(label == "SELL") g_touchedOB = false;
    }
