@@ -715,7 +715,11 @@ void CheckTF1Signal()
    double fibPos = -1.0; string fibTag = "";
    bool   zonePassed = false;
 
-   if(InpFibZoneEnable && CheckFibZone(tf1sig, fibPos, fibTag))
+   if(!InpFibZoneEnable)
+   {
+      zonePassed = true;  // pure stochastic mode – K/D cross + TF2 agreement is enough
+   }
+   else if(CheckFibZone(tf1sig, fibPos, fibTag))
    {
       zonePassed = true;
    }
