@@ -77,6 +77,7 @@ int g_h_stoch_2 = INVALID_HANDLE;
 
 datetime g_lastBar_1       = 0;
 datetime g_lastMomentumBar = 0;   // prevent momentum spam on same bar
+datetime g_lastBlockedBar  = 0;   // prevent blocked-log spam on same bar
 
 int      g_lastCooldownSig  = SIG_NONE;
 datetime g_lastCooldownTime = 0;
@@ -96,6 +97,7 @@ int OnInit()
 {
    g_lastBar_1       = 0;
    g_lastMomentumBar = 0;
+   g_lastBlockedBar  = 0;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
    g_liveK_1 = g_liveK_2 = 0.0;
@@ -469,8 +471,11 @@ void CheckTF1Signal()
    // ════════════════════════════════════════════════
    if(tf1sig == SIG_NONE || label == "")
    {
-      if(InpEnablePrint && (crossUp || crossDown) && blockReason != "")
+      if(InpEnablePrint && (crossUp || crossDown) && blockReason != "" && barTimes[1] != g_lastBlockedBar)
+      {
          Print("[BLOCKED] ", crossUp ? "BUY" : "SELL", " cross K=", DoubleToString(k_now,1), " – ", blockReason);
+         g_lastBlockedBar = barTimes[1];
+      }
       return;
    }
 
