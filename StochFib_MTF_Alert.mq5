@@ -50,7 +50,6 @@ input int    InpStoch_Slow2 = 9;
 input group "══════ OB / OS Levels ══════"
 input double InpOB_Level   = 80.0;
 input double InpOS_Level   = 20.0;
-input int    InpOSLookback = 20;   // bars to scan for OB/OS touch on both TFs
 
 input group "══════ Cross Zone Filter (both TFs) ══════"
 input double InpSellMinK = 70.0;  // SELL cross valid only if K >= this (OB or near-OB pullback)
@@ -100,7 +99,6 @@ int g_tf2_dir = SIG_NONE;
 // Cooldown
 int      g_lastCooldownSig  = SIG_NONE;
 datetime g_lastCooldownTime = 0;
-datetime g_fired_bar        = 0;   // last TF1 bar that fired a signal
 
 // Fib anchor
 double   g_fibSwingHigh = 0.0, g_fibSwingLow  = 0.0;
@@ -121,7 +119,6 @@ int OnInit()
    g_tf2_dir   = SIG_NONE;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
-   g_fired_bar        = 0;
    g_fibSwingHigh = g_fibSwingLow = 0.0;
    g_oldSwingHigh = g_oldSwingLow = 0.0;
    g_hasOldHigh   = g_hasOldLow  = false;
@@ -332,31 +329,41 @@ void UpdateFibSwing()
    if(CopyClose(_Symbol, InpFibTF, 1, 1, cls) < 1) return;
    double close = cls[0];
 
-   // Swing LOW broken → old low becomes SBR; rescan both anchors
+   // Swing LOW broken → old low becomes SBR; invalidate stale RBS; rescan both anchors
    if(close < g_fibSwingLow)
    {
-      g_oldSwingLow = g_fibSwingLow;
-      g_hasOldLow   = true;
-      g_trendBias   = -1;
+      g_oldSwingLow  = g_fibSwingLow;
+      g_hasOldLow    = true;
+      g_hasOldHigh   = false;   // bearish breakout invalidates prior RBS level
+      g_oldSwingHigh = 0.0;
+      g_trendBias    = -1;
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
+      double newRange = g_fibSwingHigh - g_fibSwingLow;
+      if(newRange < 10 * _Point)
+      { Print("[FIB WARN] Post-break range degenerate – skipping re-anchor"); return; }
       Print("[FIB] Swing LOW broken → range=[", DoubleToString(g_fibSwingLow, _Digits),
             ",", DoubleToString(g_fibSwingHigh, _Digits), "]",
             "  SBR level=", DoubleToString(g_oldSwingLow, _Digits));
       SaveFibState();
    }
-   // Swing HIGH broken → old high becomes RBS; rescan both anchors
+   // Swing HIGH broken → old high becomes RBS; invalidate stale SBR; rescan both anchors
    else if(close > g_fibSwingHigh)
    {
       g_oldSwingHigh = g_fibSwingHigh;
       g_hasOldHigh   = true;
+      g_hasOldLow    = false;   // bullish breakout invalidates prior SBR level
+      g_oldSwingLow  = 0.0;
       g_trendBias    = +1;
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
       if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
+      double newRange = g_fibSwingHigh - g_fibSwingLow;
+      if(newRange < 10 * _Point)
+      { Print("[FIB WARN] Post-break range degenerate – skipping re-anchor"); return; }
       Print("[FIB] Swing HIGH broken → range=[", DoubleToString(g_fibSwingLow, _Digits),
             ",", DoubleToString(g_fibSwingHigh, _Digits), "]",
             "  RBS level=", DoubleToString(g_oldSwingHigh, _Digits));
@@ -386,7 +393,7 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
    if(IsBullish(sigType))
       return (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax);
    else
-      return (fibPos >= InpFibSellZoneMin && fibPos <= 1.0);
+      return (fibPos >= InpFibSellZoneMin);  // allow > 1.0 (price extended above swing high)
 }
 
 //+------------------------------------------------------------------+
@@ -569,7 +576,9 @@ void CalcTPSL(int sigType, double entry,
 //+------------------------------------------------------------------+
 void FireSignal(int sigType, double fibPos, string fibTag, string tf1Zone = "")
 {
-   double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double entry = (sigType == SIG_BUY)
+                  ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl, tp1, tp2, tp3;
    CalcTPSL(sigType, entry, sl, tp1, tp2, tp3);
 
@@ -602,11 +611,9 @@ void UpdateTF2Direction()
    if(barTimes[1] == g_lastBar_2) return;
    g_lastBar_2 = barTimes[1];
 
-   int    kCopy = InpOSLookback + 2;
-   double k_buf[];
+   double k_buf[3];
    double d_buf[3];
-   ArrayResize(k_buf, kCopy);
-   if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   0, kCopy, k_buf) < kCopy) return;
+   if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   0, 3, k_buf) < 3) return;
    if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return;
 
    double k1 = k_buf[1], d1 = d_buf[1];
@@ -657,11 +664,9 @@ void CheckTF1Signal()
 
    if(g_tf2_dir == SIG_NONE) return;  // no TF2 direction established yet
 
-   int    kCopy = InpOSLookback + 2;
-   double k_buf[];
+   double k_buf[3];
    double d_buf[3];
-   ArrayResize(k_buf, kCopy);
-   if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, kCopy, k_buf) < kCopy) return;
+   if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, 3, k_buf) < 3) return;
    if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return;
 
    double k1 = k_buf[1], d1 = d_buf[1];
@@ -707,9 +712,6 @@ void CheckTF1Signal()
             " TF2=", SignalTypeName(g_tf2_dir), " – mismatch");
       return;
    }
-
-   // Same-bar guard (shouldn't happen but safety check)
-   if(barTimes[1] == g_fired_bar) return;
 
    // Fib zone gate
    double fibPos = -1.0; string fibTag = "";
@@ -758,7 +760,6 @@ void CheckTF1Signal()
    // Fire
    FireSignal(tf1sig, fibPos, fibTag, tf1Zone);
 
-   g_fired_bar        = barTimes[1];
    g_lastCooldownSig  = tf1sig;
    g_lastCooldownTime = barTimes[1];
 }
