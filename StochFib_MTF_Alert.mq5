@@ -61,7 +61,7 @@ input int    InpSignalCooldownMin = 60;
 
 input group "══════ Fib Zone Filter ══════"
 input ENUM_TIMEFRAMES InpFibTF         = PERIOD_M30;
-input int             InpFibLookback   = 100;
+input int             InpFibLookback   = 50;
 input bool            InpFibZoneEnable  = true;   // Enable fib zone gate for entries
 input double          InpFibBuyZoneMax  = 0.382;
 input double          InpFibSellZoneMin = 0.618;
