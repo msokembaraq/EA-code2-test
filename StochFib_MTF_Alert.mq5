@@ -401,16 +401,19 @@ bool CheckFibZone(int sigType, double &fibPos, string &fibTag)
 //  SBR: SELL only – price testing old swing low (broken support → resistance)
 //  RBS: BUY  only – price testing old swing high (broken resistance → support)
 //+------------------------------------------------------------------+
-bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelPrice)
+bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPrice)
 {
    fibPos = -1.0; roleTag = ""; levelPrice = 0.0;
 
    double range = g_fibSwingHigh - g_fibSwingLow;
    if(range <= 0.0) return false;
 
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double cls[1];
+   double price = (CopyClose(_Symbol, InpTF1, 1, 1, cls) == 1)
+                  ? cls[0]
+                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   if(IsBearish(stochState) && g_hasOldLow)
+   if(IsBearish(sigType) && g_hasOldLow)
    {
       double zoneLo = g_oldSwingLow - InpSBR_Tol     * range;
       double zoneHi = g_oldSwingLow + InpSBR_DeepExt * range;
@@ -426,7 +429,7 @@ bool CheckSBRRBS(int stochState, double &fibPos, string &roleTag, double &levelP
       }
    }
 
-   if(IsBullish(stochState) && g_hasOldHigh)
+   if(IsBullish(sigType) && g_hasOldHigh)
    {
       double zoneLo = g_oldSwingHigh - InpRBS_DeepExt * range;
       double zoneHi = g_oldSwingHigh + InpSBR_Tol     * range;
@@ -535,7 +538,6 @@ void CalcTPSL(int sigType, double entry,
               double &sl, double &tp1, double &tp2, double &tp3)
 {
    double arr[];
-   ArrayResize(arr, InpSLLookback);
    double risk;
 
    if(IsBullish(sigType))
@@ -713,6 +715,13 @@ void CheckTF1Signal()
       return;
    }
 
+   // Cooldown check – before any fib/SBR computation
+   if(!PassesCooldown(tf1sig, barTimes[1]))
+   {
+      Print("[COOLDOWN] ", SignalTypeName(tf1sig), " blocked – within ", InpSignalCooldownMin, "min");
+      return;
+   }
+
    // Fib zone gate
    double fibPos = -1.0; string fibTag = "";
    bool   zonePassed = false;
@@ -747,13 +756,6 @@ void CheckTF1Signal()
       Print("[FIB BLOCK] ", SignalTypeName(tf1sig),
             " blocked  fib=", DoubleToString(lp, 3),
             " K=", DoubleToString(k1, 1));
-      return;
-   }
-
-   // Cooldown check
-   if(!PassesCooldown(tf1sig, barTimes[1]))
-   {
-      Print("[COOLDOWN] ", SignalTypeName(tf1sig), " blocked – within ", InpSignalCooldownMin, "min");
       return;
    }
 
