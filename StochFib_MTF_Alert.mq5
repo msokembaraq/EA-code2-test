@@ -500,6 +500,12 @@ void CheckTF1Signal()
       if(label == "BUY")  g_touchedOS = false;
       if(label == "SELL") g_touchedOB = false;
    }
+   else
+   {
+      // MOM consumes the touch so the opposite reversal can't fire immediately
+      if(tf1sig == SIG_BUY)  g_touchedOB = false;
+      if(tf1sig == SIG_SELL) g_touchedOS = false;
+   }
 }
 
 //+------------------------------------------------------------------+
