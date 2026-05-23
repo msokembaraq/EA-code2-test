@@ -694,17 +694,20 @@ void UpdateTF2Direction()
    bool crossDown = (k2 >= d2) && (k1 < d1);
    if(!crossUp && !crossDown) return;
 
-   // Same zone filter as TF1: K value at cross must be in OB/OS or valid near-zone
-   if(crossDown && k1 >= InpSellMinK)
+   // Zone filter: OB/near-OB reversal OR OS continuation (momentum carry-through)
+   bool sellValid = (k1 >= InpSellMinK) || (k1 <= InpOS_Level);
+   bool buyValid  = (k1 <= InpBuyMaxK)  || (k1 >= InpOB_Level);
+
+   if(crossDown && sellValid)
    {
-      string zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";
+      string zone = (k1 >= InpOB_Level) ? "OB" : (k1 >= InpSellMinK ? "nearOB" : "OS cont");
       g_tf2_dir = SIG_SELL;
       Print("[TF2 DIR] → SELL from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
    }
-   else if(crossUp && k1 <= InpBuyMaxK)
+   else if(crossUp && buyValid)
    {
-      string zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";
+      string zone = (k1 <= InpOS_Level) ? "OS" : (k1 <= InpBuyMaxK ? "nearOS" : "OB cont");
       g_tf2_dir = SIG_BUY;
       Print("[TF2 DIR] → BUY from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
@@ -747,28 +750,31 @@ void CheckTF1Signal()
 
    int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
 
-   // TF1 zone filter: block crosses in the 40-70 noise band
-   // SELL valid: K >= InpTF1SellMinK (e.g. 70 – near-OB or OB)
-   // BUY  valid: K <= InpTF1BuyMaxK  (e.g. 40 – near-OS or OS)
-   if(tf1sig == SIG_SELL && k1 < InpSellMinK)
+   // TF1 zone filter: block mid-zone (InpBuyMaxK – InpSellMinK) crosses
+   // SELL valid: K >= InpSellMinK (OB/near-OB reversal) OR K <= InpOS_Level (OS continuation)
+   // BUY  valid: K <= InpBuyMaxK  (OS/near-OS bounce)   OR K >= InpOB_Level (OB continuation)
+   bool tf1SellOk = (k1 >= InpSellMinK) || (k1 <= InpOS_Level);
+   bool tf1BuyOk  = (k1 <= InpBuyMaxK)  || (k1 >= InpOB_Level);
+
+   if(tf1sig == SIG_SELL && !tf1SellOk)
    {
       Print("[TF1 NOISE] SELL cross K=", DoubleToString(k1, 1),
-            " < ", InpSellMinK, " – ignored");
+            " in noise band (", InpOS_Level, "–", InpSellMinK, ") – ignored");
       return;
    }
-   if(tf1sig == SIG_BUY && k1 > InpBuyMaxK)
+   if(tf1sig == SIG_BUY && !tf1BuyOk)
    {
       Print("[TF1 NOISE] BUY cross K=", DoubleToString(k1, 1),
-            " > ", InpBuyMaxK, " – ignored");
+            " in noise band (", InpBuyMaxK, "–", InpOB_Level, ") – ignored");
       return;
    }
 
    // Zone label for signal quality context in message
    string tf1Zone;
    if(crossUp)
-      tf1Zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";   // BUY: OS or 20-40 near-OS
+      tf1Zone = (k1 <= InpOS_Level) ? "OS" : (k1 <= InpBuyMaxK ? "nearOS" : "OB cont");
    else
-      tf1Zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";   // SELL: OB or 70-80 near-OB
+      tf1Zone = (k1 >= InpOB_Level) ? "OB" : (k1 >= InpSellMinK ? "nearOB" : "OS cont");
 
    Print("[TF1] ", SignalTypeName(tf1sig), " cross ", tf1Zone,
          "  K=", DoubleToString(k1, 2),
