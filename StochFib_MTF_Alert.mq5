@@ -86,6 +86,9 @@ double g_liveK_1 = 0.0, g_liveK_2 = 0.0;
 bool g_touchedOS = false;
 bool g_touchedOB = false;
 
+bool g_alertedOB = false;   // fired once when K enters OB zone
+bool g_alertedOS = false;   // fired once when K enters OS zone
+
 //+------------------------------------------------------------------+
 //  OnInit
 //+------------------------------------------------------------------+
@@ -98,6 +101,8 @@ int OnInit()
    g_liveK_1 = g_liveK_2 = 0.0;
    g_touchedOS = false;
    g_touchedOB = false;
+   g_alertedOB = false;
+   g_alertedOS = false;
 
    g_h_stoch_1 = iStochastic(_Symbol, InpTF1,
                               InpStoch_K, InpStoch_D, InpStoch_Slow,
@@ -220,11 +225,48 @@ void SilentWatch()
 }
 
 //+------------------------------------------------------------------+
+//  CheckZoneEntry – alert once on OB/OS entry, reset on exit
+//+------------------------------------------------------------------+
+void CheckZoneEntry()
+{
+   // OB entry
+   if(g_liveK_1 >= InpOB_Level)
+   {
+      if(!g_alertedOB)
+      {
+         string msg = "⚠️ OB ZONE  " + _Symbol + "  " + TFName(InpTF1)
+                    + "  K=" + DoubleToString(g_liveK_1, 1);
+         if(InpEnablePrint) Print(msg);
+         if(InpEnablePush)  SendNotification(msg);
+         g_alertedOB = true;
+      }
+   }
+   else
+      g_alertedOB = false;
+
+   // OS entry
+   if(g_liveK_1 <= InpOS_Level)
+   {
+      if(!g_alertedOS)
+      {
+         string msg = "⚠️ OS ZONE  " + _Symbol + "  " + TFName(InpTF1)
+                    + "  K=" + DoubleToString(g_liveK_1, 1);
+         if(InpEnablePrint) Print(msg);
+         if(InpEnablePush)  SendNotification(msg);
+         g_alertedOS = true;
+      }
+   }
+   else
+      g_alertedOS = false;
+}
+
+//+------------------------------------------------------------------+
 //  CheckAllTimeframes
 //+------------------------------------------------------------------+
 void CheckAllTimeframes()
 {
    UpdateLiveK();
+   CheckZoneEntry();
    CheckTF1Signal();
 }
 
