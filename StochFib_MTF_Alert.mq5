@@ -243,7 +243,7 @@ void CheckZoneEntry()
          g_alertedOB = true;
       }
    }
-   else
+   else if(g_liveK_1 < InpOB_Level - 2.0)
       g_alertedOB = false;
 
    // OS entry
@@ -258,7 +258,7 @@ void CheckZoneEntry()
          g_alertedOS = true;
       }
    }
-   else
+   else if(g_liveK_1 > InpOS_Level + 2.0)
       g_alertedOS = false;
 }
 
