@@ -64,11 +64,10 @@ input int             InpFibLookback   = 50;
 input bool            InpFibZoneEnable  = true;   // Enable fib zone gate for entries
 input double          InpFibBuyZoneMax  = 0.382;
 input double          InpFibSellZoneMin = 0.618;
-input double          InpSBR_Tol       = 0.05;
 
 input group "══════ SBR / RBS Rejection ══════"
-input double InpSBR_DeepExt       = 0.10;
-input double InpRBS_DeepExt       = 0.10;
+input int    InpRetestWindow      = 50;   // Max TF1 bars after break to accept retest
+input int    InpATRPeriod         = 14;   // ATR period for zone width (0.25 × ATR)
 input int    InpRejectionLookback = 5;
 
 input group "══════ TP / SL Targets ══════"
@@ -88,6 +87,7 @@ input bool InpEnablePrint = true;
 //════════════════════════════════════════════════════════════════════
 int g_h_stoch_1 = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
+int g_h_atr     = INVALID_HANDLE;
 
 // TF bar guards
 datetime g_lastBar_1 = 0;
@@ -104,6 +104,8 @@ datetime g_lastCooldownTime = 0;
 double   g_fibSwingHigh = 0.0, g_fibSwingLow  = 0.0;
 double   g_oldSwingHigh = 0.0, g_oldSwingLow  = 0.0;
 bool     g_hasOldHigh   = false, g_hasOldLow  = false;
+datetime g_oldLowBreakTime  = 0;   // FibTF bar time when swing LOW was broken
+datetime g_oldHighBreakTime = 0;   // FibTF bar time when swing HIGH was broken
 int      g_trendBias    = 0;   // +1=uptrend, -1=downtrend
 datetime g_fibBar       = 0;
 
@@ -121,10 +123,11 @@ int OnInit()
    g_lastCooldownTime = 0;
    g_fibSwingHigh = g_fibSwingLow = 0.0;
    g_oldSwingHigh = g_oldSwingLow = 0.0;
-   g_hasOldHigh   = g_hasOldLow  = false;
-   g_trendBias    = 0;
-   g_fibBar       = 0;
-   g_liveK_1      = g_liveK_2    = 0.0;
+   g_hasOldHigh       = g_hasOldLow      = false;
+   g_oldLowBreakTime  = g_oldHighBreakTime = 0;
+   g_trendBias        = 0;
+   g_fibBar           = 0;
+   g_liveK_1          = g_liveK_2        = 0.0;
 
    LoadFibState();
 
@@ -139,6 +142,10 @@ int OnInit()
                               MODE_SMA, STO_LOWHIGH);
    if(g_h_stoch_2 == INVALID_HANDLE)
    { Alert("StochFib: Failed Stoch TF2 handle"); return INIT_FAILED; }
+
+   g_h_atr = iATR(_Symbol, InpTF1, InpATRPeriod);
+   if(g_h_atr == INVALID_HANDLE)
+   { Alert("StochFib: Failed ATR handle"); return INIT_FAILED; }
 
    EventSetTimer(2);
 
@@ -159,6 +166,7 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(g_h_stoch_1 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_1);
    if(g_h_stoch_2 != INVALID_HANDLE) IndicatorRelease(g_h_stoch_2);
+   if(g_h_atr     != INVALID_HANDLE) IndicatorRelease(g_h_atr);
 }
 
 //+------------------------------------------------------------------+
@@ -253,6 +261,8 @@ void SaveFibState()
    GlobalVariableSet(GVName("OSL"), g_oldSwingLow);
    GlobalVariableSet(GVName("HOH"), g_hasOldHigh ? 1.0 : 0.0);
    GlobalVariableSet(GVName("HOL"), g_hasOldLow  ? 1.0 : 0.0);
+   GlobalVariableSet(GVName("OHT"), (double)g_oldHighBreakTime);
+   GlobalVariableSet(GVName("OLT"), (double)g_oldLowBreakTime);
    GlobalVariableSet(GVName("TRB"), (double)g_trendBias);
    GlobalVariableSet(GVName("TD2"), (double)g_tf2_dir);
 }
@@ -273,10 +283,13 @@ bool LoadFibState()
    double osh = 0, osl = 0, hoh = 0, hol = 0, trb = 0, td2 = 0;
    GlobalVariableGet(GVName("OSH"), osh); g_oldSwingHigh = osh;
    GlobalVariableGet(GVName("OSL"), osl); g_oldSwingLow  = osl;
-   GlobalVariableGet(GVName("HOH"), hoh); g_hasOldHigh   = (hoh > 0.5);
-   GlobalVariableGet(GVName("HOL"), hol); g_hasOldLow    = (hol > 0.5);
-   GlobalVariableGet(GVName("TRB"), trb); g_trendBias    = (int)MathRound(trb);
-   GlobalVariableGet(GVName("TD2"), td2); g_tf2_dir      = (int)MathRound(td2);
+   GlobalVariableGet(GVName("HOH"), hoh); g_hasOldHigh       = (hoh > 0.5);
+   GlobalVariableGet(GVName("HOL"), hol); g_hasOldLow        = (hol > 0.5);
+   double oht = 0, olt = 0;
+   GlobalVariableGet(GVName("OHT"), oht); g_oldHighBreakTime = (datetime)oht;
+   GlobalVariableGet(GVName("OLT"), olt); g_oldLowBreakTime  = (datetime)olt;
+   GlobalVariableGet(GVName("TRB"), trb); g_trendBias        = (int)MathRound(trb);
+   GlobalVariableGet(GVName("TD2"), td2); g_tf2_dir          = (int)MathRound(td2);
 
    Print("[FIB] Restored: High=", DoubleToString(g_fibSwingHigh, _Digits),
          "  Low=",  DoubleToString(g_fibSwingLow,  _Digits),
@@ -332,11 +345,14 @@ void UpdateFibSwing()
    // Swing LOW broken → old low becomes SBR; invalidate stale RBS; rescan both anchors
    if(close < g_fibSwingLow)
    {
-      g_oldSwingLow  = g_fibSwingLow;
-      g_hasOldLow    = true;
-      g_hasOldHigh   = false;   // bearish breakout invalidates prior RBS level
-      g_oldSwingHigh = 0.0;
-      g_trendBias    = -1;
+      g_oldSwingLow      = g_fibSwingLow;
+      g_hasOldLow        = true;
+      g_hasOldHigh       = false;   // bearish breakout invalidates prior RBS level
+      g_oldSwingHigh     = 0.0;
+      g_oldHighBreakTime = 0;
+      g_trendBias        = -1;
+      datetime bTimes[1];
+      if(CopyTime(_Symbol, InpFibTF, 1, 1, bTimes) == 1) g_oldLowBreakTime = bTimes[0];
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       if(loIdx >= 0) g_fibSwingLow  = iLow (_Symbol, InpFibTF, loIdx);
@@ -352,11 +368,14 @@ void UpdateFibSwing()
    // Swing HIGH broken → old high becomes RBS; invalidate stale SBR; rescan both anchors
    else if(close > g_fibSwingHigh)
    {
-      g_oldSwingHigh = g_fibSwingHigh;
-      g_hasOldHigh   = true;
-      g_hasOldLow    = false;   // bullish breakout invalidates prior SBR level
-      g_oldSwingLow  = 0.0;
-      g_trendBias    = +1;
+      g_oldSwingHigh    = g_fibSwingHigh;
+      g_hasOldHigh      = true;
+      g_hasOldLow       = false;   // bullish breakout invalidates prior SBR level
+      g_oldSwingLow     = 0.0;
+      g_oldLowBreakTime = 0;
+      g_trendBias       = +1;
+      datetime bTimes[1];
+      if(CopyTime(_Symbol, InpFibTF, 1, 1, bTimes) == 1) g_oldHighBreakTime = bTimes[0];
       int hiIdx = iHighest(_Symbol, InpFibTF, MODE_HIGH, InpFibLookback, 1);
       int loIdx = iLowest (_Symbol, InpFibTF, MODE_LOW,  InpFibLookback, 1);
       if(hiIdx >= 0) g_fibSwingHigh = iHigh(_Symbol, InpFibTF, hiIdx);
@@ -408,6 +427,17 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
    double range = g_fibSwingHigh - g_fibSwingLow;
    if(range <= 0.0) return false;
 
+   // ATR-based zone half-width
+   double atrBuf[1];
+   if(CopyBuffer(g_h_atr, 0, 1, 1, atrBuf) < 1 || atrBuf[0] <= 0) return false;
+   double zoneHalf = 0.25 * atrBuf[0];
+
+   // Last closed TF1 bar time – used for retest window
+   datetime tf1Times[1];
+   datetime curTime = (CopyTime(_Symbol, InpTF1, 1, 1, tf1Times) == 1)
+                      ? tf1Times[0] : TimeCurrent();
+   int windowSecs = InpRetestWindow * (int)PeriodSeconds(InpTF1);
+
    double cls[1];
    double price = (CopyClose(_Symbol, InpTF1, 1, 1, cls) == 1)
                   ? cls[0]
@@ -415,33 +445,49 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
 
    if(IsBearish(sigType) && g_hasOldLow)
    {
-      double zoneLo = g_oldSwingLow - InpSBR_Tol     * range;
-      double zoneHi = g_oldSwingLow + InpSBR_DeepExt * range;
-      if(price >= zoneLo && price <= zoneHi)
+      if(g_oldLowBreakTime > 0 && (curTime - g_oldLowBreakTime) > windowSecs)
       {
-         fibPos     = (price - g_fibSwingLow) / range;
-         roleTag    = "SBR";
-         levelPrice = g_oldSwingLow;
-         Print("[SBR] price=", DoubleToString(price, _Digits),
-               " zone=[", DoubleToString(zoneLo, _Digits), ",", DoubleToString(zoneHi, _Digits), "]",
-               " fibPos=", DoubleToString(fibPos, 3));
-         return true;
+         Print("[SBR STALE] ", (int)((curTime - g_oldLowBreakTime) / PeriodSeconds(InpTF1)),
+               " bars since break – window=", InpRetestWindow);
+      }
+      else
+      {
+         double zoneLo = g_oldSwingLow - zoneHalf;
+         double zoneHi = g_oldSwingLow + zoneHalf;
+         if(price >= zoneLo && price <= zoneHi)
+         {
+            fibPos     = (price - g_fibSwingLow) / range;
+            roleTag    = "SBR";
+            levelPrice = g_oldSwingLow;
+            Print("[SBR] price=", DoubleToString(price, _Digits),
+                  " zone=[", DoubleToString(zoneLo, _Digits), ",", DoubleToString(zoneHi, _Digits), "]",
+                  " fibPos=", DoubleToString(fibPos, 3));
+            return true;
+         }
       }
    }
 
    if(IsBullish(sigType) && g_hasOldHigh)
    {
-      double zoneLo = g_oldSwingHigh - InpRBS_DeepExt * range;
-      double zoneHi = g_oldSwingHigh + InpSBR_Tol     * range;
-      if(price >= zoneLo && price <= zoneHi)
+      if(g_oldHighBreakTime > 0 && (curTime - g_oldHighBreakTime) > windowSecs)
       {
-         fibPos     = (price - g_fibSwingLow) / range;
-         roleTag    = "RBS";
-         levelPrice = g_oldSwingHigh;
-         Print("[RBS] price=", DoubleToString(price, _Digits),
-               " zone=[", DoubleToString(zoneLo, _Digits), ",", DoubleToString(zoneHi, _Digits), "]",
-               " fibPos=", DoubleToString(fibPos, 3));
-         return true;
+         Print("[RBS STALE] ", (int)((curTime - g_oldHighBreakTime) / PeriodSeconds(InpTF1)),
+               " bars since break – window=", InpRetestWindow);
+      }
+      else
+      {
+         double zoneLo = g_oldSwingHigh - zoneHalf;
+         double zoneHi = g_oldSwingHigh + zoneHalf;
+         if(price >= zoneLo && price <= zoneHi)
+         {
+            fibPos     = (price - g_fibSwingLow) / range;
+            roleTag    = "RBS";
+            levelPrice = g_oldSwingHigh;
+            Print("[RBS] price=", DoubleToString(price, _Digits),
+                  " zone=[", DoubleToString(zoneLo, _Digits), ",", DoubleToString(zoneHi, _Digits), "]",
+                  " fibPos=", DoubleToString(fibPos, 3));
+            return true;
+         }
       }
    }
 
@@ -459,8 +505,10 @@ bool HasRejectionCandle(bool bearish, double levelPrice, ENUM_TIMEFRAMES tf, int
    if(CopyLow  (_Symbol, tf, 1, lookback, lows)   < lookback) return false;
    if(CopyClose(_Symbol, tf, 1, lookback, closes) < lookback) return false;
 
-   double range    = g_fibSwingHigh - g_fibSwingLow;
-   double priceTol = InpSBR_Tol * range;
+   double atrBuf[1];
+   double priceTol = (CopyBuffer(g_h_atr, 0, 1, 1, atrBuf) == 1 && atrBuf[0] > 0)
+                     ? 0.25 * atrBuf[0]
+                     : MathAbs(levelPrice) * 0.001;   // fallback 0.1% of price
 
    for(int i = 0; i < lookback; i++)
    {
