@@ -75,6 +75,10 @@ input int    InpRetestWindow      = 50;   // Max TF1 bars after break to accept 
 input int    InpATRPeriod         = 14;   // ATR period for zone width (0.25 × ATR)
 input int    InpRejectionLookback = 5;
 
+input group "══════ Swing Break Signal ══════"
+input bool   InpSwingBreakEnable = true;  // Fire BUY/SELL SWING BREAK alert on swing break
+input int    InpSwingBreakBars   = 1;     // FibTF bars to hold after break before alerting (0=immediate)
+
 input group "══════ TP / SL Targets ══════"
 input int    InpSLLookback  = 20;
 input int    InpSLFallback  = 500;
@@ -117,6 +121,11 @@ datetime g_fibBar       = 0;
 // Live K – silent tracking
 double g_liveK_1 = 0.0, g_liveK_2 = 0.0;
 
+// Swing break pending confirmation
+int      g_pendingBreakDir   = SIG_NONE;
+datetime g_pendingBreakTime  = 0;
+double   g_pendingBreakLevel = 0.0;
+
 //+------------------------------------------------------------------+
 //  OnInit
 //+------------------------------------------------------------------+
@@ -133,6 +142,9 @@ int OnInit()
    g_trendBias        = 0;
    g_fibBar           = 0;
    g_liveK_1          = g_liveK_2        = 0.0;
+   g_pendingBreakDir  = SIG_NONE;
+   g_pendingBreakTime = 0;
+   g_pendingBreakLevel= 0.0;
 
    LoadFibState();
 
@@ -222,11 +234,64 @@ void SilentWatch()
 }
 
 //+------------------------------------------------------------------+
+//  CheckSwingBreakConfirm – fire alert once N FibTF bars have held
+//  after a swing break; cancels silently if price recovers.
+//+------------------------------------------------------------------+
+void CheckSwingBreakConfirm()
+{
+   if(!InpSwingBreakEnable)          return;
+   if(g_pendingBreakDir == SIG_NONE) return;
+
+   datetime barTimes[2];
+   if(CopyTime(_Symbol, InpFibTF, 0, 2, barTimes) < 2) return;
+   datetime curBar = barTimes[1];
+
+   int barsSince = (int)MathRound((double)(curBar - g_pendingBreakTime) / PeriodSeconds(InpFibTF));
+   if(barsSince < InpSwingBreakBars) return;
+
+   double cls[1];
+   if(CopyClose(_Symbol, InpFibTF, 1, 1, cls) < 1) return;
+   double closePrice = cls[0];
+
+   // Cancel if price has recovered back through the broken level
+   if(g_pendingBreakDir == SIG_SELL && closePrice >= g_pendingBreakLevel)
+   {
+      Print("[SWING BREAK CANCEL] SELL – price recovered above ",
+            DoubleToString(g_pendingBreakLevel, _Digits));
+      g_pendingBreakDir = SIG_NONE; g_pendingBreakTime = 0;
+      return;
+   }
+   if(g_pendingBreakDir == SIG_BUY && closePrice <= g_pendingBreakLevel)
+   {
+      Print("[SWING BREAK CANCEL] BUY – price recovered below ",
+            DoubleToString(g_pendingBreakLevel, _Digits));
+      g_pendingBreakDir = SIG_NONE; g_pendingBreakTime = 0;
+      return;
+   }
+
+   string dir   = (g_pendingBreakDir == SIG_BUY) ? "BUY"  : "SELL";
+   string emoji = (g_pendingBreakDir == SIG_BUY) ? "🔵"   : "🟠";
+   string msg   = emoji + " " + dir + " SWING BREAK"
+                + "  " + _Symbol
+                + "  Level:" + DoubleToString(g_pendingBreakLevel, _Digits)
+                + "  Close:" + DoubleToString(closePrice, _Digits)
+                + "  [" + IntegerToString(barsSince) + "bar hold on " + TFName(InpFibTF) + "]";
+
+   if(InpEnablePush  && !SendNotification(msg)) Print("Push failed.");
+   if(InpEnablePopup) Alert(msg);
+   if(InpEnablePrint) Print(msg);
+
+   g_pendingBreakDir  = SIG_NONE;
+   g_pendingBreakTime = 0;
+}
+
+//+------------------------------------------------------------------+
 //  CheckAllTimeframes – main dispatch
 //+------------------------------------------------------------------+
 void CheckAllTimeframes()
 {
    UpdateFibSwing();
+   CheckSwingBreakConfirm();
    UpdateLiveK();
    UpdateTF2Direction();
    CheckTF1Signal();
@@ -369,6 +434,9 @@ void UpdateFibSwing()
       Print("[FIB] Swing LOW broken → range=[", DoubleToString(g_fibSwingLow, _Digits),
             ",", DoubleToString(g_fibSwingHigh, _Digits), "]",
             "  SBR level=", DoubleToString(g_oldSwingLow, _Digits));
+      g_pendingBreakDir   = SIG_SELL;
+      g_pendingBreakTime  = g_fibBar;
+      g_pendingBreakLevel = g_oldSwingLow;
       SaveFibState();
    }
    // Swing HIGH broken → old high becomes RBS; invalidate stale SBR; rescan both anchors
@@ -392,6 +460,9 @@ void UpdateFibSwing()
       Print("[FIB] Swing HIGH broken → range=[", DoubleToString(g_fibSwingLow, _Digits),
             ",", DoubleToString(g_fibSwingHigh, _Digits), "]",
             "  RBS level=", DoubleToString(g_oldSwingHigh, _Digits));
+      g_pendingBreakDir   = SIG_BUY;
+      g_pendingBreakTime  = g_fibBar;
+      g_pendingBreakLevel = g_oldSwingHigh;
       SaveFibState();
    }
 }
