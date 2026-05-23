@@ -4,10 +4,12 @@
 //|  v2.1                                                            |
 //|                                                                  |
 //|  SIGNAL LOGIC:                                                   |
-//|   TF2 (slow): K/D cross in OB/OS or near-zone sets direction    |
-//|               Mid-zone (40-70) TF2 crosses are ignored           |
+//|   TF2 (slow): live K/D alignment checked at each TF1 cross      |
+//|               SELL bias: K < D AND K >= InpSellMinK             |
+//|               BUY  bias: K > D AND K <= InpBuyMaxK              |
+//|               Mid-zone or misaligned K/D = NONE (no gate)       |
 //|   TF1 (fast): K/D cross valid if K>=InpSellMinK / K<=InpBuyMaxK |
-//|               Fires only when TF1 direction == TF2 direction     |
+//|               Fires only when TF1 direction == TF2 live bias    |
 //|                                                                  |
 //|  PRICE GATE (when InpFibZoneEnable=true):                        |
 //|   Primary : price within fib 0–0.382 (BUY) / 0.618–∞ (SELL)   |
@@ -63,8 +65,7 @@ input double InpSellMinK = 70.0;  // SELL cross valid only if K >= this (OB or n
 input double InpBuyMaxK  = 40.0;  // BUY  cross valid only if K <= this (OS or near-OS bounce)
 
 input group "══════ Signal Cooldown ══════"
-input int    InpSignalCooldownMin  = 60;
-input int    InpTF2DirTimeoutHrs   = 48;  // TF2 direction expires after N hours without a fresh OB/OS cross (0 = never)
+input int    InpSignalCooldownMin = 60;
 
 input group "══════ Fib Zone Filter ══════"
 input ENUM_TIMEFRAMES InpFibTF         = PERIOD_M30;
@@ -102,13 +103,8 @@ int g_h_stoch_1 = INVALID_HANDLE;
 int g_h_stoch_2 = INVALID_HANDLE;
 int g_h_atr     = INVALID_HANDLE;
 
-// TF bar guards
+// TF bar guard
 datetime g_lastBar_1 = 0;
-datetime g_lastBar_2 = 0;
-
-// TF2 direction – set by OB/OS crosses only; expires after InpTF2DirTimeoutHrs
-int      g_tf2_dir      = SIG_NONE;
-datetime g_tf2_dir_time = 0;   // Bar time when g_tf2_dir was last set
 
 // Cooldown
 int      g_lastCooldownSig  = SIG_NONE;
@@ -136,9 +132,7 @@ double   g_pendingBreakLevel = 0.0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   g_lastBar_1 = g_lastBar_2 = 0;
-   g_tf2_dir      = SIG_NONE;
-   g_tf2_dir_time = 0;
+   g_lastBar_1 = 0;
    g_lastCooldownSig  = SIG_NONE;
    g_lastCooldownTime = 0;
    g_fibSwingHigh = g_fibSwingLow = 0.0;
@@ -218,24 +212,41 @@ void UpdateLiveK()
 }
 
 //+------------------------------------------------------------------+
-//  SilentWatch – journal snapshot every TF1/TF2 bar change
+//  GetTF2LiveBias – real-time TF2 directional state, no stored memory.
+//  Reads the last closed TF2 bar's K and D; returns live bias.
+//  SELL: K < D (K crossed below D) AND K >= InpSellMinK (in valid SELL zone)
+//  BUY:  K > D (K crossed above D) AND K <= InpBuyMaxK  (in valid BUY zone)
+//  NONE: mid-zone or K/D alignment contradicts zone – direction unclear
+//+------------------------------------------------------------------+
+int GetTF2LiveBias()
+{
+   double k[1], d[1];
+   if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   1, 1, k) < 1) return SIG_NONE;
+   if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 1, 1, d) < 1) return SIG_NONE;
+   if(k[0] < d[0] && k[0] >= InpSellMinK) return SIG_SELL;
+   if(k[0] > d[0] && k[0] <= InpBuyMaxK)  return SIG_BUY;
+   return SIG_NONE;
+}
+
+//+------------------------------------------------------------------+
+//  SilentWatch – journal snapshot every TF1 bar change
 //+------------------------------------------------------------------+
 void SilentWatch()
 {
-   if(!InpEnablePrint)          return;
-   if(g_tf2_dir == SIG_NONE)   return;  // no direction established yet – nothing to watch
+   if(!InpEnablePrint) return;
 
-   double range  = g_fibSwingHigh - g_fibSwingLow;
-   double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double fibPos = (range > 0) ? (price - g_fibSwingLow) / range : -1.0;
+   int    tf2Bias = GetTF2LiveBias();
+   double range   = g_fibSwingHigh - g_fibSwingLow;
+   double price   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double fibPos  = (range > 0) ? (price - g_fibSwingLow) / range : -1.0;
 
    string zone  = (fibPos >= 0.0 && fibPos <= InpFibBuyZoneMax)   ? "BUY ZONE"  :
                   (fibPos >= InpFibSellZoneMin && fibPos <= 1.0)   ? "SELL ZONE" : "DEAD ZONE";
-   string tf2st = (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none");
+   string tf2st = (tf2Bias == SIG_BUY ? "BUY" : tf2Bias == SIG_SELL ? "SELL" : "none");
 
    Print("[WATCH] ",
          TFName(InpTF1), " K=", DoubleToString(g_liveK_1, 1),
-         " | ", TFName(InpTF2), " K=", DoubleToString(g_liveK_2, 1), " dir=", tf2st,
+         " | ", TFName(InpTF2), " K=", DoubleToString(g_liveK_2, 1), " bias=", tf2st,
          " | fib=", FibPosLabel(fibPos), " (", zone, ")");
 }
 
@@ -299,7 +310,6 @@ void CheckAllTimeframes()
    UpdateFibSwing();
    CheckSwingBreakConfirm();
    UpdateLiveK();
-   UpdateTF2Direction();
    CheckTF1Signal();
 }
 
@@ -328,7 +338,7 @@ string GVName(string suffix)
 }
 
 //+------------------------------------------------------------------+
-//  SaveFibState – persist fib anchors + TF2 direction to GlobalVariables
+//  SaveFibState – persist fib anchors to GlobalVariables
 //+------------------------------------------------------------------+
 void SaveFibState()
 {
@@ -341,8 +351,6 @@ void SaveFibState()
    GlobalVariableSet(GVName("OHT"), (double)g_oldHighBreakTime);
    GlobalVariableSet(GVName("OLT"), (double)g_oldLowBreakTime);
    GlobalVariableSet(GVName("TRB"), (double)g_trendBias);
-   GlobalVariableSet(GVName("TD2"), (double)g_tf2_dir);
-   GlobalVariableSet(GVName("T2T"), (double)g_tf2_dir_time);
 }
 
 //+------------------------------------------------------------------+
@@ -358,7 +366,7 @@ bool LoadFibState()
    g_fibSwingHigh = sh;
    g_fibSwingLow  = sl;
 
-   double osh = 0, osl = 0, hoh = 0, hol = 0, trb = 0, td2 = 0;
+   double osh = 0, osl = 0, hoh = 0, hol = 0, trb = 0;
    GlobalVariableGet(GVName("OSH"), osh); g_oldSwingHigh = osh;
    GlobalVariableGet(GVName("OSL"), osl); g_oldSwingLow  = osl;
    GlobalVariableGet(GVName("HOH"), hoh); g_hasOldHigh       = (hoh > 0.5);
@@ -366,31 +374,14 @@ bool LoadFibState()
    double oht = 0, olt = 0;
    GlobalVariableGet(GVName("OHT"), oht); g_oldHighBreakTime = (datetime)oht;
    GlobalVariableGet(GVName("OLT"), olt); g_oldLowBreakTime  = (datetime)olt;
-   GlobalVariableGet(GVName("TRB"), trb); g_trendBias        = (int)MathRound(trb);
-   GlobalVariableGet(GVName("TD2"), td2); g_tf2_dir          = (int)MathRound(td2);
-   double t2t = 0;
-   GlobalVariableGet(GVName("T2T"), t2t); g_tf2_dir_time     = (datetime)t2t;
-
-   // Immediately expire stale direction on load (protects against terminal-restart staleness)
-   if(InpTF2DirTimeoutHrs > 0 && g_tf2_dir != SIG_NONE && g_tf2_dir_time > 0)
-   {
-      int ageSecs = (int)(TimeCurrent() - g_tf2_dir_time);
-      if(ageSecs > InpTF2DirTimeoutHrs * 3600)
-      {
-         Print("[TF2 EXPIRE on load] dir=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"),
-               " was ", ageSecs / 3600, "h old (limit ", InpTF2DirTimeoutHrs, "h) – reset to NONE");
-         g_tf2_dir      = SIG_NONE;
-         g_tf2_dir_time = 0;
-      }
-   }
+   GlobalVariableGet(GVName("TRB"), trb); g_trendBias = (int)MathRound(trb);
 
    Print("[FIB] Restored: High=", DoubleToString(g_fibSwingHigh, _Digits),
          "  Low=",  DoubleToString(g_fibSwingLow,  _Digits),
          "  SBR:", (g_hasOldLow  ? DoubleToString(g_oldSwingLow,  _Digits) : "none"),
          "  RBS:", (g_hasOldHigh ? DoubleToString(g_oldSwingHigh, _Digits) : "none"),
          "  TrendBias:", (g_trendBias == 1 ? "UP" : g_trendBias == -1 ? "DOWN" : "none"),
-         "  TF2dir:", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"),
-         (g_tf2_dir != SIG_NONE ? "  set " + IntegerToString((int)(TimeCurrent() - g_tf2_dir_time) / 3600) + "h ago" : ""));
+         "  TF2 bias: live (computed per bar)");
    return true;
 }
 
@@ -767,72 +758,8 @@ void FireSignal(int sigType, double fibPos, string fibTag, string tf1Zone = "")
 }
 
 //+------------------------------------------------------------------+
-//  UpdateTF2Direction – OB/OS crosses on TF2 set the market direction.
-//  Mid-zone TF2 crosses are ignored – they don't change direction.
-//+------------------------------------------------------------------+
-void UpdateTF2Direction()
-{
-   datetime barTimes[3];
-   if(CopyTime(_Symbol, InpTF2, 0, 3, barTimes) < 3) return;
-   if(barTimes[1] == g_lastBar_2) return;
-   g_lastBar_2 = barTimes[1];
-
-   // Expire stale direction: if no fresh OB/OS cross in InpTF2DirTimeoutHrs, reset to NONE.
-   if(InpTF2DirTimeoutHrs > 0 && g_tf2_dir != SIG_NONE && g_tf2_dir_time > 0)
-   {
-      int ageSecs = (int)(barTimes[1] - g_tf2_dir_time);
-      if(ageSecs > InpTF2DirTimeoutHrs * 3600)
-      {
-         Print("[TF2 EXPIRE] dir=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"),
-               " expired after ", ageSecs / 3600, "h (limit ", InpTF2DirTimeoutHrs, "h) – reset to NONE");
-         g_tf2_dir      = SIG_NONE;
-         g_tf2_dir_time = 0;
-         SaveFibState();
-      }
-   }
-
-   double k_buf[3];
-   double d_buf[3];
-   if(CopyBuffer(g_h_stoch_2, MAIN_LINE,   0, 3, k_buf) < 3) return;
-   if(CopyBuffer(g_h_stoch_2, SIGNAL_LINE, 0, 3, d_buf) < 3) return;
-
-   double k1 = k_buf[1], d1 = d_buf[1];
-   double k2 = k_buf[2], d2 = d_buf[2];
-
-   bool crossUp   = (k2 <= d2) && (k1 > d1);
-   bool crossDown = (k2 >= d2) && (k1 < d1);
-   if(!crossUp && !crossDown) return;
-
-   // TF2 direction: reversal crosses only (OB/near-OB for SELL, OS/near-OS for BUY).
-   // OB cont (crossUp K>80) and OS cont (crossDown K<20) are excluded –
-   // they cause rapid direction flips when price grinds in extremes.
-   if(crossDown && k1 >= InpSellMinK)
-   {
-      string zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";
-      g_tf2_dir      = SIG_SELL;
-      g_tf2_dir_time = barTimes[1];
-      Print("[TF2 DIR] → SELL from ", zone, "  K=", DoubleToString(k1, 2));
-      SaveFibState();
-   }
-   else if(crossUp && k1 <= InpBuyMaxK)
-   {
-      string zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";
-      g_tf2_dir      = SIG_BUY;
-      g_tf2_dir_time = barTimes[1];
-      Print("[TF2 DIR] → BUY from ", zone, "  K=", DoubleToString(k1, 2));
-      SaveFibState();
-   }
-   else
-   {
-      Print("[TF2 NOISE] cross ignored K=", DoubleToString(k1, 2),
-            " (dir stays ", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"), ")");
-   }
-}
-
-//+------------------------------------------------------------------+
-//  CheckTF1Signal – TF1 bar cross; fires when aligned with TF2 direction
-//  Any zone cross (OB / OS / mid 30-70) is valid if TF2 agrees.
-//  Signal message labels TF1 zone so user can gauge signal quality.
+//  CheckTF1Signal – fires on TF1 K/D cross when TF2 live bias agrees.
+//  TF2 bias is computed fresh from the last closed TF2 bar (no stored state).
 //+------------------------------------------------------------------+
 void CheckTF1Signal()
 {
@@ -841,31 +768,32 @@ void CheckTF1Signal()
    if(barTimes[1] == g_lastBar_1) return;
    g_lastBar_1 = barTimes[1];
 
-   // Always emit WATCH on TF1 bar change
    SilentWatch();
 
-   // Read stoch buffers early – needed by both SBR/RBS structural path and stoch path
+   // TF2 live bias: K/D alignment on last closed TF2 bar, evaluated right now.
+   int tf2Bias = GetTF2LiveBias();
+
+   // TF1 K/D cross detection (was vs current)
    double k_buf[3], d_buf[3];
    if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, 3, k_buf) < 3) return;
    if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3, d_buf) < 3) return;
 
-   double k1 = k_buf[1], d1 = d_buf[1];
-   double k2 = k_buf[2], d2 = d_buf[2];
+   double k_now  = k_buf[1], d_now  = d_buf[1];  // current closed TF1 bar
+   double k_prev = k_buf[2], d_prev = d_buf[2];  // previous closed TF1 bar
 
-   bool crossUp   = (k2 <= d2) && (k1 > d1);
-   bool crossDown = (k2 >= d2) && (k1 < d1);
+   bool crossUp   = (k_prev <= d_prev) && (k_now > d_now);
+   bool crossDown = (k_prev >= d_prev) && (k_now < d_now);
    if(!crossUp && !crossDown) return;
 
    int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
 
    // ── Structural SBR/RBS path ──
-   // Fires when price retests a broken structural level with a rejection candle.
-   // TF2 must NOT actively oppose: RBS BUY allowed when TF2 is BUY or NONE;
-   // SBR SELL allowed when TF2 is SELL or NONE. Prevents trading against live TF2 bias.
+   // Uses live TF2 bias: fires if TF2 is not actively opposing.
+   // Structural level provides the directional context; TF2 NONE = allowed.
    if(InpFibZoneEnable)
    {
-      bool tf2Compatible = (tf1sig == SIG_BUY) ? (g_tf2_dir != SIG_SELL)
-                                                : (g_tf2_dir != SIG_BUY);
+      bool tf2Compatible = (tf1sig == SIG_BUY) ? (tf2Bias != SIG_SELL)
+                                                : (tf2Bias != SIG_BUY);
       bool tf2NotStuck   = (tf1sig == SIG_SELL) ? (g_liveK_2 < InpOBStuckLevel)
                                                  : (g_liveK_2 > InpOSStuckLevel);
       double sbrPos = -1.0; string sbrTag = ""; double sbrLevel = 0.0;
@@ -875,19 +803,19 @@ void CheckTF1Signal()
          && PassesCooldown(tf1sig, barTimes[1]))
       {
          Print("[", sbrTag, "] ", SignalTypeName(tf1sig),
-               "  K=", DoubleToString(k1, 1),
+               "  K=", DoubleToString(k_now, 1),
                "  level=", DoubleToString(sbrLevel, _Digits),
-               "  TF2=", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"));
+               "  TF2 bias=", (tf2Bias == SIG_BUY ? "BUY" : tf2Bias == SIG_SELL ? "SELL" : "none"));
          FireSignal(tf1sig, sbrPos, sbrTag, "");
          g_lastCooldownSig  = tf1sig;
          g_lastCooldownTime = barTimes[1];
-         return;  // one signal per bar
+         return;
       }
       else if(InpEnablePrint)
       {
          if(!tf2Compatible)
-            Print("[SBR/RBS SKIP] TF2 actively opposes: tf1sig=", SignalTypeName(tf1sig),
-                  " TF2=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"));
+            Print("[SBR/RBS SKIP] TF2 opposes: tf1sig=", SignalTypeName(tf1sig),
+                  " TF2 bias=", (tf2Bias == SIG_BUY ? "BUY" : "SELL"));
          else if(!tf2NotStuck)
             Print("[SBR/RBS SKIP] TF2 K stuck: tf1sig=", SignalTypeName(tf1sig),
                   " TF2 K=", DoubleToString(g_liveK_2, 1),
@@ -896,49 +824,44 @@ void CheckTF1Signal()
       }
    }
 
-   // ── Standard stochastic path: requires TF2 direction agreement ──
-   if(g_tf2_dir == SIG_NONE) return;  // no TF2 direction established yet
+   // ── Standard stochastic path: TF2 live bias must agree ──
+   if(tf2Bias == SIG_NONE) return;  // TF2 K/D in mid-zone – no clear direction
 
-   // TF1 zone filter: block mid-zone (InpBuyMaxK – InpSellMinK) crosses
-   // SELL valid: K >= InpSellMinK (OB/near-OB reversal) OR K <= InpOS_Level (OS continuation)
-   // BUY  valid: K <= InpBuyMaxK  (OS/near-OS bounce)   OR K >= InpOB_Level (OB continuation)
-   bool tf1SellOk = (k1 >= InpSellMinK) || (k1 <= InpOS_Level);
-   bool tf1BuyOk  = (k1 <= InpBuyMaxK)  || (k1 >= InpOB_Level);
+   // TF1 zone filter
+   bool tf1SellOk = (k_now >= InpSellMinK) || (k_now <= InpOS_Level);
+   bool tf1BuyOk  = (k_now <= InpBuyMaxK)  || (k_now >= InpOB_Level);
 
    if(tf1sig == SIG_SELL && !tf1SellOk)
    {
-      Print("[TF1 NOISE] SELL cross K=", DoubleToString(k1, 1),
+      Print("[TF1 NOISE] SELL cross K=", DoubleToString(k_now, 1),
             " in noise band (", InpOS_Level, "–", InpSellMinK, ") – ignored");
       return;
    }
    if(tf1sig == SIG_BUY && !tf1BuyOk)
    {
-      Print("[TF1 NOISE] BUY cross K=", DoubleToString(k1, 1),
+      Print("[TF1 NOISE] BUY cross K=", DoubleToString(k_now, 1),
             " in noise band (", InpBuyMaxK, "–", InpOB_Level, ") – ignored");
       return;
    }
 
-   // Zone label for signal quality context in message
    string tf1Zone;
    if(crossUp)
-      tf1Zone = (k1 <= InpOS_Level) ? "OS" : (k1 <= InpBuyMaxK ? "nearOS" : "OB cont");
+      tf1Zone = (k_now <= InpOS_Level) ? "OS" : (k_now <= InpBuyMaxK ? "nearOS" : "OB cont");
    else
-      tf1Zone = (k1 >= InpOB_Level) ? "OB" : (k1 >= InpSellMinK ? "nearOB" : "OS cont");
+      tf1Zone = (k_now >= InpOB_Level) ? "OB" : (k_now >= InpSellMinK ? "nearOB" : "OS cont");
 
    Print("[TF1] ", SignalTypeName(tf1sig), " cross ", tf1Zone,
-         "  K=", DoubleToString(k1, 2),
-         "  TF2 dir=", (g_tf2_dir == SIG_BUY ? "BUY" : "SELL"));
+         "  K=", DoubleToString(k_now, 2),
+         "  TF2 bias=", (tf2Bias == SIG_BUY ? "BUY" : "SELL"));
 
-   // Must align with TF2 direction
-   if(tf1sig != g_tf2_dir)
+   if(tf1sig != tf2Bias)
    {
       Print("[WAIT] TF1=", SignalTypeName(tf1sig),
-            " TF2=", SignalTypeName(g_tf2_dir), " – mismatch");
+            " TF2 bias=", SignalTypeName(tf2Bias), " – mismatch");
       return;
    }
 
-   // Stuck OB/OS: TF2 K is grinding at extreme – market is trending, not reversing.
-   // Block and wait for K to retrace below InpOBStuckLevel / above InpOSStuckLevel.
+   // Stuck OB/OS: TF2 K grinding at extreme – wait for retrace
    if(tf1sig == SIG_SELL && g_liveK_2 >= InpOBStuckLevel)
    {
       Print("[OB STUCK] SELL blocked – TF2 K=", DoubleToString(g_liveK_2, 1),
@@ -952,16 +875,12 @@ void CheckTF1Signal()
       return;
    }
 
-   // Cooldown check – before any fib/SBR computation
    if(!PassesCooldown(tf1sig, barTimes[1]))
    {
       Print("[COOLDOWN] ", SignalTypeName(tf1sig), " blocked – within ", InpSignalCooldownMin, "min");
       return;
    }
 
-   // Fib zone gate – optional on stoch path. Off by default (InpFibGateOnStoch=false):
-   // TF1+TF2 stoch agreement is sufficient; structural trades use the independent SBR/RBS path.
-   // Enable InpFibGateOnStoch=true to also require price to be in a fib zone here.
    double fibPos = -1.0; string fibTag = "";
    if(InpFibZoneEnable && InpFibGateOnStoch)
    {
@@ -974,13 +893,12 @@ void CheckTF1Signal()
                         ? (SymbolInfoDouble(_Symbol, SYMBOL_BID) - g_fibSwingLow) / range
                         : -1.0;
          Print("[FIB BLOCK] ", SignalTypeName(tf1sig),
-               " blocked  fib=", DoubleToString(lp, 3), " K=", DoubleToString(k1, 1));
+               " blocked  fib=", DoubleToString(lp, 3), " K=", DoubleToString(k_now, 1));
          return;
       }
    }
 
    FireSignal(tf1sig, fibPos, fibTag, tf1Zone);
-
    g_lastCooldownSig  = tf1sig;
    g_lastCooldownTime = barTimes[1];
 }
