@@ -52,6 +52,10 @@ input double InpOB_Level   = 80.0;
 input double InpOS_Level   = 20.0;
 input int    InpOSLookback = 20;   // bars to scan for OB/OS touch on both TFs
 
+input group "══════ TF1 Cross Zone Filter ══════"
+input double InpTF1SellMinK = 70.0;  // SELL cross valid only if K >= this (blocks 40-70 noise)
+input double InpTF1BuyMaxK  = 40.0;  // BUY  cross valid only if K <= this (blocks 40-70 noise)
+
 input group "══════ Signal Cooldown ══════"
 input int    InpSignalCooldownMin = 60;
 
@@ -675,12 +679,28 @@ void CheckTF1Signal()
 
    int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
 
-   // Zone label for signal message (quality indicator only – does not block)
+   // TF1 zone filter: block crosses in the 40-70 noise band
+   // SELL valid: K >= InpTF1SellMinK (e.g. 70 – near-OB or OB)
+   // BUY  valid: K <= InpTF1BuyMaxK  (e.g. 40 – near-OS or OS)
+   if(tf1sig == SIG_SELL && k1 < InpTF1SellMinK)
+   {
+      Print("[TF1 NOISE] SELL cross K=", DoubleToString(k1, 1),
+            " < sell threshold ", InpTF1SellMinK, " – ignored");
+      return;
+   }
+   if(tf1sig == SIG_BUY && k1 > InpTF1BuyMaxK)
+   {
+      Print("[TF1 NOISE] BUY cross K=", DoubleToString(k1, 1),
+            " > buy threshold ", InpTF1BuyMaxK, " – ignored");
+      return;
+   }
+
+   // Zone label for signal quality context in message
    string tf1Zone;
    if(crossUp)
-      tf1Zone = (k1 <= InpOS_Level) ? "OS" : (k1 < 30.0) ? "nearOS" : "MID";
+      tf1Zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";   // BUY: OS or 20-40 near-OS
    else
-      tf1Zone = (k1 >= InpOB_Level) ? "OB" : (k1 > 70.0) ? "nearOB" : "MID";
+      tf1Zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";   // SELL: OB or 70-80 near-OB
 
    Print("[TF1] ", SignalTypeName(tf1sig), " cross ", tf1Zone,
          "  K=", DoubleToString(k1, 2),
