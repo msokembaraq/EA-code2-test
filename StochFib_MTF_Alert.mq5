@@ -567,16 +567,19 @@ void CalcTPSL(int sigType, double entry,
 //  FireSignal – single alert with SL/TP
 //  🟢 BUY (SBR) XAUUSD.p @ FIB 0.236 [M4:OS H1:BUY]  SL:...  TP1:...
 //+------------------------------------------------------------------+
-void FireSignal(int sigType, double fibPos, string fibTag)
+void FireSignal(int sigType, double fibPos, string fibTag, string tf1Zone = "")
 {
    double entry = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl, tp1, tp2, tp3;
    CalcTPSL(sigType, entry, sl, tp1, tp2, tp3);
 
+   bool   isMid  = (tf1Zone == "nearOB" || tf1Zone == "nearOS");
+   string sigName = SignalTypeName(sigType) + (isMid ? " AGAIN" : "");
+
    string emoji  = IsBullish(sigType) ? "🟢" : "🔴";
    string tag    = fibTag == "" ? "" : " (" + fibTag + ")";
 
-   string msg = emoji + " " + SignalTypeName(sigType) + tag
+   string msg = emoji + " " + sigName + tag
               + " " + _Symbol
               + "  SL:"  + DoubleToString(sl,  _Digits)
               + "  TP1:" + DoubleToString(tp1, _Digits)
@@ -749,7 +752,7 @@ void CheckTF1Signal()
    }
 
    // Fire
-   FireSignal(tf1sig, fibPos, fibTag);
+   FireSignal(tf1sig, fibPos, fibTag, tf1Zone);
 
    g_fired_bar        = barTimes[1];
    g_lastCooldownSig  = tf1sig;
