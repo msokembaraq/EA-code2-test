@@ -35,7 +35,7 @@ const string FIB_LABEL[7] = {"0", "0.236", "0.382", "0.5", "0.618", "0.786", "1"
 //════════════════════════════════════════════════════════════════════
 input group "══════ Timeframe Selection ══════"
 input ENUM_TIMEFRAMES InpTF1 = PERIOD_M6;   // TF1 – trigger (faster)
-input ENUM_TIMEFRAMES InpTF2 = PERIOD_H1;   // TF2 – direction (slower)
+input ENUM_TIMEFRAMES InpTF2 = PERIOD_M15;   // TF2 – direction (slower)
 
 input group "══════ Stochastic – TF1 (trigger) ══════"
 input int    InpStoch_K    = 26;
