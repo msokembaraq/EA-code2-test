@@ -52,9 +52,9 @@ input double InpOB_Level   = 80.0;
 input double InpOS_Level   = 20.0;
 input int    InpOSLookback = 20;   // bars to scan for OB/OS touch on both TFs
 
-input group "══════ TF1 Cross Zone Filter ══════"
-input double InpTF1SellMinK = 70.0;  // SELL cross valid only if K >= this (blocks 40-70 noise)
-input double InpTF1BuyMaxK  = 40.0;  // BUY  cross valid only if K <= this (blocks 40-70 noise)
+input group "══════ Cross Zone Filter (both TFs) ══════"
+input double InpSellMinK = 70.0;  // SELL cross valid only if K >= this (OB or near-OB pullback)
+input double InpBuyMaxK  = 40.0;  // BUY  cross valid only if K <= this (OS or near-OS bounce)
 
 input group "══════ Signal Cooldown ══════"
 input int    InpSignalCooldownMin = 60;
@@ -612,33 +612,27 @@ void UpdateTF2Direction()
    bool crossDown = (k2 >= d2) && (k1 < d1);
    if(!crossUp && !crossDown) return;
 
-   // Check OB/OS within lookback – TF2 direction only set from extremes
-   bool recentOS = false, recentOB = false;
-   for(int i = 1; i < kCopy; i++)
+   // Same zone filter as TF1: K value at cross must be in OB/OS or valid near-zone
+   if(crossDown && k1 >= InpSellMinK)
    {
-      if(k_buf[i] <= InpOS_Level) recentOS = true;
-      if(k_buf[i] >= InpOB_Level) recentOB = true;
-   }
-
-   if(crossUp && recentOS)
-   {
-      g_tf2_dir = SIG_BUY;
-      Print("[TF2 DIR] → BUY from OS  K=", DoubleToString(k1, 2));
+      string zone = (k1 >= InpOB_Level) ? "OB" : "nearOB";
+      g_tf2_dir = SIG_SELL;
+      Print("[TF2 DIR] → SELL from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
       SilentWatch();
    }
-   else if(crossDown && recentOB)
+   else if(crossUp && k1 <= InpBuyMaxK)
    {
-      g_tf2_dir = SIG_SELL;
-      Print("[TF2 DIR] → SELL from OB  K=", DoubleToString(k1, 2));
+      string zone = (k1 <= InpOS_Level) ? "OS" : "nearOS";
+      g_tf2_dir = SIG_BUY;
+      Print("[TF2 DIR] → BUY from ", zone, "  K=", DoubleToString(k1, 2));
       SaveFibState();
       SilentWatch();
    }
    else
    {
-      Print("[TF2 MID] cross ignored K=", DoubleToString(k1, 2),
+      Print("[TF2 NOISE] cross ignored K=", DoubleToString(k1, 2),
             " (dir stays ", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"), ")");
-      SilentWatch();
    }
 }
 
@@ -678,16 +672,16 @@ void CheckTF1Signal()
    // TF1 zone filter: block crosses in the 40-70 noise band
    // SELL valid: K >= InpTF1SellMinK (e.g. 70 – near-OB or OB)
    // BUY  valid: K <= InpTF1BuyMaxK  (e.g. 40 – near-OS or OS)
-   if(tf1sig == SIG_SELL && k1 < InpTF1SellMinK)
+   if(tf1sig == SIG_SELL && k1 < InpSellMinK)
    {
       Print("[TF1 NOISE] SELL cross K=", DoubleToString(k1, 1),
-            " < sell threshold ", InpTF1SellMinK, " – ignored");
+            " < ", InpSellMinK, " – ignored");
       return;
    }
-   if(tf1sig == SIG_BUY && k1 > InpTF1BuyMaxK)
+   if(tf1sig == SIG_BUY && k1 > InpBuyMaxK)
    {
       Print("[TF1 NOISE] BUY cross K=", DoubleToString(k1, 1),
-            " > buy threshold ", InpTF1BuyMaxK, " – ignored");
+            " > ", InpBuyMaxK, " – ignored");
       return;
    }
 
