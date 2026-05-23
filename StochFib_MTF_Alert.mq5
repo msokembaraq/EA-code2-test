@@ -62,6 +62,7 @@ input int    InpSignalCooldownMin = 60;
 input group "══════ Fib Zone Filter ══════"
 input ENUM_TIMEFRAMES InpFibTF         = PERIOD_M30;
 input int             InpFibLookback   = 100;
+input bool            InpFibZoneEnable  = true;   // Enable fib zone gate for entries
 input double          InpFibBuyZoneMax  = 0.382;
 input double          InpFibSellZoneMin = 0.618;
 input double          InpSBR_Tol       = 0.05;
@@ -711,7 +712,7 @@ void CheckTF1Signal()
    double fibPos = -1.0; string fibTag = "";
    bool   zonePassed = false;
 
-   if(CheckFibZone(tf1sig, fibPos, fibTag))
+   if(InpFibZoneEnable && CheckFibZone(tf1sig, fibPos, fibTag))
    {
       zonePassed = true;
    }
