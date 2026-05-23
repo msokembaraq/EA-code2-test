@@ -507,13 +507,14 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
    // ATR-based zone half-width
    double atrBuf[1];
    if(CopyBuffer(g_h_atr, 0, 1, 1, atrBuf) < 1 || atrBuf[0] <= 0) return false;
-   double zoneHalf = 0.25 * atrBuf[0];
+   double zoneHalf = 0.5 * atrBuf[0];  // 0.5×ATR gives a wider retest capture zone
 
-   // Last closed TF1 bar time – used for retest window
-   datetime tf1Times[1];
-   datetime curTime = (CopyTime(_Symbol, InpTF1, 1, 1, tf1Times) == 1)
-                      ? tf1Times[0] : TimeCurrent();
-   int windowSecs = InpRetestWindow * (int)PeriodSeconds(InpTF1);
+   // Window in FibTF bars – the level lives on FibTF so the timer should too.
+   // 50 × M30 = 25 hours; far more appropriate than 50 × M5 = 4 hours.
+   datetime fibTimes[1];
+   datetime curTime = (CopyTime(_Symbol, InpFibTF, 1, 1, fibTimes) == 1)
+                      ? fibTimes[0] : TimeCurrent();
+   int windowSecs = InpRetestWindow * (int)PeriodSeconds(InpFibTF);
 
    double cls[1];
    double price = (CopyClose(_Symbol, InpTF1, 1, 1, cls) == 1)
@@ -525,8 +526,8 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
       if(g_oldLowBreakTime > 0 && (curTime - g_oldLowBreakTime) > windowSecs)
       {
          Print("[SBR STALE] Expired after ",
-               (int)((curTime - g_oldLowBreakTime) / PeriodSeconds(InpTF1)),
-               " bars – clearing");
+               (int)((curTime - g_oldLowBreakTime) / PeriodSeconds(InpFibTF)),
+               " ", TFName(InpFibTF), " bars – clearing");
          g_hasOldLow       = false;
          g_oldSwingLow     = 0.0;
          g_oldLowBreakTime = 0;
@@ -554,8 +555,8 @@ bool CheckSBRRBS(int sigType, double &fibPos, string &roleTag, double &levelPric
       if(g_oldHighBreakTime > 0 && (curTime - g_oldHighBreakTime) > windowSecs)
       {
          Print("[RBS STALE] Expired after ",
-               (int)((curTime - g_oldHighBreakTime) / PeriodSeconds(InpTF1)),
-               " bars – clearing");
+               (int)((curTime - g_oldHighBreakTime) / PeriodSeconds(InpFibTF)),
+               " ", TFName(InpFibTF), " bars – clearing");
          g_hasOldHigh       = false;
          g_oldSwingHigh     = 0.0;
          g_oldHighBreakTime = 0;
@@ -804,12 +805,10 @@ void CheckTF1Signal()
    // Always emit WATCH on TF1 bar change
    SilentWatch();
 
-   if(g_tf2_dir == SIG_NONE) return;  // no TF2 direction established yet
-
-   double k_buf[3];
-   double d_buf[3];
+   // Read stoch buffers early – needed by both SBR/RBS structural path and stoch path
+   double k_buf[3], d_buf[3];
    if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, 3, k_buf) < 3) return;
-   if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3,     d_buf) < 3)     return;
+   if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3, d_buf) < 3) return;
 
    double k1 = k_buf[1], d1 = d_buf[1];
    double k2 = k_buf[2], d2 = d_buf[2];
@@ -819,6 +818,30 @@ void CheckTF1Signal()
    if(!crossUp && !crossDown) return;
 
    int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
+
+   // ── Structural SBR/RBS path (independent of TF2 direction and zone filter) ──
+   // Fires on any stoch cross when price is at a broken-level zone + rejection candle.
+   // TF2 is irrelevant: the structural level IS the directional confirmation.
+   if(InpFibZoneEnable)
+   {
+      double sbrPos = -1.0; string sbrTag = ""; double sbrLevel = 0.0;
+      if(CheckSBRRBS(tf1sig, sbrPos, sbrTag, sbrLevel)
+         && HasRejectionCandle(IsBearish(tf1sig), sbrLevel, InpTF1, InpRejectionLookback)
+         && PassesCooldown(tf1sig, barTimes[1]))
+      {
+         Print("[", sbrTag, "] ", SignalTypeName(tf1sig),
+               "  K=", DoubleToString(k1, 1),
+               "  level=", DoubleToString(sbrLevel, _Digits),
+               "  TF2=", (g_tf2_dir == SIG_BUY ? "BUY" : g_tf2_dir == SIG_SELL ? "SELL" : "none"));
+         FireSignal(tf1sig, sbrPos, sbrTag, "");
+         g_lastCooldownSig  = tf1sig;
+         g_lastCooldownTime = barTimes[1];
+         return;  // one signal per bar
+      }
+   }
+
+   // ── Standard stochastic path: requires TF2 direction agreement ──
+   if(g_tf2_dir == SIG_NONE) return;  // no TF2 direction established yet
 
    // TF1 zone filter: block mid-zone (InpBuyMaxK – InpSellMinK) crosses
    // SELL valid: K >= InpSellMinK (OB/near-OB reversal) OR K <= InpOS_Level (OS continuation)
