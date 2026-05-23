@@ -5,11 +5,11 @@
 //|                                                                  |
 //|  BUY:        OS touch (0-10) → recover >15 → cross up 15-30     |
 //|  BUY AGAIN:  Retrace to 10-30 → cross up                       |
-//|  BUY MOM:    K ≥ 90, K > D (fires each bar)                    |
+//|  BUY MOM:    K ≤ 10, K > D (turning up from OS)                |
 //|                                                                  |
 //|  SELL:       OB touch (90-100) → reject <90 → cross down 80-90 |
 //|  SELL AGAIN: Pullback to 80-90 → cross down                    |
-//|  SELL MOM:   K ≤ 10, K < D (fires each bar)                    |
+//|  SELL MOM:   K ≥ 90, K < D (turning down from OB)              |
 //+------------------------------------------------------------------+
 #property copyright   "Custom Indicator"
 #property version     "5.00"
@@ -352,11 +352,11 @@ void FireSignal(int sigType, string label)
 //
 //  BUY:        OS touch (0-10) → recover >15 → cross up in 15-30
 //  BUY AGAIN:  Retrace to 10-30 → cross up
-//  BUY MOM:    K ≥ 90, K > D (each bar)
+//  BUY MOM:    K ≤ 10, K > D – turning up from OS (each bar)
 //
 //  SELL:       OB touch (90-100) → reject <90 → cross down in 80-90
 //  SELL AGAIN: Pullback to 80-90 → cross down
-//  SELL MOM:   K ≤ 10, K < D (each bar)
+//  SELL MOM:   K ≥ 90, K < D – turning down from OB (each bar)
 //+------------------------------------------------------------------+
 void CheckTF1Signal()
 {
@@ -386,12 +386,12 @@ void CheckTF1Signal()
    // ════════════════════════════════════════════════
    //  MOMENTUM SIGNALS (no cross needed, each bar)
    // ════════════════════════════════════════════════
-   if(k_now >= InpOB_Level && k_now > d_now)
+   if(k_now <= InpOS_Level && k_now > d_now)
    {
       tf1sig = SIG_BUY;
       label  = "BUY MOM";
    }
-   else if(k_now <= InpOS_Level && k_now < d_now)
+   else if(k_now >= InpOB_Level && k_now < d_now)
    {
       tf1sig = SIG_SELL;
       label  = "SELL MOM";
