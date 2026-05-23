@@ -238,7 +238,7 @@ void CheckZoneEntry()
    if(CopyBuffer(g_h_stoch_1, MAIN_LINE, 1, 1, k) < 1) return;
    double k1 = k[0];
 
-   // OB entry
+   // OB entry – reset only after K drops 5pts below threshold
    if(k1 >= InpOB_Level)
    {
       if(!g_alertedOB)
@@ -250,10 +250,10 @@ void CheckZoneEntry()
          g_alertedOB = true;
       }
    }
-   else
+   else if(k1 < InpOB_Level - 5.0)
       g_alertedOB = false;
 
-   // OS entry
+   // OS entry – reset only after K rises 5pts above threshold
    if(k1 <= InpOS_Level)
    {
       if(!g_alertedOS)
@@ -265,7 +265,7 @@ void CheckZoneEntry()
          g_alertedOS = true;
       }
    }
-   else
+   else if(k1 > InpOS_Level + 5.0)
       g_alertedOS = false;
 }
 
@@ -376,8 +376,6 @@ void CheckTF1Signal()
    if(barTimes[1] == g_lastBar_1) return;
    g_lastBar_1 = barTimes[1];
 
-   SilentWatch();
-
    double k_buf[3], d_buf[3];
    if(CopyBuffer(g_h_stoch_1, MAIN_LINE,   0, 3, k_buf) < 3) return;
    if(CopyBuffer(g_h_stoch_1, SIGNAL_LINE, 0, 3, d_buf) < 3) return;
@@ -388,6 +386,8 @@ void CheckTF1Signal()
    bool crossUp   = (k_prev <= d_prev) && (k_now > d_now);
    bool crossDown = (k_prev >= d_prev) && (k_now < d_now);
    if(!crossUp && !crossDown) return;
+
+   SilentWatch();
 
    int tf1sig = crossUp ? SIG_BUY : SIG_SELL;
    string label       = "";
