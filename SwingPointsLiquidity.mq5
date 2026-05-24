@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.70"
+#property version   "1.71"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 8
@@ -84,9 +84,9 @@ input bool   InpPush         = true;             // Push Notifications (mobile)
 input group "=== Level Approach Alerts ==="
 input bool   InpLvlAlerts    = true;             // Push when price nears a swing level
 input bool   InpTrackFlips   = true;             // Alert SBR / RBS on retests
-input int    InpApproachMode = 0;                // Approach zone: 0=ATR  1=Fixed pips
-input double InpApproachATR  = 0.5;             // ATR multiplier for approach zone
-input double InpApproachPips = 10.0;            // Pip distance for approach zone (mode 1)
+input int    InpApproachMode = 0;                // 0=Swing range  1=ATR  2=Fixed pips
+input double InpApproachMult = 0.5;             // Multiplier for swing / ATR modes
+input double InpApproachPips = 10.0;            // Pip distance for approach zone (mode 2)
 
 // ================================================================
 // BUFFERS  (6 plotted + 2 internal)
@@ -117,6 +117,7 @@ struct SLevel
    bool     isHigh;
    string   lineName;
    string   boxName;
+   double   swingRange;      // pivot candle range (high-low) used for approach threshold
    bool     approached;      // approach alert active for current episode
    bool     broken;          // price closed through (level flipped)
    bool     flipApproached;  // SBR / RBS alert active for current episode
@@ -329,14 +330,20 @@ void FireSignal(const string &dir, const string &label,
 // ================================================================
 // HELPERS : level approach threshold + alert
 // ================================================================
-double GetApproachThreshold()
+double GetApproachThreshold(double swingRange)
   {
-   if(InpApproachMode == 1 || g_atrHandle == INVALID_HANDLE)
+   if(InpApproachMode == 2) return InpApproachPips * _Point;
+   if(InpApproachMode == 1)
+     {
+      if(g_atrHandle != INVALID_HANDLE)
+        {
+         double atr[1];
+         if(CopyBuffer(g_atrHandle, 0, 0, 1, atr) > 0)
+            return atr[0] * InpApproachMult;
+        }
       return InpApproachPips * _Point;
-   double atr[1];
-   if(CopyBuffer(g_atrHandle, 0, 0, 1, atr) > 0)
-      return atr[0] * InpApproachATR;
-   return InpApproachPips * _Point;
+     }
+   return swingRange * InpApproachMult;  // mode 0: pivot candle range × multiplier
   }
 
 void FireLvlAlert(const string &tag, const string &rdy, double price)
@@ -448,7 +455,7 @@ void DrawChochLabel(const string &name, const string &txt,
 // HELPERS : level array
 // ================================================================
 void AddLevel(double price, double top, double bot,
-              datetime t1, bool isHigh,
+              datetime t1, bool isHigh, double swingRange,
               const string &ln, const string &bx)
   {
    ArrayResize(g_lv, g_nLv + 1);
@@ -459,6 +466,7 @@ void AddLevel(double price, double top, double bot,
    g_lv[g_nLv].isHigh        = isHigh;
    g_lv[g_nLv].lineName      = ln;
    g_lv[g_nLv].boxName       = bx;
+   g_lv[g_nLv].swingRange     = swingRange;
    g_lv[g_nLv].approached    = false;
    g_lv[g_nLv].broken        = false;
    g_lv[g_nLv].flipApproached= false;
@@ -655,7 +663,7 @@ int OnCalculate(const int rates_total,
          string bx = PFX + "BH_" + IntegerToString(pBar);
          DrawLine(ln, ph, time[pBar], time[i], InpHighColor);
          DrawBox (bx, ph * (1.0 + bw1), ph, time[pBar], time[i], InpHighColor);
-         AddLevel(ph, ph * (1.0 + bw1), ph, time[pBar], true, ln, bx);
+         AddLevel(ph, ph * (1.0 + bw1), ph, time[pBar], true, high[pBar] - low[pBar], ln, bx);
 
          // Capture prior trend before any update (fixes withTrend ordering bug)
          int priorTrend = g_trend;
@@ -724,7 +732,7 @@ int OnCalculate(const int rates_total,
          string bx = PFX + "BL_" + IntegerToString(pBar);
          DrawLine(ln, pl, time[pBar], time[i], InpLowColor);
          DrawBox (bx, pl, pl * (1.0 - bw1), time[pBar], time[i], InpLowColor);
-         AddLevel(pl, pl, pl * (1.0 - bw1), time[pBar], false, ln, bx);
+         AddLevel(pl, pl, pl * (1.0 - bw1), time[pBar], false, high[pBar] - low[pBar], ln, bx);
 
          int  priorTrend = g_trend;
          bool isLL = (g_lastPL == 0 || pl < g_lastPL);
@@ -803,10 +811,10 @@ int OnCalculate(const int rates_total,
       // the zone — not deferred to bar close.
       if(InpLvlAlerts && i == rates_total - 1)
         {
-         double thr = GetApproachThreshold();
          for(int j = 0; j < g_nLv; j++)
            {
-            double lp = g_lv[j].price;
+            double thr = GetApproachThreshold(g_lv[j].swingRange);
+            double lp  = g_lv[j].price;
             if(!g_lv[j].broken)
               {
                // Unbroken resistance: approach from below
