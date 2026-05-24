@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.71"
+#property version   "1.72"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 8
@@ -662,8 +662,8 @@ int OnCalculate(const int rates_total,
          string ln = PFX + "LH_" + IntegerToString(pBar);
          string bx = PFX + "BH_" + IntegerToString(pBar);
          DrawLine(ln, ph, time[pBar], time[i], InpHighColor);
-         DrawBox (bx, ph * (1.0 + bw1), ph, time[pBar], time[i], InpHighColor);
-         AddLevel(ph, ph * (1.0 + bw1), ph, time[pBar], true, high[pBar] - low[pBar], ln, bx);
+         DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpHighColor);
+         AddLevel(ph, high[pBar], low[pBar], time[pBar], true, high[pBar] - low[pBar], ln, bx);
 
          // Capture prior trend before any update (fixes withTrend ordering bug)
          int priorTrend = g_trend;
@@ -731,8 +731,8 @@ int OnCalculate(const int rates_total,
          string ln = PFX + "LL_" + IntegerToString(pBar);
          string bx = PFX + "BL_" + IntegerToString(pBar);
          DrawLine(ln, pl, time[pBar], time[i], InpLowColor);
-         DrawBox (bx, pl, pl * (1.0 - bw1), time[pBar], time[i], InpLowColor);
-         AddLevel(pl, pl, pl * (1.0 - bw1), time[pBar], false, high[pBar] - low[pBar], ln, bx);
+         DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpLowColor);
+         AddLevel(pl, high[pBar], low[pBar], time[pBar], false, high[pBar] - low[pBar], ln, bx);
 
          int  priorTrend = g_trend;
          bool isLL = (g_lastPL == 0 || pl < g_lastPL);
@@ -813,39 +813,53 @@ int OnCalculate(const int rates_total,
         {
          for(int j = 0; j < g_nLv; j++)
            {
-            double thr = GetApproachThreshold(g_lv[j].swingRange);
-            double lp  = g_lv[j].price;
+            double lp = g_lv[j].price;
+            bool inZone, inFlipZone;
+
+            if(InpApproachMode == 0)
+              {
+               // Mode 0 (default): price enters the full pivot candle range box.
+               // Resistance approach: bar enters box from below, hasn't closed above.
+               // Support approach:    bar enters box from above, hasn't closed below.
+               inZone     = g_lv[j].isHigh
+                            ? (high[i] >= g_lv[j].boxBot && close[i] < g_lv[j].boxTop)
+                            : (low[i]  <= g_lv[j].boxTop && close[i] > g_lv[j].boxBot);
+               // Flip roles are the mirror of the original
+               inFlipZone = g_lv[j].isHigh
+                            ? (low[i]  <= g_lv[j].boxTop && close[i] > g_lv[j].boxBot)
+                            : (high[i] >= g_lv[j].boxBot && close[i] < g_lv[j].boxTop);
+              }
+            else
+              {
+               // Modes 1/2: threshold distance from pivot price
+               double thr = GetApproachThreshold(g_lv[j].swingRange);
+               inZone     = g_lv[j].isHigh
+                            ? (high[i] >= lp - thr && close[i] < lp)
+                            : (low[i]  <= lp + thr && close[i] > lp);
+               inFlipZone = g_lv[j].isHigh
+                            ? (low[i]  <= lp + thr && close[i] > lp)
+                            : (high[i] >= lp - thr && close[i] < lp);
+              }
+
             if(!g_lv[j].broken)
               {
-               // Unbroken resistance: approach from below
-               // Unbroken support:    approach from above
-               bool inZone = g_lv[j].isHigh
-                             ? (high[i] >= lp - thr && close[i] < lp)
-                             : (low[i]  <= lp + thr && close[i] > lp);
                if(inZone && !g_lv[j].approached)
                  {
                   FireLvlAlert(g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT",
                                g_lv[j].isHigh ? "SELL READY" : "BUY READY", lp);
                   g_lv[j].approached = true;
                  }
-               if(!inZone) g_lv[j].approached = false;  // reset episode
+               if(!inZone) g_lv[j].approached = false;
               }
             else if(InpTrackFlips)
               {
-               // SBR: was support (isHigh=false), broke below → now resistance
-               //      price returns from below → approach from below
-               // RBS: was resistance (isHigh=true), broke above → now support
-               //      price returns from above → approach from above
-               bool inFlipZone = g_lv[j].isHigh
-                                 ? (low[i]  <= lp + thr && close[i] > lp)
-                                 : (high[i] >= lp - thr && close[i] < lp);
                if(inFlipZone && !g_lv[j].flipApproached)
                  {
                   FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
                                g_lv[j].isHigh ? "BUY READY" : "SELL READY", lp);
                   g_lv[j].flipApproached = true;
                  }
-               if(!inFlipZone) g_lv[j].flipApproached = false;  // reset episode
+               if(!inFlipZone) g_lv[j].flipApproached = false;
               }
            }
         }
