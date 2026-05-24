@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.79"
+#property version   "1.80"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -62,7 +62,6 @@ input bool   InpShowLines    = true;             // Show Level Lines
 input bool   InpExtendFill   = true;             // Extend Until Filled
 input bool   InpHideFilled   = false;            // Hide Filled Levels
 input bool   InpVolFilter    = true;             // Volume tiebreaker: skip weaker overlapping zones
-input bool   InpShowCTSig    = true;             // Show Counter-Trend Signals
 input bool   InpShowMSSZones = true;             // Draw FVG / OB Zones on Chart
 
 input group "=== Appearance ==="
@@ -833,11 +832,11 @@ int OnCalculate(const int rates_total,
                              isLive && i == rates_total - 1,
                              g_lastSellAlertBar);
               }
-            else if(InpShowCTSig)
+            else
               {
                BufSellCT[pBar] = ph;
                if(CheckMinRR(false, ph, sl))
-                  FireSignal("SELL", "Bull", ph, sl,
+                  FireSignal("RISKY SELL", "Bull", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastSellAlertBar);
@@ -923,14 +922,14 @@ int OnCalculate(const int rates_total,
                              isLive && i == rates_total - 1,
                              g_lastBuyAlertBar);
               }
-            else if(InpShowCTSig)
+            else
               {
                BufBuyCT[pBar] = pl;
                if(CheckMinRR(true, pl, sl))
-                  FireSignal("BUY", "Bear", pl, sl,
+                  FireSignal("RISKY BUY", "Bear", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
-                          g_lastBuyAlertBar);
+                             g_lastBuyAlertBar);
               }
            }
 
