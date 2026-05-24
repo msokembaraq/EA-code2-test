@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.77"
+#property version   "1.78"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -1011,7 +1011,7 @@ int OnCalculate(const int rates_total,
                      FireLvlAlert(lvTag, lvRdy, lp, g_lv[j].touches);
                     }
                  }
-               if(!inZone) g_lv[j].approached = false;
+               // approached stays true — no re-alert if price leaves and returns
               }
             else if(InpTrackFlips)
               {
@@ -1035,7 +1035,7 @@ int OnCalculate(const int rates_total,
                         FireLvlAlert(flipTag, flipRdy, lp, g_lv[j].touches);
                        }
                     }
-                  if(!inFlipZone) g_lv[j].flipApproached = false;
+                  // flipApproached stays true — one alert per flip level
                  }
               }
            }
