@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.60"
+#property version   "1.70"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 8
@@ -81,6 +81,13 @@ input group "=== Alerts & Push ==="
 input bool   InpAlerts       = true;             // Pop-up Alerts
 input bool   InpPush         = true;             // Push Notifications (mobile)
 
+input group "=== Level Approach Alerts ==="
+input bool   InpLvlAlerts    = true;             // Push when price nears a swing level
+input bool   InpTrackFlips   = true;             // Alert SBR / RBS on retests
+input int    InpApproachMode = 0;                // Approach zone: 0=ATR  1=Fixed pips
+input double InpApproachATR  = 0.5;             // ATR multiplier for approach zone
+input double InpApproachPips = 10.0;            // Pip distance for approach zone (mode 1)
+
 // ================================================================
 // BUFFERS  (6 plotted + 2 internal)
 // ================================================================
@@ -110,6 +117,9 @@ struct SLevel
    bool     isHigh;
    string   lineName;
    string   boxName;
+   bool     approached;      // approach alert active for current episode
+   bool     broken;          // price closed through (level flipped)
+   bool     flipApproached;  // SBR / RBS alert active for current episode
   };
 
 SLevel   g_lv[];
@@ -150,6 +160,7 @@ int      g_lastMSSAlertBar  = -1;
 int      g_chochBar         = -1;  // bar index of most recent CHoCH (for MSS skip guard)
 int      g_chochSeq         = 0;   // monotonic counter for unique MSS zone object names
 datetime g_lastExtTime      = 0;   // bar open time of last extension pass (P1: skip same-bar ticks)
+int      g_atrHandle        = INVALID_HANDLE;
 
 // ================================================================
 // OnInit
@@ -161,6 +172,10 @@ int OnInit()
       Alert("SP&L: InpSwingLeft and InpSwingRight must be >= 2");
       return INIT_PARAMETERS_INCORRECT;
      }
+
+   g_atrHandle = iATR(NULL, 0, 14);
+   if(g_atrHandle == INVALID_HANDLE)
+     { Print("SP&L: Failed to create ATR handle"); return INIT_FAILED; }
 
 //--- 6 plotted buffers
    SetIndexBuffer(0, BufBuyBull,  INDICATOR_DATA);
@@ -202,6 +217,7 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    ObjectsDeleteAll(0, PFX);
+   if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
   }
 
 // ================================================================
@@ -311,6 +327,27 @@ void FireSignal(const string &dir, const string &label,
   }
 
 // ================================================================
+// HELPERS : level approach threshold + alert
+// ================================================================
+double GetApproachThreshold()
+  {
+   if(InpApproachMode == 1 || g_atrHandle == INVALID_HANDLE)
+      return InpApproachPips * _Point;
+   double atr[1];
+   if(CopyBuffer(g_atrHandle, 0, 0, 1, atr) > 0)
+      return atr[0] * InpApproachATR;
+   return InpApproachPips * _Point;
+  }
+
+void FireLvlAlert(const string &tag, const string &rdy, double price)
+  {
+   if(!InpAlerts && !InpPush) return;
+   string msg = tag + " " + _Symbol + " " + DoubleToString(price, _Digits) + " | " + rdy;
+   if(InpAlerts) Alert(msg);
+   if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
+  }
+
+// ================================================================
 // HELPERS : object drawing
 // ================================================================
 void DrawLine(const string &name, double price,
@@ -415,13 +452,16 @@ void AddLevel(double price, double top, double bot,
               const string &ln, const string &bx)
   {
    ArrayResize(g_lv, g_nLv + 1);
-   g_lv[g_nLv].price    = price;
-   g_lv[g_nLv].boxTop   = top;
-   g_lv[g_nLv].boxBot   = bot;
-   g_lv[g_nLv].t1       = t1;
-   g_lv[g_nLv].isHigh   = isHigh;
-   g_lv[g_nLv].lineName = ln;
-   g_lv[g_nLv].boxName  = bx;
+   g_lv[g_nLv].price         = price;
+   g_lv[g_nLv].boxTop        = top;
+   g_lv[g_nLv].boxBot        = bot;
+   g_lv[g_nLv].t1            = t1;
+   g_lv[g_nLv].isHigh        = isHigh;
+   g_lv[g_nLv].lineName      = ln;
+   g_lv[g_nLv].boxName       = bx;
+   g_lv[g_nLv].approached    = false;
+   g_lv[g_nLv].broken        = false;
+   g_lv[g_nLv].flipApproached= false;
    g_nLv++;
   }
 
@@ -741,6 +781,67 @@ int OnCalculate(const int rates_total,
          g_lastPL = pl;  g_lastPLBar = pBar;
         }
 
+      // ── LEVEL BREAK TRACKING (all bars) ──────────────────────────
+      // Detects when price closes through a swing level and marks it
+      // as broken so the SBR / RBS flip logic can take over.
+      for(int j = 0; j < g_nLv; j++)
+        {
+         if(g_lv[j].broken) continue;
+         bool broke = g_lv[j].isHigh
+                      ? (close[i] > g_lv[j].boxTop)
+                      : (close[i] < g_lv[j].boxBot);
+         if(broke)
+           {
+            g_lv[j].broken         = true;
+            g_lv[j].approached     = false;
+            g_lv[j].flipApproached = false;
+           }
+        }
+
+      // ── LEVEL APPROACH ALERTS (live bar, every tick) ─────────────
+      // Runs on every tick so the alert fires as soon as price enters
+      // the zone — not deferred to bar close.
+      if(InpLvlAlerts && i == rates_total - 1)
+        {
+         double thr = GetApproachThreshold();
+         for(int j = 0; j < g_nLv; j++)
+           {
+            double lp = g_lv[j].price;
+            if(!g_lv[j].broken)
+              {
+               // Unbroken resistance: approach from below
+               // Unbroken support:    approach from above
+               bool inZone = g_lv[j].isHigh
+                             ? (high[i] >= lp - thr && close[i] < lp)
+                             : (low[i]  <= lp + thr && close[i] > lp);
+               if(inZone && !g_lv[j].approached)
+                 {
+                  FireLvlAlert(g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT",
+                               g_lv[j].isHigh ? "SELL READY" : "BUY READY", lp);
+                  g_lv[j].approached = true;
+                 }
+               if(!inZone) g_lv[j].approached = false;  // reset episode
+              }
+            else if(InpTrackFlips)
+              {
+               // SBR: was support (isHigh=false), broke below → now resistance
+               //      price returns from below → approach from below
+               // RBS: was resistance (isHigh=true), broke above → now support
+               //      price returns from above → approach from above
+               bool inFlipZone = g_lv[j].isHigh
+                                 ? (low[i]  <= lp + thr && close[i] > lp)
+                                 : (high[i] >= lp - thr && close[i] < lp);
+               if(inFlipZone && !g_lv[j].flipApproached)
+                 {
+                  FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
+                               g_lv[j].isHigh ? "BUY READY" : "SELL READY", lp);
+                  g_lv[j].flipApproached = true;
+                 }
+               if(!inFlipZone) g_lv[j].flipApproached = false;  // reset episode
+              }
+           }
+        }
+
       // ── MSS ZONE ENTRY CHECK ────────────────────────────────────
       // Skip on the exact bar where a CHoCH fired (g_chochBar) to avoid
       // entering the breakout candle as an MSS trade.
@@ -813,9 +914,30 @@ int OnCalculate(const int rates_total,
          int j = 0;
          while(j < g_nLv)
            {
-            double lp     = g_lv[j].price;
-            bool   filled = (high[i] >= lp && low[i] <= lp);
-            color  col    = g_lv[j].isHigh ? InpHighColor : InpLowColor;
+            double lp  = g_lv[j].price;
+            color  col = g_lv[j].isHigh ? InpHighColor : InpLowColor;
+
+            if(g_lv[j].broken)
+              {
+               if(!InpTrackFlips) { RemoveLevel(j); continue; }
+
+               // Double-break: flip role also broken → remove permanently
+               bool doubleBroke = g_lv[j].isHigh
+                                  ? (close[i] < g_lv[j].boxBot)
+                                  : (close[i] > g_lv[j].boxTop);
+               if(doubleBroke) { RemoveLevel(j); continue; }
+
+               // Draw at 35% brightness to distinguish flipped levels
+               color dimCol = (color)(((int)(((col >> 16) & 0xFF) * 0.35) << 16) |
+                                      ((int)(((col >>  8) & 0xFF) * 0.35) <<  8) |
+                                       (int)((col & 0xFF) * 0.35));
+               DrawLine(g_lv[j].lineName, lp, g_lv[j].t1, tNow, dimCol);
+               DrawBox (g_lv[j].boxName, g_lv[j].boxTop, g_lv[j].boxBot,
+                        g_lv[j].t1, tNow, dimCol);
+               j++; continue;
+              }
+
+            bool filled = (high[i] >= lp && low[i] <= lp);
 
             if(filled && InpHideFilled)
               { RemoveLevel(j); continue; }
