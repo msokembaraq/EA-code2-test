@@ -7,10 +7,10 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.75"
+#property version   "1.76"
 #property indicator_chart_window
 #property indicator_plots   6
-#property indicator_buffers 8
+#property indicator_buffers 10
 
 //--- Plot 0 : BUY  With-Trend  (HL confirmed in bull)
 #property indicator_label1  "BUY - Bull"
@@ -52,8 +52,9 @@
 // INPUTS
 // ================================================================
 input group "=== Swing Detection ==="
-input int    InpSwingRight   = 15;               // Bars Right
-input int    InpSwingLeft    = 15;               // Bars Left
+input int    InpSwingRight        = 15;          // Bars Right (confirmed signal + drawing)
+input int    InpSwingLeft         = 15;          // Bars Left
+input int    InpSwingRightSignal  = 5;           // Bars Right for early PROBABLE signal (0=off)
 
 input group "=== Display ==="
 input bool   InpShowBoxes    = true;             // Show Liquidity Boxes
@@ -81,6 +82,7 @@ input color  InpOBColor      = C'140,60,0';      // OB zone colour
 input group "=== Alerts & Push ==="
 input bool   InpAlerts       = true;             // Pop-up Alerts
 input bool   InpPush         = true;             // Push Notifications (mobile)
+input double InpMinRR        = 1.0;              // Min R:R to nearest opposing level (0=off)
 
 input group "=== Level Approach Alerts ==="
 input bool   InpLvlAlerts    = true;             // Push when price nears a swing level
@@ -101,6 +103,8 @@ double BufSellCT[];     // plot 4
 double BufSellMSS[];    // plot 5
 double BufPivHProc[];   // internal: pivot-high "already processed" flag
 double BufPivLProc[];   // internal: pivot-low  "already processed" flag
+double BufPivHEarly[];  // internal: pivot-high "early signal fired" flag
+double BufPivLEarly[];  // internal: pivot-low  "early signal fired" flag
 
 // ================================================================
 // CONSTANTS & GLOBALS
@@ -163,6 +167,8 @@ bool     g_mssBull   = false;
 int      g_lastBuyAlertBar  = -1;
 int      g_lastSellAlertBar = -1;
 int      g_lastMSSAlertBar  = -1;
+int      g_lastProbBuyBar   = -1;   // dedup for PROBABLE BUY early alerts
+int      g_lastProbSellBar  = -1;   // dedup for PROBABLE SELL early alerts
 int      g_chochBar         = -1;  // bar index of most recent CHoCH (for MSS skip guard)
 int      g_chochSeq         = 0;   // monotonic counter for unique MSS zone object names
 datetime g_lastExtTime      = 0;   // bar open time of last extension pass (P1: skip same-bar ticks)
@@ -192,8 +198,11 @@ int OnInit()
    SetIndexBuffer(5, BufSellMSS,  INDICATOR_DATA);
 
 //--- 2 internal tracking buffers (not plotted, used as "processed" flags)
-   SetIndexBuffer(6, BufPivHProc, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(7, BufPivLProc, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(6, BufPivHProc,  INDICATOR_CALCULATIONS);
+   SetIndexBuffer(7, BufPivLProc,  INDICATOR_CALCULATIONS);
+//--- 2 internal early-signal tracking buffers
+   SetIndexBuffer(8, BufPivHEarly, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(9, BufPivLEarly, INDICATOR_CALCULATIONS);
 
 //--- Circles (●) for all signal types — the confirmed pivot dot IS the signal
    PlotIndexSetInteger(0, PLOT_ARROW, 159);
@@ -509,6 +518,8 @@ void ResetAll()
    g_lastBuyAlertBar  = -1;
    g_lastSellAlertBar = -1;
    g_lastMSSAlertBar  = -1;
+   g_lastProbBuyBar   = -1;
+   g_lastProbSellBar  = -1;
    g_chochBar         = -1;
    g_chochSeq         = 0;
    g_lastExtTime      = 0;
@@ -610,6 +621,40 @@ void FindMSSZones(int legStart, int legEnd, bool isBullLeg,
   }
 
 // ================================================================
+// HELPERS : R:R pre-check
+// Returns true if the nearest opposing level is far enough away to
+// justify the trade (opposing distance >= slDist * InpMinRR).
+// isBuy=true  → check nearest resistance ABOVE entry (limits BUY upside)
+// isBuy=false → check nearest support BELOW entry (limits SELL downside)
+// ================================================================
+bool CheckMinRR(bool isBuy, double entry, double sl)
+  {
+   if(InpMinRR <= 0.0) return true;
+   double slDist = MathAbs(entry - sl);
+   if(slDist < _Point) return true;   // degenerate SL, don't block signal
+
+   double nearestDist = DBL_MAX / 2.0;
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      if(isBuy && g_lv[k].isHigh)
+        {
+         // Resistance zone above entry — price meets it at boxBot on the way up
+         double d = g_lv[k].boxBot - entry;
+         if(d > 0.0 && d < nearestDist) nearestDist = d;
+        }
+      else if(!isBuy && !g_lv[k].isHigh)
+        {
+         // Support zone below entry — price meets it at boxTop on the way down
+         double d = entry - g_lv[k].boxTop;
+         if(d > 0.0 && d < nearestDist) nearestDist = d;
+        }
+     }
+   if(nearestDist >= DBL_MAX / 4.0) return true;  // no opposing level found
+   return (nearestDist >= slDist * InpMinRR);
+  }
+
+// ================================================================
 // OnCalculate
 // ================================================================
 int OnCalculate(const int rates_total,
@@ -628,7 +673,7 @@ int OnCalculate(const int rates_total,
    if(prev_calculated == 0)
      {
       ResetAll();
-      // BufPivHProc / BufPivLProc are auto-initialised to 0 by MT5 on full recalc
+      // BufPivHProc/BufPivLProc/BufPivHEarly/BufPivLEarly auto-init to 0 by MT5
       ArrayInitialize(BufBuyBull,  0);
       ArrayInitialize(BufBuyCT,    0);
       ArrayInitialize(BufBuyMSS,   0);
@@ -650,6 +695,54 @@ int OnCalculate(const int rates_total,
    // ================================================================
    for(int i = startBar; i < rates_total; i++)
      {
+      // ── EARLY (PROBABLE) SIGNAL ──────────────────────────────────────
+      // Fires after InpSwingRightSignal confirmed right bars — earlier
+      // warning than the full confirmed signal. May repaint if later bars
+      // invalidate the pivot. R:R check still applies.
+      if(InpSwingRightSignal > 0 && InpSwingRightSignal < InpSwingRight)
+        {
+         int ep = i - InpSwingRightSignal;
+         if(ep >= InpSwingLeft)
+           {
+            if(IsPivotHigh(high, ep, InpSwingLeft, InpSwingRightSignal, rates_total)
+               && BufPivHEarly[ep] == 0.0)
+              {
+               BufPivHEarly[ep] = 1.0;
+               double eph = high[ep];
+               if(g_lastPH > 0.0 && eph <= g_lastPH)   // probable LH → SELL
+                 {
+                  double epSL = (g_lastPH > eph) ? g_lastPH : eph * 1.001;
+                  double etp1, etp2, etp3;
+                  FindSellTPs(eph, etp1, etp2, etp3);
+                  if(CheckMinRR(false, eph, epSL))
+                    {
+                     string epDirS = "PROBABLE SELL"; string epLblS = "Bear?";
+                     FireSignal(epDirS, epLblS, eph, epSL, etp1, etp2, etp3,
+                                i, isLive && i == rates_total - 1, g_lastProbSellBar);
+                    }
+                 }
+              }
+            if(IsPivotLow(low, ep, InpSwingLeft, InpSwingRightSignal, rates_total)
+               && BufPivLEarly[ep] == 0.0)
+              {
+               BufPivLEarly[ep] = 1.0;
+               double epl = low[ep];
+               if(g_lastPL > 0.0 && epl >= g_lastPL)   // probable HL → BUY
+                 {
+                  double epSL = (g_lastPL > 0.0 && g_lastPL < epl) ? g_lastPL : epl * 0.999;
+                  double etp1, etp2, etp3;
+                  FindBuyTPs(epl, etp1, etp2, etp3);
+                  if(CheckMinRR(true, epl, epSL))
+                    {
+                     string epDirB = "PROBABLE BUY"; string epLblB = "Bull?";
+                     FireSignal(epDirB, epLblB, epl, epSL, etp1, etp2, etp3,
+                                i, isLive && i == rates_total - 1, g_lastProbBuyBar);
+                    }
+                 }
+              }
+           }
+        }
+
       int pBar = i - InpSwingRight;
       if(pBar < InpSwingLeft) continue;
 
@@ -732,19 +825,21 @@ int OnCalculate(const int rates_total,
 
             if(withTrend)
               {
-               BufSellBear[pBar] = ph;
-               FireSignal("SELL", "Bear", ph, sl,
-                          tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1,
-                          g_lastSellAlertBar);
+               BufSellBear[pBar] = ph;   // dot always drawn (shows structure)
+               if(CheckMinRR(false, ph, sl))
+                  FireSignal("SELL", "Bear", ph, sl,
+                             tp1, tp2, tp3, i,
+                             isLive && i == rates_total - 1,
+                             g_lastSellAlertBar);
               }
             else if(InpShowCTSig)
               {
                BufSellCT[pBar] = ph;
-               FireSignal("SELL", "Bull", ph, sl,
-                          tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1,
-                          g_lastSellAlertBar);
+               if(CheckMinRR(false, ph, sl))
+                  FireSignal("SELL", "Bull", ph, sl,
+                             tp1, tp2, tp3, i,
+                             isLive && i == rates_total - 1,
+                             g_lastSellAlertBar);
               }
            }
 
@@ -820,18 +915,20 @@ int OnCalculate(const int rates_total,
 
             if(withTrend)
               {
-               BufBuyBull[pBar] = pl;
-               FireSignal("BUY", "Bull", pl, sl,
-                          tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1,
-                          g_lastBuyAlertBar);
+               BufBuyBull[pBar] = pl;    // dot always drawn (shows structure)
+               if(CheckMinRR(true, pl, sl))
+                  FireSignal("BUY", "Bull", pl, sl,
+                             tp1, tp2, tp3, i,
+                             isLive && i == rates_total - 1,
+                             g_lastBuyAlertBar);
               }
             else if(InpShowCTSig)
               {
                BufBuyCT[pBar] = pl;
-               FireSignal("BUY", "Bear", pl, sl,
-                          tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1,
+               if(CheckMinRR(true, pl, sl))
+                  FireSignal("BUY", "Bear", pl, sl,
+                             tp1, tp2, tp3, i,
+                             isLive && i == rates_total - 1,
                           g_lastBuyAlertBar);
               }
            }
