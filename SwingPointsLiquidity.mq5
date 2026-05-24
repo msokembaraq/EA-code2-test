@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.73"
+#property version   "1.74"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 8
@@ -60,6 +60,7 @@ input bool   InpShowBoxes    = true;             // Show Liquidity Boxes
 input bool   InpShowLines    = true;             // Show Level Lines
 input bool   InpExtendFill   = true;             // Extend Until Filled
 input bool   InpHideFilled   = false;            // Hide Filled Levels
+input bool   InpVolFilter    = true;             // Volume tiebreaker: skip weaker overlapping zones
 input bool   InpShowCTSig    = true;             // Show Counter-Trend Signals
 input bool   InpShowMSSZones = true;             // Draw FVG / OB Zones on Chart
 
@@ -119,6 +120,7 @@ struct SLevel
    string   lineName;
    string   boxName;
    double   swingRange;      // pivot candle range (high-low) used for approach threshold
+   long     pivotVolume;     // tick_volume at pivot candle (overlap tiebreaker)
    int      touches;         // number of approach episodes (shown in push notification)
    int      brokenBar;       // bar index when level was broken (-1 = still active)
    bool     approached;      // approach alert active for current episode
@@ -459,23 +461,24 @@ void DrawChochLabel(const string &name, const string &txt,
 // HELPERS : level array
 // ================================================================
 void AddLevel(double price, double top, double bot,
-              datetime t1, bool isHigh, double swingRange,
+              datetime t1, bool isHigh, double swingRange, long pivotVolume,
               const string &ln, const string &bx)
   {
    ArrayResize(g_lv, g_nLv + 1);
-   g_lv[g_nLv].price         = price;
-   g_lv[g_nLv].boxTop        = top;
-   g_lv[g_nLv].boxBot        = bot;
-   g_lv[g_nLv].t1            = t1;
-   g_lv[g_nLv].isHigh        = isHigh;
-   g_lv[g_nLv].lineName      = ln;
-   g_lv[g_nLv].boxName       = bx;
+   g_lv[g_nLv].price          = price;
+   g_lv[g_nLv].boxTop         = top;
+   g_lv[g_nLv].boxBot         = bot;
+   g_lv[g_nLv].t1             = t1;
+   g_lv[g_nLv].isHigh         = isHigh;
+   g_lv[g_nLv].lineName       = ln;
+   g_lv[g_nLv].boxName        = bx;
    g_lv[g_nLv].swingRange     = swingRange;
-   g_lv[g_nLv].touches       = 0;
-   g_lv[g_nLv].brokenBar     = -1;
-   g_lv[g_nLv].approached    = false;
-   g_lv[g_nLv].broken        = false;
-   g_lv[g_nLv].flipApproached= false;
+   g_lv[g_nLv].pivotVolume    = pivotVolume;
+   g_lv[g_nLv].touches        = 0;
+   g_lv[g_nLv].brokenBar      = -1;
+   g_lv[g_nLv].approached     = false;
+   g_lv[g_nLv].broken         = false;
+   g_lv[g_nLv].flipApproached = false;
    g_nLv++;
   }
 
@@ -665,11 +668,32 @@ int OnCalculate(const int rates_total,
          double ph = high[pBar];
 
          // Draw liquidity line + box
+         // Volume tiebreaker: if new box overlaps an existing high zone, keep the
+         // higher-volume pivot and evict the weaker one. If existing wins, skip new.
          string ln = PFX + "LH_" + IntegerToString(pBar);
          string bx = PFX + "BH_" + IntegerToString(pBar);
-         DrawLine(ln, ph, time[pBar], time[i], InpHighColor);
-         DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpHighColor);
-         AddLevel(ph, high[pBar], low[pBar], time[pBar], true, high[pBar] - low[pBar], ln, bx);
+         bool addZonePH = true;
+         if(InpVolFilter)
+           {
+            for(int k = 0; k < g_nLv && addZonePH; k++)
+              {
+               if(!g_lv[k].isHigh || g_lv[k].broken) continue;
+               if(high[pBar] >= g_lv[k].boxBot && low[pBar] <= g_lv[k].boxTop)
+                 {
+                  if(tick_volume[pBar] > g_lv[k].pivotVolume)
+                     RemoveLevel(k);        // new zone is stronger — evict old
+                  else
+                     addZonePH = false;     // existing zone is stronger — skip new
+                 }
+              }
+           }
+         if(addZonePH)
+           {
+            DrawLine(ln, ph, time[pBar], time[i], InpHighColor);
+            DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpHighColor);
+            AddLevel(ph, high[pBar], low[pBar], time[pBar], true,
+                     high[pBar] - low[pBar], tick_volume[pBar], ln, bx);
+           }
 
          // Capture prior trend before any update (fixes withTrend ordering bug)
          int priorTrend = g_trend;
@@ -736,9 +760,28 @@ int OnCalculate(const int rates_total,
 
          string ln = PFX + "LL_" + IntegerToString(pBar);
          string bx = PFX + "BL_" + IntegerToString(pBar);
-         DrawLine(ln, pl, time[pBar], time[i], InpLowColor);
-         DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpLowColor);
-         AddLevel(pl, high[pBar], low[pBar], time[pBar], false, high[pBar] - low[pBar], ln, bx);
+         bool addZonePL = true;
+         if(InpVolFilter)
+           {
+            for(int k = 0; k < g_nLv && addZonePL; k++)
+              {
+               if(g_lv[k].isHigh || g_lv[k].broken) continue;
+               if(high[pBar] >= g_lv[k].boxBot && low[pBar] <= g_lv[k].boxTop)
+                 {
+                  if(tick_volume[pBar] > g_lv[k].pivotVolume)
+                     RemoveLevel(k);        // new zone is stronger — evict old
+                  else
+                     addZonePL = false;     // existing zone is stronger — skip new
+                 }
+              }
+           }
+         if(addZonePL)
+           {
+            DrawLine(ln, pl, time[pBar], time[i], InpLowColor);
+            DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpLowColor);
+            AddLevel(pl, high[pBar], low[pBar], time[pBar], false,
+                     high[pBar] - low[pBar], tick_volume[pBar], ln, bx);
+           }
 
          int  priorTrend = g_trend;
          bool isLL = (g_lastPL == 0 || pl < g_lastPL);
@@ -852,11 +895,14 @@ int OnCalculate(const int rates_total,
               {
                if(inZone && !g_lv[j].approached)
                  {
-                  g_lv[j].touches++;
-                  FireLvlAlert(g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT",
-                               g_lv[j].isHigh ? "SELL READY" : "BUY READY",
-                               lp, g_lv[j].touches);
                   g_lv[j].approached = true;
+                  if(InpAlerts || InpPush)
+                    {
+                     g_lv[j].touches++;
+                     FireLvlAlert(g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT",
+                                  g_lv[j].isHigh ? "SELL READY" : "BUY READY",
+                                  lp, g_lv[j].touches);
+                    }
                  }
                if(!inZone) g_lv[j].approached = false;
               }
@@ -870,11 +916,14 @@ int OnCalculate(const int rates_total,
                  {
                   if(inFlipZone && !g_lv[j].flipApproached)
                     {
-                     g_lv[j].touches++;
-                     FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
-                                  g_lv[j].isHigh ? "BUY READY" : "SELL READY",
-                                  lp, g_lv[j].touches);
                      g_lv[j].flipApproached = true;
+                     if(InpAlerts || InpPush)
+                       {
+                        g_lv[j].touches++;
+                        FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
+                                     g_lv[j].isHigh ? "BUY READY" : "SELL READY",
+                                     lp, g_lv[j].touches);
+                       }
                     }
                   if(!inFlipZone) g_lv[j].flipApproached = false;
                  }
@@ -973,13 +1022,18 @@ int OnCalculate(const int rates_total,
                                   : (close[i] > g_lv[j].boxTop);
                if(doubleBroke) { RemoveLevel(j); continue; }
 
-               // Draw at 35% brightness to distinguish flipped levels
+               // Draw at 35% brightness to distinguish flipped levels.
+               // DrawLine/DrawBox only update coordinates on existing objects;
+               // color must be set explicitly via ObjectSetInteger.
                color dimCol = (color)(((int)(((col >> 16) & 0xFF) * 0.35) << 16) |
                                       ((int)(((col >>  8) & 0xFF) * 0.35) <<  8) |
                                        (int)((col & 0xFF) * 0.35));
                DrawLine(g_lv[j].lineName, lp, g_lv[j].t1, tNow, dimCol);
                DrawBox (g_lv[j].boxName, g_lv[j].boxTop, g_lv[j].boxBot,
                         g_lv[j].t1, tNow, dimCol);
+               ObjectSetInteger(0, g_lv[j].lineName, OBJPROP_COLOR,   dimCol);
+               ObjectSetInteger(0, g_lv[j].boxName,  OBJPROP_COLOR,   dimCol);
+               ObjectSetInteger(0, g_lv[j].boxName,  OBJPROP_BGCOLOR, dimCol);
                j++; continue;
               }
 
