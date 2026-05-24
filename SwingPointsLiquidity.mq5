@@ -7,9 +7,10 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.50"
+#property version   "1.60"
 #property indicator_chart_window
-#property indicator_plots 6
+#property indicator_plots   6
+#property indicator_buffers 8
 
 //--- Plot 0 : BUY  With-Trend  (HL confirmed in bull)
 #property indicator_label1  "BUY - Bull"
@@ -147,12 +148,20 @@ int      g_lastBuyAlertBar  = -1;
 int      g_lastSellAlertBar = -1;
 int      g_lastMSSAlertBar  = -1;
 int      g_chochBar         = -1;  // bar index of most recent CHoCH (for MSS skip guard)
+int      g_chochSeq         = 0;   // monotonic counter for unique MSS zone object names
+datetime g_lastExtTime      = 0;   // bar open time of last extension pass (P1: skip same-bar ticks)
 
 // ================================================================
 // OnInit
 // ================================================================
 int OnInit()
   {
+   if(InpSwingLeft < 2 || InpSwingRight < 2)
+     {
+      Alert("SP&L: InpSwingLeft and InpSwingRight must be >= 2");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+
 //--- 6 plotted buffers
    SetIndexBuffer(0, BufBuyBull,  INDICATOR_DATA);
    SetIndexBuffer(1, BufBuyCT,    INDICATOR_DATA);
@@ -243,10 +252,12 @@ void AddSwingLow(double p)
 void FindBuyTPs(double entry, double &tp1, double &tp2, double &tp3)
   {
    tp1 = tp2 = tp3 = 0.0;
-   double c[]; int n = 0;
+   if(g_nSH == 0) return;
+   double c[]; ArrayResize(c, g_nSH); int n = 0;
    for(int i = 0; i < g_nSH; i++)
-      if(g_swHi[i] > entry) { ArrayResize(c, n + 1); c[n++] = g_swHi[i]; }
+      if(g_swHi[i] > entry) c[n++] = g_swHi[i];
    if(n == 0) return;
+   ArrayResize(c, n);
    ArraySort(c);
    if(n >= 1) tp1 = c[0];
    if(n >= 2) tp2 = c[1];
@@ -256,10 +267,12 @@ void FindBuyTPs(double entry, double &tp1, double &tp2, double &tp3)
 void FindSellTPs(double entry, double &tp1, double &tp2, double &tp3)
   {
    tp1 = tp2 = tp3 = 0.0;
-   double c[]; int n = 0;
+   if(g_nSL == 0) return;
+   double c[]; ArrayResize(c, g_nSL); int n = 0;
    for(int i = 0; i < g_nSL; i++)
-      if(g_swLo[i] < entry) { ArrayResize(c, n + 1); c[n++] = g_swLo[i]; }
+      if(g_swLo[i] < entry) c[n++] = g_swLo[i];
    if(n == 0) return;
+   ArrayResize(c, n);
    ArraySort(c);
    // reverse → closest below entry first
    for(int i = 0, j = n - 1; i < j; i++, j--) { double t = c[i]; c[i] = c[j]; c[j] = t; }
@@ -294,7 +307,7 @@ void FireSignal(const string &dir, const string &label,
                 " | TP3: " + PriceStr(tp3);
 
    if(InpAlerts) Alert(msg);
-   if(InpPush)   SendNotification(msg);
+   if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
   }
 
 // ================================================================
@@ -440,6 +453,8 @@ void ResetAll()
    g_lastSellAlertBar = -1;
    g_lastMSSAlertBar  = -1;
    g_chochBar         = -1;
+   g_chochSeq         = 0;
+   g_lastExtTime      = 0;
   }
 
 // ================================================================
@@ -572,7 +587,6 @@ int OnCalculate(const int rates_total,
    datetime tNow   = time[rates_total - 1];
    double   bw1    = 0.001 * InpBoxWidth;
    bool     isLive = (prev_calculated > 0);
-   static int chochSeq = 0;
 
    // ================================================================
    // MAIN BAR LOOP  (oldest → newest)
@@ -610,12 +624,12 @@ int OnCalculate(const int rates_total,
          if(isHH && priorTrend == -1)
            {
             // ─── CHoCH: bear → bull ────────────────────────────
-            chochSeq++;
+            g_chochSeq++;
             DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pBar),
                            "CHoCH", time[pBar], ph, InpMSSBullCol, false);
             int legStart = (g_lastPHBar >= 0) ? g_lastPHBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, true,
-                         high, low, open, close, time, rates_total, chochSeq);
+                         high, low, open, close, time, rates_total, g_chochSeq);
             // FIX: SL for BUY MSS = last swing LOW (structural support below zones)
             g_mssSL    = (g_lastPL > 0) ? g_lastPL : ph * 0.999;
             g_mssBull  = true;
@@ -678,12 +692,12 @@ int OnCalculate(const int rates_total,
          if(isLL && priorTrend == 1)
            {
             // ─── CHoCH: bull → bear ────────────────────────────
-            chochSeq++;
+            g_chochSeq++;
             DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pBar),
                            "CHoCH", time[pBar], pl, InpMSSBearCol, true);
             int legStart = (g_lastPLBar >= 0) ? g_lastPLBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, false,
-                         high, low, open, close, time, rates_total, chochSeq);
+                         high, low, open, close, time, rates_total, g_chochSeq);
             // FIX: SL for SELL MSS = last swing HIGH (structural resistance above zones)
             g_mssSL    = (g_lastPH > 0) ? g_lastPH : pl * 1.001;
             g_mssBull  = false;
@@ -760,7 +774,7 @@ int OnCalculate(const int rates_total,
 
                if(g_mssBull)
                  {
-                  BufBuyMSS[i] = low[i];
+                  BufBuyMSS[i] = entryPx;
                   FindBuyTPs(entryPx, tp1, tp2, tp3);
                   FireSignal("BUY", zType, entryPx, g_mssSL,
                              tp1, tp2, tp3, i,
@@ -769,7 +783,7 @@ int OnCalculate(const int rates_total,
                  }
                else
                  {
-                  BufSellMSS[i] = high[i];
+                  BufSellMSS[i] = entryPx;
                   FindSellTPs(entryPx, tp1, tp2, tp3);
                   FireSignal("SELL", zType, entryPx, g_mssSL,
                              tp1, tp2, tp3, i,
@@ -782,21 +796,20 @@ int OnCalculate(const int rates_total,
            }
         }
 
-      // ── EXTEND ACTIVE MSS ZONES (live bar only) ─────────────────
-      if(i == rates_total - 1)
+      // ── EXTEND ACTIVE ZONES & LEVELS (once per new bar, not per tick) ─
+      if(i == rates_total - 1 && tNow != g_lastExtTime)
         {
+         g_lastExtTime = tNow;
+
+         // MSS zones — use stored t1, only update right edge
          for(int z = 0; z < g_nMSSZones; z++)
             if(g_mssZones[z].active)
-               // Use stored t1 — NOT time[0] — to preserve the correct left edge
                DrawMSSZoneBox(g_mssZones[z].boxName,
                               g_mssZones[z].top, g_mssZones[z].bot,
                               g_mssZones[z].t1, tNow,
                               g_mssZones[z].isFVG, g_mssZones[z].isBull);
-        }
 
-      // ── EXTEND LIQUIDITY LEVELS (live bar only) ─────────────────
-      if(i == rates_total - 1)
-        {
+         // Liquidity levels
          int j = 0;
          while(j < g_nLv)
            {
