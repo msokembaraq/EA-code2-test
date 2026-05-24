@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.76"
+#property version   "1.77"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -86,6 +86,7 @@ input double InpMinRR        = 1.0;              // Min R:R to nearest opposing 
 
 input group "=== Level Approach Alerts ==="
 input bool   InpLvlAlerts    = true;             // Push when price nears a swing level
+input bool   InpTrendFilter  = true;             // Suppress contra-trend approach alerts
 input bool   InpTrackFlips   = true;             // Alert SBR / RBS on retests
 input int    InpApproachMode = 0;                // 0=Swing range  1=ATR  2=Fixed pips
 input double InpApproachMult = 0.5;             // Multiplier for swing / ATR modes
@@ -999,7 +1000,10 @@ int OnCalculate(const int rates_total,
                if(inZone && !g_lv[j].approached)
                  {
                   g_lv[j].approached = true;
-                  if(InpAlerts || InpPush)
+                  // Trend filter: RESISTANCE→SELL suppressed in bull; SUPPORT→BUY suppressed in bear
+                  bool trendOK = !InpTrendFilter ||
+                                 (g_lv[j].isHigh ? g_trend <= 0 : g_trend >= 0);
+                  if(trendOK && (InpAlerts || InpPush))
                     {
                      g_lv[j].touches++;
                      string lvTag = g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT";
@@ -1020,7 +1024,10 @@ int OnCalculate(const int rates_total,
                   if(inFlipZone && !g_lv[j].flipApproached)
                     {
                      g_lv[j].flipApproached = true;
-                     if(InpAlerts || InpPush)
+                     // Trend filter: RBS→BUY suppressed in bear; SBR→SELL suppressed in bull
+                     bool flipTrendOK = !InpTrendFilter ||
+                                        (g_lv[j].isHigh ? g_trend >= 0 : g_trend <= 0);
+                     if(flipTrendOK && (InpAlerts || InpPush))
                        {
                         g_lv[j].touches++;
                         string flipTag = g_lv[j].isHigh ? "RBS" : "SBR";
