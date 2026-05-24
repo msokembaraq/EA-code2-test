@@ -7,17 +7,17 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.30"
+#property version   "1.40"
 #property indicator_chart_window
 #property indicator_plots 6
 
-//--- Plot 0 : BUY  With-Trend  (HL in bull)
+//--- Plot 0 : BUY  With-Trend  (HL confirmed in bull)
 #property indicator_label1  "BUY - Bull"
 #property indicator_type1   DRAW_ARROW
 #property indicator_color1  clrLimeGreen
 #property indicator_width1  2
 
-//--- Plot 1 : BUY  Counter-Trend  (HL in bear)
+//--- Plot 1 : BUY  Counter-Trend  (HL confirmed in bear)
 #property indicator_label2  "BUY - Bear (CT)"
 #property indicator_type2   DRAW_ARROW
 #property indicator_color2  C'0,130,60'
@@ -29,13 +29,13 @@
 #property indicator_color3  clrDeepSkyBlue
 #property indicator_width3  2
 
-//--- Plot 3 : SELL  With-Trend  (LH in bear)
+//--- Plot 3 : SELL  With-Trend  (LH confirmed in bear)
 #property indicator_label4  "SELL - Bear"
 #property indicator_type4   DRAW_ARROW
 #property indicator_color4  clrCrimson
 #property indicator_width4  2
 
-//--- Plot 4 : SELL  Counter-Trend  (LH in bull)
+//--- Plot 4 : SELL  Counter-Trend  (LH confirmed in bull)
 #property indicator_label5  "SELL - Bull (CT)"
 #property indicator_type5   DRAW_ARROW
 #property indicator_color5  C'140,40,50'
@@ -81,14 +81,16 @@ input bool   InpAlerts       = true;             // Pop-up Alerts
 input bool   InpPush         = true;             // Push Notifications (mobile)
 
 // ================================================================
-// BUFFERS
+// BUFFERS  (6 plotted + 2 internal)
 // ================================================================
-double BufBuyBull[];
-double BufBuyCT[];
-double BufBuyMSS[];
-double BufSellBear[];
-double BufSellCT[];
-double BufSellMSS[];
+double BufBuyBull[];    // plot 0
+double BufBuyCT[];      // plot 1
+double BufBuyMSS[];     // plot 2
+double BufSellBear[];   // plot 3
+double BufSellCT[];     // plot 4
+double BufSellMSS[];    // plot 5
+double BufPivHProc[];   // internal: pivot-high "already processed" flag
+double BufPivLProc[];   // internal: pivot-low  "already processed" flag
 
 // ================================================================
 // CONSTANTS & GLOBALS
@@ -128,25 +130,29 @@ struct MSSZone
   {
    double   top;
    double   bot;
-   bool     isFVG;     // true = FVG,  false = OB
-   bool     isBull;    // true = bullish zone (support), false = bearish (resistance)
+   datetime t1;        // creation left-edge time (stored to fix extension bug)
+   bool     isFVG;
+   bool     isBull;
    bool     active;
    string   boxName;
   };
 
 MSSZone  g_mssZones[8];
 int      g_nMSSZones = 0;
-double   g_mssSL     = 0;    // SL for MSS trade = extreme of the CHoCH pivot
+double   g_mssSL     = 0;    // SL for MSS trade (structural extreme BELOW/ABOVE zones)
 bool     g_mssBull   = false;
 
-//--- Alert dedup
-int      g_lastAlertBar = -1;
+//--- Per-direction alert dedup (fix: was single int → silenced second signal on same bar)
+int      g_lastBuyAlertBar  = -1;
+int      g_lastSellAlertBar = -1;
+int      g_lastMSSAlertBar  = -1;
 
 // ================================================================
 // OnInit
 // ================================================================
 int OnInit()
   {
+//--- 6 plotted buffers
    SetIndexBuffer(0, BufBuyBull,  INDICATOR_DATA);
    SetIndexBuffer(1, BufBuyCT,    INDICATOR_DATA);
    SetIndexBuffer(2, BufBuyMSS,   INDICATOR_DATA);
@@ -154,19 +160,25 @@ int OnInit()
    SetIndexBuffer(4, BufSellCT,   INDICATOR_DATA);
    SetIndexBuffer(5, BufSellMSS,  INDICATOR_DATA);
 
-   PlotIndexSetInteger(0, PLOT_ARROW, 233);
-   PlotIndexSetInteger(1, PLOT_ARROW, 233);
-   PlotIndexSetInteger(2, PLOT_ARROW, 233);
-   PlotIndexSetInteger(3, PLOT_ARROW, 234);
-   PlotIndexSetInteger(4, PLOT_ARROW, 234);
-   PlotIndexSetInteger(5, PLOT_ARROW, 234);
+//--- 2 internal tracking buffers (not plotted, used as "processed" flags)
+   SetIndexBuffer(6, BufPivHProc, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(7, BufPivLProc, INDICATOR_CALCULATIONS);
 
-   PlotIndexSetInteger(0, PLOT_ARROW_SHIFT,  12);
-   PlotIndexSetInteger(1, PLOT_ARROW_SHIFT,  12);
-   PlotIndexSetInteger(2, PLOT_ARROW_SHIFT,  12);
-   PlotIndexSetInteger(3, PLOT_ARROW_SHIFT, -12);
-   PlotIndexSetInteger(4, PLOT_ARROW_SHIFT, -12);
-   PlotIndexSetInteger(5, PLOT_ARROW_SHIFT, -12);
+//--- Circles (●) for all signal types — the confirmed pivot dot IS the signal
+   PlotIndexSetInteger(0, PLOT_ARROW, 159);
+   PlotIndexSetInteger(1, PLOT_ARROW, 159);
+   PlotIndexSetInteger(2, PLOT_ARROW, 159);
+   PlotIndexSetInteger(3, PLOT_ARROW, 159);
+   PlotIndexSetInteger(4, PLOT_ARROW, 159);
+   PlotIndexSetInteger(5, PLOT_ARROW, 159);
+
+//--- Shift circles: buy below bar, sell above bar
+   PlotIndexSetInteger(0, PLOT_ARROW_SHIFT,  8);
+   PlotIndexSetInteger(1, PLOT_ARROW_SHIFT,  8);
+   PlotIndexSetInteger(2, PLOT_ARROW_SHIFT,  8);
+   PlotIndexSetInteger(3, PLOT_ARROW_SHIFT, -8);
+   PlotIndexSetInteger(4, PLOT_ARROW_SHIFT, -8);
+   PlotIndexSetInteger(5, PLOT_ARROW_SHIFT, -8);
 
    for(int p = 0; p < 6; p++)
       PlotIndexSetDouble(p, PLOT_EMPTY_VALUE, 0.0);
@@ -224,6 +236,8 @@ void AddSwingLow(double p)
 
 // ================================================================
 // HELPERS : TP calculation
+// FindBuyTPs  → 3 nearest swing HIGHS strictly above `entry`, ascending
+// FindSellTPs → 3 nearest swing LOWS  strictly below `entry`, descending
 // ================================================================
 void FindBuyTPs(double entry, double &tp1, double &tp2, double &tp3)
   {
@@ -246,6 +260,7 @@ void FindSellTPs(double entry, double &tp1, double &tp2, double &tp3)
       if(g_swLo[i] < entry) { ArrayResize(c, n + 1); c[n++] = g_swLo[i]; }
    if(n == 0) return;
    ArraySort(c);
+   // reverse → closest below entry first
    for(int i = 0, j = n - 1; i < j; i++, j--) { double t = c[i]; c[i] = c[j]; c[j] = t; }
    if(n >= 1) tp1 = c[0];
    if(n >= 2) tp2 = c[1];
@@ -254,6 +269,8 @@ void FindSellTPs(double entry, double &tp1, double &tp2, double &tp3)
 
 // ================================================================
 // HELPERS : notification
+// Three separate dedup vars (buy/sell/mss) so simultaneous
+// signals on the same bar are all delivered.
 // ================================================================
 string PriceStr(double p)
   { return (p > 0.0) ? DoubleToString(p, _Digits) : "N/A"; }
@@ -261,12 +278,12 @@ string PriceStr(double p)
 void FireSignal(const string &dir, const string &label,
                 double sigPrice, double sl,
                 double tp1, double tp2, double tp3,
-                int confirmBar, bool isLive)
+                int confirmBar, bool isLive, int &dedupBar)
   {
-   if(!isLive) return;
+   if(!isLive)              return;
    if(!InpAlerts && !InpPush) return;
-   if(g_lastAlertBar == confirmBar) return;
-   g_lastAlertBar = confirmBar;
+   if(dedupBar == confirmBar) return;   // already fired this direction this bar
+   dedupBar = confirmBar;
 
    string msg = dir + " " + _Symbol + " " + DoubleToString(sigPrice, _Digits) +
                 " | " + label +
@@ -332,7 +349,8 @@ void DrawBox(const string &name, double top, double bot,
      }
   }
 
-// Draw an MSS entry zone (FVG or OB) with its own distinct colour
+// Draw / extend an MSS entry zone (FVG or OB).
+// t1 must be the zone's original creation time, stored in MSSZone.t1.
 void DrawMSSZoneBox(const string &name, double top, double bot,
                     datetime t1, datetime t2, bool isFVG, bool isBull)
   {
@@ -342,27 +360,23 @@ void DrawMSSZoneBox(const string &name, double top, double bot,
                         ((int)(((base >>  8) & 0xFF) * 0.30) <<  8) |
                          (int)((base & 0xFF) * 0.30));
 
-   string tag = isFVG ? (isBull ? "FVG-B" : "FVG-S") : (isBull ? "OB-B" : "OB-S");
-
    if(ObjectFind(0, name) < 0)
      {
       ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, top, t2, bot);
       ObjectSetInteger(0, name, OBJPROP_COLOR,       base);
       ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     dim);
       ObjectSetInteger(0, name, OBJPROP_FILL,        true);
-      ObjectSetInteger(0, name, OBJPROP_BACK,        false);   // in front for visibility
+      ObjectSetInteger(0, name, OBJPROP_BACK,        false);
       ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
-      // Small text tag inside the box
+      string tag = isFVG ? (isBull ? "FVG-B" : "FVG-S") : (isBull ? "OB-B" : "OB-S");
       ObjectSetString (0, name, OBJPROP_TEXT, tag);
      }
    else
      {
-      ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
-      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, top);
-      ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
-      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, bot);
+      // Only update the right edge — t1 (left edge) is fixed at creation time
+      ObjectSetInteger(0, name, OBJPROP_TIME, 1, t2);
      }
   }
 
@@ -421,110 +435,94 @@ void ResetAll()
    g_trend = 0;
    g_nMSSZones  = 0;
    g_mssSL      = 0;
-   g_lastAlertBar = -1;
+   g_lastBuyAlertBar  = -1;
+   g_lastSellAlertBar = -1;
+   g_lastMSSAlertBar  = -1;
   }
 
 // ================================================================
 // MSS ZONE DETECTION
-// Called right after a CHoCH to scan the breakout leg for
-// FVGs and the Order Block, storing them as entry zones.
+// Scans the CHoCH breakout leg for FVGs and the Order Block.
 //
 //  legStart : bar index of the pivot that was broken (old HL or LH)
 //  legEnd   : bar index of the CHoCH pivot (new LL or HH)
-//  isBullLeg: true  = bullish leg (bear→bull CHoCH)  → look for bull FVG/OB
-//             false = bearish leg (bull→bear CHoCH)  → look for bear FVG/OB
+//  isBullLeg: true  = bullish leg (bear→bull CHoCH) → bullish FVG/OB
+//             false = bearish leg (bull→bear CHoCH) → bearish FVG/OB
 // ================================================================
-void FindMSSZones(int legStart, int legEnd,
-                  bool isBullLeg,
+void FindMSSZones(int legStart, int legEnd, bool isBullLeg,
                   const double &h[], const double &l[],
                   const double &o[], const double &c[],
-                  const datetime &time[],
-                  int total, int chochSeq)
+                  const datetime &time[], int total, int chochSeq)
   {
-   // Delete any zones from the previous CHoCH
+   // Clear previous CHoCH zones from chart and array
    for(int z = 0; z < g_nMSSZones; z++)
       ObjectDelete(0, g_mssZones[z].boxName);
    g_nMSSZones = 0;
 
    if(legStart < 0 || legEnd <= legStart || legEnd >= total) return;
 
-   string seqStr = IntegerToString(chochSeq);
+   string seq = IntegerToString(chochSeq);
 
-   // ── 1. Scan for FVGs in the leg ─────────────────────────────
-   // A 3-candle FVG exists between candle[i-1] and candle[i+1]:
-   //   Bearish FVG (resistance): low[i-1] > high[i+1]  → zone=[high[i+1], low[i-1]]
-   //   Bullish FVG (support)   : high[i-1] < low[i+1]  → zone=[high[i-1], low[i+1]]
+   // ── 1. FVGs in the leg ─────────────────────────────────────────
+   // Bearish FVG: l[i-1] > h[i+1]  → zone = [h[i+1], l[i-1]]  (resistance)
+   // Bullish FVG: h[i-1] < l[i+1]  → zone = [h[i-1], l[i+1]]  (support)
    int fvgCount = 0;
    for(int i = legStart + 1; i <= legEnd - 1 && fvgCount < 4; i++)
      {
-      if(!isBullLeg)
+      if(!isBullLeg && l[i - 1] > h[i + 1])
         {
-         // Bearish FVG
-         if(l[i - 1] > h[i + 1])
+         double zTop = l[i - 1], zBot = h[i + 1];
+         if(zTop > zBot && g_nMSSZones < 8)
            {
-            double zTop = l[i - 1];
-            double zBot = h[i + 1];
-            if(zTop > zBot && g_nMSSZones < 8)
-              {
-               string bn = PFX + "MZ_FVG_" + seqStr + "_" + IntegerToString(i);
-               g_mssZones[g_nMSSZones].top     = zTop;
-               g_mssZones[g_nMSSZones].bot     = zBot;
-               g_mssZones[g_nMSSZones].isFVG   = true;
-               g_mssZones[g_nMSSZones].isBull  = false;
-               g_mssZones[g_nMSSZones].active  = true;
-               g_mssZones[g_nMSSZones].boxName = bn;
-               DrawMSSZoneBox(bn, zTop, zBot, time[i - 1], time[i + 1], true, false);
-               g_nMSSZones++;
-               fvgCount++;
-              }
+            string bn = PFX + "MZ_FVG_" + seq + "_" + IntegerToString(i);
+            g_mssZones[g_nMSSZones].top     = zTop;
+            g_mssZones[g_nMSSZones].bot     = zBot;
+            g_mssZones[g_nMSSZones].t1      = time[i];   // store creation time
+            g_mssZones[g_nMSSZones].isFVG   = true;
+            g_mssZones[g_nMSSZones].isBull  = false;
+            g_mssZones[g_nMSSZones].active  = true;
+            g_mssZones[g_nMSSZones].boxName = bn;
+            DrawMSSZoneBox(bn, zTop, zBot, time[i], time[legEnd], true, false);
+            g_nMSSZones++; fvgCount++;
            }
         }
-      else
+      else if(isBullLeg && h[i - 1] < l[i + 1])
         {
-         // Bullish FVG
-         if(h[i - 1] < l[i + 1])
+         double zTop = l[i + 1], zBot = h[i - 1];
+         if(zTop > zBot && g_nMSSZones < 8)
            {
-            double zTop = l[i + 1];
-            double zBot = h[i - 1];
-            if(zTop > zBot && g_nMSSZones < 8)
-              {
-               string bn = PFX + "MZ_FVG_" + seqStr + "_" + IntegerToString(i);
-               g_mssZones[g_nMSSZones].top     = zTop;
-               g_mssZones[g_nMSSZones].bot     = zBot;
-               g_mssZones[g_nMSSZones].isFVG   = true;
-               g_mssZones[g_nMSSZones].isBull  = true;
-               g_mssZones[g_nMSSZones].active  = true;
-               g_mssZones[g_nMSSZones].boxName = bn;
-               DrawMSSZoneBox(bn, zTop, zBot, time[i - 1], time[i + 1], true, true);
-               g_nMSSZones++;
-               fvgCount++;
-              }
+            string bn = PFX + "MZ_FVG_" + seq + "_" + IntegerToString(i);
+            g_mssZones[g_nMSSZones].top     = zTop;
+            g_mssZones[g_nMSSZones].bot     = zBot;
+            g_mssZones[g_nMSSZones].t1      = time[i];   // store creation time
+            g_mssZones[g_nMSSZones].isFVG   = true;
+            g_mssZones[g_nMSSZones].isBull  = true;
+            g_mssZones[g_nMSSZones].active  = true;
+            g_mssZones[g_nMSSZones].boxName = bn;
+            DrawMSSZoneBox(bn, zTop, zBot, time[i], time[legEnd], true, true);
+            g_nMSSZones++; fvgCount++;
            }
         }
      }
 
-   // ── 2. Find the Order Block ──────────────────────────────────
-   // Bearish OB : last BULLISH candle (c>o) in a bearish leg  → resistance
-   // Bullish OB : last BEARISH candle (c<o) in a bullish leg  → support
-   // Scan from legEnd-1 backward to legStart to find the most
-   // recent opposite-colour candle closest to the CHoCH.
+   // ── 2. Order Block (most recent opposite candle in the leg) ─────
+   // Bearish OB: last bullish candle (c>o) in a bearish leg  → resistance
+   // Bullish OB: last bearish candle (c<o) in a bullish leg  → support
    for(int i = legEnd - 1; i >= legStart && g_nMSSZones < 8; i--)
      {
       bool isBullCandle = (c[i] > o[i]);
       bool isBearCandle = (c[i] < o[i]);
-
-      bool isOB = (!isBullLeg && isBullCandle) ||  // bearish OB = last bull candle in bear leg
-                  ( isBullLeg && isBearCandle);     // bullish OB = last bear candle in bull leg
-
+      bool isOB = (!isBullLeg && isBullCandle) || (isBullLeg && isBearCandle);
       if(isOB)
         {
-         double zTop = isBullCandle ? c[i] : o[i];  // top of body
-         double zBot = isBullCandle ? o[i] : c[i];  // bot of body
+         double zTop = isBullCandle ? c[i] : o[i];
+         double zBot = isBullCandle ? o[i] : c[i];
          if(zTop > zBot)
            {
-            string bn = PFX + "MZ_OB_" + seqStr + "_" + IntegerToString(i);
+            string bn = PFX + "MZ_OB_" + seq + "_" + IntegerToString(i);
             g_mssZones[g_nMSSZones].top     = zTop;
             g_mssZones[g_nMSSZones].bot     = zBot;
+            g_mssZones[g_nMSSZones].t1      = time[i];   // store creation time
             g_mssZones[g_nMSSZones].isFVG   = false;
             g_mssZones[g_nMSSZones].isBull  = isBullLeg;
             g_mssZones[g_nMSSZones].active  = true;
@@ -532,7 +530,7 @@ void FindMSSZones(int legStart, int legEnd,
             DrawMSSZoneBox(bn, zTop, zBot, time[i], time[legEnd], false, isBullLeg);
             g_nMSSZones++;
            }
-         break;  // only the most recent OB
+         break;
         }
      }
   }
@@ -556,6 +554,7 @@ int OnCalculate(const int rates_total,
    if(prev_calculated == 0)
      {
       ResetAll();
+      // BufPivHProc / BufPivLProc are auto-initialised to 0 by MT5 on full recalc
       ArrayInitialize(BufBuyBull,  0);
       ArrayInitialize(BufBuyCT,    0);
       ArrayInitialize(BufBuyMSS,   0);
@@ -568,13 +567,13 @@ int OnCalculate(const int rates_total,
                   ? InpSwingLeft
                   : MathMax(InpSwingLeft, prev_calculated - InpSwingRight - 1);
 
-   datetime tNow    = time[rates_total - 1];
-   double   bw1     = 0.001 * InpBoxWidth;
-   bool     isLive  = (prev_calculated > 0);
-   static int chochSeq = 0;   // unique sequence number per CHoCH
+   datetime tNow   = time[rates_total - 1];
+   double   bw1    = 0.001 * InpBoxWidth;
+   bool     isLive = (prev_calculated > 0);
+   static int chochSeq = 0;
 
    // ================================================================
-   // MAIN BAR LOOP
+   // MAIN BAR LOOP  (oldest → newest)
    // ================================================================
    for(int i = startBar; i < rates_total; i++)
      {
@@ -585,54 +584,72 @@ int OnCalculate(const int rates_total,
       bool newPL = IsPivotLow (low,  pBar, InpSwingLeft, InpSwingRight, rates_total);
 
       // ── NEW PIVOT HIGH ──────────────────────────────────────────
-      if(newPH && BufSellBear[pBar] == 0.0 && BufSellCT[pBar] == 0.0)
+      // BufPivHProc[pBar] == 0 means this bar has never been processed.
+      // Set it to 1 on first visit so incremental runs skip it — this
+      // prevents CHoCH bars (which write to no signal buffer) from being
+      // re-classified as LH signals on subsequent ticks.
+      if(newPH && BufPivHProc[pBar] == 0.0)
         {
-         double ph = high[pBar];
+         BufPivHProc[pBar] = 1.0;   // mark as processed FIRST
 
+         double ph = high[pBar];
+         double confirmClose = close[i];  // price when signal is confirmed
+
+         // Draw liquidity line + box
          string ln = PFX + "LH_" + IntegerToString(pBar);
          string bx = PFX + "BH_" + IntegerToString(pBar);
          DrawLine(ln, ph, time[pBar], time[i], InpHighColor);
          DrawBox (bx, ph * (1.0 + bw1), ph, time[pBar], time[i], InpHighColor);
          AddLevel(ph, ph * (1.0 + bw1), ph, time[pBar], true, ln, bx);
 
+         // Capture prior trend before any update (fixes withTrend ordering bug)
+         int priorTrend = g_trend;
          bool isHH = (g_lastPH == 0 || ph > g_lastPH);
 
-         if(isHH && g_trend == -1)
+         if(isHH && priorTrend == -1)
            {
             // ─── CHoCH: bear → bull ────────────────────────────
             chochSeq++;
             DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pBar),
                            "CHoCH", time[pBar], ph, InpMSSBullCol, false);
-            // Bullish leg = from last LH bar up to this HH bar
             int legStart = (g_lastPHBar >= 0) ? g_lastPHBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, true,
                          high, low, open, close, time, rates_total, chochSeq);
-            g_mssSL   = ph;        // SL for MSS trade = the HH extreme
-            g_mssBull = true;      // looking for BUY retrace into bull zones
+            // FIX: SL for BUY MSS = last swing LOW (structural support below zones)
+            g_mssSL   = (g_lastPL > 0) ? g_lastPL : ph * 0.999;
+            g_mssBull = true;
             g_trend   = 1;
            }
          else if(isHH)
+           {
             g_trend = (g_trend == 0) ? 1 : g_trend;
+           }
          else
            {
             // LH → SELL signal
-            if(g_trend == 1)  g_trend = -1;
-            else if(g_trend == 0) g_trend = -1;
+            // FIX: evaluate withTrend from priorTrend, then update g_trend
+            bool withTrend = (priorTrend == -1);
+            if(priorTrend == 1 || priorTrend == 0) g_trend = -1;
 
+            // sigPrice = market price at confirmation; sl = the LH pivot (structural high)
             double tp1, tp2, tp3;
-            FindSellTPs(ph, tp1, tp2, tp3);
-            bool withTrend = (g_trend == -1);
+            FindSellTPs(confirmClose, tp1, tp2, tp3);
+
             if(withTrend)
               {
                BufSellBear[pBar] = ph;
-               FireSignal("SELL", "Bear", ph, ph, tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1);
+               FireSignal("SELL", "Bear", confirmClose, ph,
+                          tp1, tp2, tp3, i,
+                          isLive && i == rates_total - 1,
+                          g_lastSellAlertBar);
               }
             else if(InpShowCTSig)
               {
                BufSellCT[pBar] = ph;
-               FireSignal("SELL", "Bull", ph, ph, tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1);
+               FireSignal("SELL", "Bull", confirmClose, ph,
+                          tp1, tp2, tp3, i,
+                          isLive && i == rates_total - 1,
+                          g_lastSellAlertBar);
               }
            }
 
@@ -641,9 +658,12 @@ int OnCalculate(const int rates_total,
         }
 
       // ── NEW PIVOT LOW ───────────────────────────────────────────
-      if(newPL && BufBuyBull[pBar] == 0.0 && BufBuyCT[pBar] == 0.0)
+      if(newPL && BufPivLProc[pBar] == 0.0)
         {
+         BufPivLProc[pBar] = 1.0;   // mark as processed FIRST
+
          double pl = low[pBar];
+         double confirmClose = close[i];
 
          string ln = PFX + "LL_" + IntegerToString(pBar);
          string bx = PFX + "BL_" + IntegerToString(pBar);
@@ -651,44 +671,51 @@ int OnCalculate(const int rates_total,
          DrawBox (bx, pl, pl * (1.0 - bw1), time[pBar], time[i], InpLowColor);
          AddLevel(pl, pl, pl * (1.0 - bw1), time[pBar], false, ln, bx);
 
+         int  priorTrend = g_trend;
          bool isLL = (g_lastPL == 0 || pl < g_lastPL);
 
-         if(isLL && g_trend == 1)
+         if(isLL && priorTrend == 1)
            {
             // ─── CHoCH: bull → bear ────────────────────────────
             chochSeq++;
             DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pBar),
                            "CHoCH", time[pBar], pl, InpMSSBearCol, true);
-            // Bearish leg = from last HL bar down to this LL bar
             int legStart = (g_lastPLBar >= 0) ? g_lastPLBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, false,
                          high, low, open, close, time, rates_total, chochSeq);
-            g_mssSL   = pl;        // SL for MSS trade = the LL extreme
-            g_mssBull = false;     // looking for SELL retrace into bear zones
+            // FIX: SL for SELL MSS = last swing HIGH (structural resistance above zones)
+            g_mssSL   = (g_lastPH > 0) ? g_lastPH : pl * 1.001;
+            g_mssBull = false;
             g_trend   = -1;
            }
          else if(isLL)
+           {
             g_trend = (g_trend == 0) ? -1 : g_trend;
+           }
          else
            {
             // HL → BUY signal
-            if(g_trend == -1) g_trend = 1;
-            else if(g_trend == 0) g_trend = 1;
+            bool withTrend = (priorTrend == 1);
+            if(priorTrend == -1 || priorTrend == 0) g_trend = 1;
 
             double tp1, tp2, tp3;
-            FindBuyTPs(pl, tp1, tp2, tp3);
-            bool withTrend = (g_trend == 1);
+            FindBuyTPs(confirmClose, tp1, tp2, tp3);
+
             if(withTrend)
               {
                BufBuyBull[pBar] = pl;
-               FireSignal("BUY", "Bull", pl, pl, tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1);
+               FireSignal("BUY", "Bull", confirmClose, pl,
+                          tp1, tp2, tp3, i,
+                          isLive && i == rates_total - 1,
+                          g_lastBuyAlertBar);
               }
             else if(InpShowCTSig)
               {
                BufBuyCT[pBar] = pl;
-               FireSignal("BUY", "Bear", pl, pl, tp1, tp2, tp3, i,
-                          isLive && i == rates_total - 1);
+               FireSignal("BUY", "Bear", confirmClose, pl,
+                          tp1, tp2, tp3, i,
+                          isLive && i == rates_total - 1,
+                          g_lastBuyAlertBar);
               }
            }
 
@@ -697,80 +724,76 @@ int OnCalculate(const int rates_total,
         }
 
       // ── MSS ZONE ENTRY CHECK ────────────────────────────────────
-      // Signal fires when price enters an active FVG or OB zone
-      // that was identified in the CHoCH leg.
-      if(g_nMSSZones > 0)
+      // Runs only AFTER the pivot blocks above, so zones created this
+      // iteration are checked against future bars only (the next tick).
+      // On the SAME bar as a CHoCH confirmation (i == rates_total-1)
+      // we skip zone checks to avoid firing on the breakout candle itself.
+      bool isChochBar = (i == rates_total - 1 &&
+                         (BufPivHProc[pBar] != 0.0 || BufPivLProc[pBar] != 0.0) &&
+                          i - InpSwingRight == pBar);
+
+      if(g_nMSSZones > 0 && !isChochBar)
         {
          for(int z = 0; z < g_nMSSZones; z++)
            {
             if(!g_mssZones[z].active) continue;
 
-            bool entered = false;
-            double entryPrice = 0.0;
+            bool entered   = false;
+            double entryPx = 0.0;
 
             if(g_mssBull)
               {
-               // Looking for BUY: price pulls back down into a bullish zone
-               if(low[i] <= g_mssZones[z].top && high[i] >= g_mssZones[z].bot)
-                 {
-                  entered   = true;
-                  // Entry = top of zone (best price on pullback)
-                  entryPrice = g_mssZones[z].top;
-                 }
+               // BUY: price pulls back down into a bullish zone
+               // Condition: low touches or enters zone top, high confirms bar is near zone
+               if(low[i] <= g_mssZones[z].top && low[i] >= g_mssZones[z].bot)
+                 { entered = true; entryPx = g_mssZones[z].top; }
               }
             else
               {
-               // Looking for SELL: price retraces up into a bearish zone
-               if(high[i] >= g_mssZones[z].bot && low[i] <= g_mssZones[z].top)
-                 {
-                  entered   = true;
-                  entryPrice = g_mssZones[z].bot;
-                 }
+               // SELL: price retraces up into a bearish zone
+               if(high[i] >= g_mssZones[z].bot && high[i] <= g_mssZones[z].top)
+                 { entered = true; entryPx = g_mssZones[z].bot; }
               }
 
             if(entered && BufBuyMSS[i] == 0.0 && BufSellMSS[i] == 0.0)
               {
-               string zoneType = g_mssZones[z].isFVG ? "MSS-FVG" : "MSS-OB";
+               string zType = g_mssZones[z].isFVG ? "MSS-FVG" : "MSS-OB";
                double tp1, tp2, tp3;
 
                if(g_mssBull)
                  {
                   BufBuyMSS[i] = low[i];
-                  FindBuyTPs(entryPrice, tp1, tp2, tp3);
-                  FireSignal("BUY", zoneType, entryPrice, g_mssSL,
+                  FindBuyTPs(entryPx, tp1, tp2, tp3);
+                  FireSignal("BUY", zType, entryPx, g_mssSL,
                              tp1, tp2, tp3, i,
-                             isLive && i == rates_total - 1);
+                             isLive && i == rates_total - 1,
+                             g_lastMSSAlertBar);
                  }
                else
                  {
                   BufSellMSS[i] = high[i];
-                  FindSellTPs(entryPrice, tp1, tp2, tp3);
-                  FireSignal("SELL", zoneType, entryPrice, g_mssSL,
+                  FindSellTPs(entryPx, tp1, tp2, tp3);
+                  FireSignal("SELL", zType, entryPx, g_mssSL,
                              tp1, tp2, tp3, i,
-                             isLive && i == rates_total - 1);
+                             isLive && i == rates_total - 1,
+                             g_lastMSSAlertBar);
                  }
 
-               // Deactivate this zone but keep the others alive
                g_mssZones[z].active = false;
-               // Extend the zone box to current bar so it stays visible
-               DrawMSSZoneBox(g_mssZones[z].boxName,
-                              g_mssZones[z].top, g_mssZones[z].bot,
-                              time[0],   // keep original left edge
-                              tNow,
-                              g_mssZones[z].isFVG, g_mssZones[z].isBull);
               }
            }
+        }
 
-         // Extend active zones to current bar
-         if(i == rates_total - 1)
-           {
-            for(int z = 0; z < g_nMSSZones; z++)
-               if(g_mssZones[z].active)
-                  DrawMSSZoneBox(g_mssZones[z].boxName,
-                                 g_mssZones[z].top, g_mssZones[z].bot,
-                                 time[0], tNow,
-                                 g_mssZones[z].isFVG, g_mssZones[z].isBull);
-           }
+      // ── EXTEND ACTIVE MSS ZONES (live bar only) ─────────────────
+      if(i == rates_total - 1)
+        {
+         for(int z = 0; z < g_nMSSZones; z++)
+            if(g_mssZones[z].active)
+               // Use stored t1 — NOT time[0] — to preserve the correct left edge
+               DrawMSSZoneBox(g_mssZones[z].boxName,
+                              g_mssZones[z].top, g_mssZones[z].bot,
+                              g_mssZones[z].t1, tNow,
+                              g_mssZones[z].isFVG, g_mssZones[z].isBull);
         }
 
       // ── EXTEND LIQUIDITY LEVELS (live bar only) ─────────────────
@@ -799,8 +822,7 @@ int OnCalculate(const int rates_total,
             if(!InpExtendFill) { j++; continue; }
 
             DrawLine(g_lv[j].lineName, lp, g_lv[j].t1, tNow, col);
-            DrawBox (g_lv[j].boxName,
-                     g_lv[j].boxTop, g_lv[j].boxBot,
+            DrawBox (g_lv[j].boxName, g_lv[j].boxTop, g_lv[j].boxBot,
                      g_lv[j].t1, tNow, col);
 
             if(g_nLv >= MAX_OBJECTS) RemoveLevel(0);
