@@ -703,8 +703,9 @@ int OnCalculate(const int rates_total,
            {
             // ─── CHoCH: bear → bull ────────────────────────────
             g_chochSeq++;
-            DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pBar),
-                           "CHoCH", time[pBar], ph, InpMSSBullCol, false);
+            string chochLnB = PFX + "CHoCH_" + IntegerToString(pBar);
+            string chochTxB = "CHoCH";
+            DrawChochLabel(chochLnB, chochTxB, time[pBar], ph, InpMSSBullCol, false);
             int legStart = (g_lastPHBar >= 0) ? g_lastPHBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, true,
                          high, low, open, close, time, rates_total, g_chochSeq);
@@ -790,8 +791,9 @@ int OnCalculate(const int rates_total,
            {
             // ─── CHoCH: bull → bear ────────────────────────────
             g_chochSeq++;
-            DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pBar),
-                           "CHoCH", time[pBar], pl, InpMSSBearCol, true);
+            string chochLnS = PFX + "CHoCH_" + IntegerToString(pBar);
+            string chochTxS = "CHoCH";
+            DrawChochLabel(chochLnS, chochTxS, time[pBar], pl, InpMSSBearCol, true);
             int legStart = (g_lastPLBar >= 0) ? g_lastPLBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, false,
                          high, low, open, close, time, rates_total, g_chochSeq);
@@ -899,9 +901,9 @@ int OnCalculate(const int rates_total,
                   if(InpAlerts || InpPush)
                     {
                      g_lv[j].touches++;
-                     FireLvlAlert(g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT",
-                                  g_lv[j].isHigh ? "SELL READY" : "BUY READY",
-                                  lp, g_lv[j].touches);
+                     string lvTag = g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT";
+                     string lvRdy = g_lv[j].isHigh ? "SELL READY" : "BUY READY";
+                     FireLvlAlert(lvTag, lvRdy, lp, g_lv[j].touches);
                     }
                  }
                if(!inZone) g_lv[j].approached = false;
@@ -920,9 +922,9 @@ int OnCalculate(const int rates_total,
                      if(InpAlerts || InpPush)
                        {
                         g_lv[j].touches++;
-                        FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
-                                     g_lv[j].isHigh ? "BUY READY" : "SELL READY",
-                                     lp, g_lv[j].touches);
+                        string flipTag = g_lv[j].isHigh ? "RBS" : "SBR";
+                        string flipRdy = g_lv[j].isHigh ? "BUY READY" : "SELL READY";
+                        FireLvlAlert(flipTag, flipRdy, lp, g_lv[j].touches);
                        }
                     }
                   if(!inFlipZone) g_lv[j].flipApproached = false;
