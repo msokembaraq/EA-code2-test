@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.74"
+#property version   "1.75"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 8
@@ -870,27 +870,31 @@ int OnCalculate(const int rates_total,
 
             if(InpApproachMode == 0)
               {
-               // Mode 0 (default): price enters the full pivot candle range box.
-               // Resistance approach: bar enters box from below, hasn't closed above.
-               // Support approach:    bar enters box from above, hasn't closed below.
+               // Use high/low only — both are monotonic within a bar (high never
+               // decreases, low never increases), so inZone cannot flip false then
+               // true again on later ticks of the same bar. This eliminates the
+               // close-oscillation bug that caused 50+ repeated alerts per episode
+               // during tick-data backtests.
+               // Resistance approach: bar's high reaches the zone from below.
+               // Support approach:    bar's low reaches the zone from above.
                inZone     = g_lv[j].isHigh
-                            ? (high[i] >= g_lv[j].boxBot && close[i] < g_lv[j].boxTop)
-                            : (low[i]  <= g_lv[j].boxTop && close[i] > g_lv[j].boxBot);
-               // Flip roles are the mirror of the original
+                            ? (high[i] >= g_lv[j].boxBot)
+                            : (low[i]  <= g_lv[j].boxTop);
+               // Flip — price returns from the opposite side after the break
                inFlipZone = g_lv[j].isHigh
-                            ? (low[i]  <= g_lv[j].boxTop && close[i] > g_lv[j].boxBot)
-                            : (high[i] >= g_lv[j].boxBot && close[i] < g_lv[j].boxTop);
+                            ? (low[i]  <= g_lv[j].boxTop)
+                            : (high[i] >= g_lv[j].boxBot);
               }
             else
               {
-               // Modes 1/2: threshold distance from pivot price
+               // Modes 1/2: threshold distance — also high/low only for same reason.
                double thr = GetApproachThreshold(g_lv[j].swingRange);
                inZone     = g_lv[j].isHigh
-                            ? (high[i] >= lp - thr && close[i] < lp)
-                            : (low[i]  <= lp + thr && close[i] > lp);
+                            ? (high[i] >= lp - thr)
+                            : (low[i]  <= lp + thr);
                inFlipZone = g_lv[j].isHigh
-                            ? (low[i]  <= lp + thr && close[i] > lp)
-                            : (high[i] >= lp - thr && close[i] < lp);
+                            ? (low[i]  <= lp + thr)
+                            : (high[i] >= lp - thr);
               }
 
             if(!g_lv[j].broken)
