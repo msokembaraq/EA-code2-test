@@ -1,38 +1,49 @@
 //+------------------------------------------------------------------+
 //|                                       SwingPointsLiquidity.mq5  |
 //|          Port of "Swing Points and Liquidity" by LeviathanCap.  |
-//|          + Market Structure (HH/HL/LH/LL)                       |
-//|          + CHoCH / MSS Detection                                 |
-//|          + Buy / Sell Signal Generation                          |
+//|          + Market Structure (HH / HL / LH / LL)                 |
+//|          + CHoCH / MSS Detection + Trend-State Signals          |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.00"
+#property version   "1.10"
 #property indicator_chart_window
-#property indicator_plots 4
+#property indicator_plots 6
 
-//--- Plot 0 : Pivot-high dots (circles)
-#property indicator_label1  "Pivot High"
+//--- Plot 0 : With-trend BUY  (HL in bull trend)
+#property indicator_label1  "BUY (With-Trend)"
 #property indicator_type1   DRAW_ARROW
-#property indicator_color1  clrCrimson
-#property indicator_width1  1
+#property indicator_color1  clrLimeGreen
+#property indicator_width1  2
 
-//--- Plot 1 : Pivot-low dots
-#property indicator_label2  "Pivot Low"
+//--- Plot 1 : Counter-trend BUY  (HL in bear trend)
+#property indicator_label2  "BUY (Counter-Trend)"
 #property indicator_type2   DRAW_ARROW
-#property indicator_color2  clrLimeGreen
+#property indicator_color2  C'0,120,60'
 #property indicator_width2  1
 
-//--- Plot 2 : Buy arrow
-#property indicator_label3  "Buy"
+//--- Plot 2 : With-trend SELL  (LH in bear trend)
+#property indicator_label3  "SELL (With-Trend)"
 #property indicator_type3   DRAW_ARROW
-#property indicator_color3  clrDeepSkyBlue
+#property indicator_color3  clrCrimson
 #property indicator_width3  2
 
-//--- Plot 3 : Sell arrow
-#property indicator_label4  "Sell"
+//--- Plot 3 : Counter-trend SELL  (LH in bull trend)
+#property indicator_label4  "SELL (Counter-Trend)"
 #property indicator_type4   DRAW_ARROW
-#property indicator_color4  clrOrangeRed
-#property indicator_width4  2
+#property indicator_color4  C'130,40,50'
+#property indicator_width4  1
+
+//--- Plot 4 : CHoCH Bullish dot
+#property indicator_label5  "CHoCH Bull"
+#property indicator_type5   DRAW_ARROW
+#property indicator_color5  clrDeepSkyBlue
+#property indicator_width5  2
+
+//--- Plot 5 : CHoCH Bearish dot
+#property indicator_label6  "CHoCH Bear"
+#property indicator_type6   DRAW_ARROW
+#property indicator_color6  clrOrangeRed
+#property indicator_width6  2
 
 // ================================================================
 // INPUTS
@@ -44,7 +55,8 @@ input int    InpSwingLeft    = 15;               // Bars Left
 input group "=== Display ==="
 input bool   InpShowBoxes    = true;             // Show Liquidity Boxes
 input bool   InpShowLines    = true;             // Show Level Lines
-input bool   InpShowDots     = true;             // Show Pivot Dots
+input bool   InpShowDots     = true;             // Show Signal Dots
+input bool   InpShowCTSig    = true;             // Show Counter-Trend Signals
 input bool   InpExtendFill   = true;             // Extend Until Filled
 input bool   InpHideFilled   = false;            // Hide Filled Levels
 
@@ -55,37 +67,40 @@ input ENUM_LINE_STYLE InpLineStyle = STYLE_DOT;  // Line Style
 input int    InpLineWidth    = 1;                // Line Width
 input double InpBoxWidth     = 0.7;              // Box Width % (0.1-2.0)
 
-input group "=== Market Structure & Signals ==="
-input bool   InpShowMSS      = true;             // Show CHoCH / MSS Labels
-input bool   InpShowSignals  = true;             // Show Buy / Sell Arrows
+input group "=== Market Structure ==="
+input bool   InpShowMSS      = true;             // Draw CHoCH Label on Chart
 input color  InpMSSBullCol   = clrDeepSkyBlue;   // CHoCH → Bullish colour
 input color  InpMSSBearCol   = clrOrangeRed;     // CHoCH → Bearish colour
+
+input group "=== Alerts & Push ==="
+input bool   InpAlerts       = true;             // Pop-up Alerts
+input bool   InpPush         = true;             // Push Notifications (mobile)
+input bool   InpOnlyNewBar   = true;             // Fire alert only on bar close
 
 // ================================================================
 // BUFFERS
 // ================================================================
-double BufPH[];    // pivot-high dot values
-double BufPL[];    // pivot-low  dot values
-double BufBuy[];   // buy  signal values
-double BufSell[];  // sell signal values
+double BufBuyWT[];    // with-trend  BUY   (HL in bull)
+double BufBuyCT[];    // counter-trd BUY   (HL in bear)
+double BufSellWT[];   // with-trend  SELL  (LH in bear)
+double BufSellCT[];   // counter-trd SELL  (LH in bull)
+double BufChochB[];   // CHoCH bullish dot
+double BufChochBr[];  // CHoCH bearish dot
 
 // ================================================================
 // CONSTANTS / GLOBALS
 // ================================================================
-const string PFX         = "SPL_";   // object name prefix
-const int    MAX_OBJECTS = 500;      // mirror Pine max_boxes_count
+const string PFX         = "SPL_";
+const int    MAX_OBJECTS = 500;
 
-// ----------------------------------------------------------------
-// Level tracking (mirrors Pine's levelBoxes / levelLines arrays)
-// ----------------------------------------------------------------
+//--- Level tracking (liquidity lines / boxes)
 struct SLevel
   {
    double   price;
    double   boxTop;
    double   boxBot;
-   datetime t1;       // time of pivot bar
+   datetime t1;
    bool     isHigh;
-   bool     filled;
    string   lineName;
    string   boxName;
   };
@@ -93,40 +108,44 @@ struct SLevel
 SLevel   g_lv[];
 int      g_nLv = 0;
 
-// ----------------------------------------------------------------
-// Market-structure state (persistent across bars)
-// ----------------------------------------------------------------
+//--- Market-structure state
 double   g_lastPH    = 0;
 double   g_lastPL    = 0;
 int      g_lastPHBar = -1;
 int      g_lastPLBar = -1;
-int      g_trend     = 0;    // 0=undefined  1=bull  -1=bear
-double   g_mssLevel  = 0;
-bool     g_mssActive = false;
-bool     g_mssBull   = false; // true=looking for buy retrace  false=sell
+int      g_trend     = 0;   // 0=undef  1=bull  -1=bear
+
+//--- Alert dedup : track last bar index that fired an alert
+int      g_lastAlertBar = -1;
 
 // ================================================================
 // OnInit
 // ================================================================
 int OnInit()
   {
-   SetIndexBuffer(0, BufPH,   INDICATOR_DATA);
-   SetIndexBuffer(1, BufPL,   INDICATOR_DATA);
-   SetIndexBuffer(2, BufBuy,  INDICATOR_DATA);
-   SetIndexBuffer(3, BufSell, INDICATOR_DATA);
+   SetIndexBuffer(0, BufBuyWT,   INDICATOR_DATA);
+   SetIndexBuffer(1, BufBuyCT,   INDICATOR_DATA);
+   SetIndexBuffer(2, BufSellWT,  INDICATOR_DATA);
+   SetIndexBuffer(3, BufSellCT,  INDICATOR_DATA);
+   SetIndexBuffer(4, BufChochB,  INDICATOR_DATA);
+   SetIndexBuffer(5, BufChochBr, INDICATOR_DATA);
 
-   PlotIndexSetInteger(0, PLOT_ARROW, 159);  // ● small circle
-   PlotIndexSetInteger(1, PLOT_ARROW, 159);
-   PlotIndexSetInteger(2, PLOT_ARROW, 233);  // ▲ up arrow
-   PlotIndexSetInteger(3, PLOT_ARROW, 234);  // ▼ down arrow
+   // Arrow codes (Wingdings)
+   PlotIndexSetInteger(0, PLOT_ARROW, 233);  // ▲ up   - with-trend buy
+   PlotIndexSetInteger(1, PLOT_ARROW, 233);  // ▲ up   - counter-trend buy (dimmer colour)
+   PlotIndexSetInteger(2, PLOT_ARROW, 234);  // ▼ down - with-trend sell
+   PlotIndexSetInteger(3, PLOT_ARROW, 234);  // ▼ down - counter-trend sell (dimmer)
+   PlotIndexSetInteger(4, PLOT_ARROW, 159);  // ● circle - CHoCH bull
+   PlotIndexSetInteger(5, PLOT_ARROW, 159);  // ● circle - CHoCH bear
 
-   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, 0.0);
-   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, 0.0);
-   PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, 0.0);
-   PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, 0.0);
+   // Arrow shifts: buy arrow below bar, sell arrow above bar
+   PlotIndexSetInteger(0, PLOT_ARROW_SHIFT,  12);
+   PlotIndexSetInteger(1, PLOT_ARROW_SHIFT,  12);
+   PlotIndexSetInteger(3, PLOT_ARROW_SHIFT, -12);
+   PlotIndexSetInteger(2, PLOT_ARROW_SHIFT, -12);
 
-   PlotIndexSetInteger(2, PLOT_ARROW_SHIFT,  10);  // buy  arrow below bar
-   PlotIndexSetInteger(3, PLOT_ARROW_SHIFT, -10);  // sell arrow above bar
+   for(int p = 0; p < 6; p++)
+      PlotIndexSetDouble(p, PLOT_EMPTY_VALUE, 0.0);
 
    IndicatorSetString(INDICATOR_SHORTNAME,
       StringFormat("SP&L (%d/%d)", InpSwingLeft, InpSwingRight));
@@ -143,8 +162,8 @@ void OnDeinit(const int reason)
   }
 
 // ================================================================
-// HELPER : pivot detection
-// Arrays are NOT time-series (index 0 = oldest bar)
+// HELPERS : pivot detection
+// Arrays are NOT time-series (index 0 = oldest bar).
 // ================================================================
 bool IsPivotHigh(const double &h[], int pos, int left, int right, int total)
   {
@@ -165,7 +184,7 @@ bool IsPivotLow(const double &l[], int pos, int left, int right, int total)
   }
 
 // ================================================================
-// HELPER : object drawing
+// HELPERS : object drawing
 // ================================================================
 void DrawLine(const string &name, double price,
               datetime t1, datetime t2, color col)
@@ -194,20 +213,19 @@ void DrawBox(const string &name, double top, double bot,
              datetime t1, datetime t2, color col)
   {
    if(!InpShowBoxes) return;
-   // Dim colour to ~20 % for a semi-transparent feel behind candles
-   color dim = (color)(((int)(((col >> 16) & 0xFF) * 0.25) << 16) |
-                       ((int)(((col >>  8) & 0xFF) * 0.25) <<  8) |
-                        (int)((col         & 0xFF) * 0.25));
+   color dim = (color)(((int)(((col >> 16) & 0xFF) * 0.22) << 16) |
+                       ((int)(((col >>  8) & 0xFF) * 0.22) <<  8) |
+                        (int)((col         & 0xFF) * 0.22));
    if(ObjectFind(0, name) < 0)
      {
       ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, top, t2, bot);
-      ObjectSetInteger(0, name, OBJPROP_COLOR,      dim);
-      ObjectSetInteger(0, name, OBJPROP_BGCOLOR,    dim);
-      ObjectSetInteger(0, name, OBJPROP_FILL,       true);
-      ObjectSetInteger(0, name, OBJPROP_BACK,       true);
-      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE,BORDER_FLAT);
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,       dim);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     dim);
+      ObjectSetInteger(0, name, OBJPROP_FILL,        true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,        true);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
      }
    else
      {
@@ -218,59 +236,35 @@ void DrawBox(const string &name, double top, double bot,
      }
   }
 
-// Draw a short text label (CHoCH / MSS)
-void DrawMSSLabel(const string &name, const string &txt,
-                  datetime t, double price, color col, bool isUp)
+void DrawChochLabel(const string &name, const string &txt,
+                    datetime t, double price, color col, bool above)
   {
    if(!InpShowMSS) return;
-   if(ObjectFind(0, name) >= 0) return;  // draw once
+   if(ObjectFind(0, name) >= 0) return;
    ObjectCreate(0, name, OBJ_TEXT, 0, t, price);
-   ObjectSetString (0, name, OBJPROP_TEXT,      txt);
-   ObjectSetInteger(0, name, OBJPROP_COLOR,     col);
-   ObjectSetInteger(0, name, OBJPROP_ANCHOR,    isUp ? ANCHOR_LOWER : ANCHOR_UPPER);
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  8);
-   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN,    true);
-  }
-
-// Draw (or refresh) the active MSS level line
-void DrawMSSLine(double price, datetime t1, datetime t2, color col)
-  {
-   string n = PFX + "MSS_LVL";
-   if(ObjectFind(0, n) < 0)
-     {
-      ObjectCreate(0, n, OBJ_TREND, 0, t1, price, t2, price);
-      ObjectSetInteger(0, n, OBJPROP_COLOR,     col);
-      ObjectSetInteger(0, n, OBJPROP_STYLE,     STYLE_DASH);
-      ObjectSetInteger(0, n, OBJPROP_WIDTH,     2);
-      ObjectSetInteger(0, n, OBJPROP_RAY_RIGHT, false);
-      ObjectSetInteger(0, n, OBJPROP_SELECTABLE,false);
-      ObjectSetInteger(0, n, OBJPROP_HIDDEN,    true);
-     }
-   else
-     {
-      ObjectSetInteger(0, n, OBJPROP_TIME,  1, t2);
-      ObjectSetDouble (0, n, OBJPROP_PRICE, 0, price);
-      ObjectSetDouble (0, n, OBJPROP_PRICE, 1, price);
-     }
+   ObjectSetString (0, name, OBJPROP_TEXT,       txt);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      col);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,     above ? ANCHOR_LOWER : ANCHOR_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   8);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
   }
 
 // ================================================================
-// HELPER : level array management
+// HELPERS : level array management
 // ================================================================
-void AddLevel(double price, double boxTop, double boxBot,
+void AddLevel(double price, double top, double bot,
               datetime t1, bool isHigh,
-              const string &lnName, const string &bxName)
+              const string &ln, const string &bx)
   {
    ArrayResize(g_lv, g_nLv + 1);
    g_lv[g_nLv].price    = price;
-   g_lv[g_nLv].boxTop   = boxTop;
-   g_lv[g_nLv].boxBot   = boxBot;
+   g_lv[g_nLv].boxTop   = top;
+   g_lv[g_nLv].boxBot   = bot;
    g_lv[g_nLv].t1       = t1;
    g_lv[g_nLv].isHigh   = isHigh;
-   g_lv[g_nLv].filled   = false;
-   g_lv[g_nLv].lineName = lnName;
-   g_lv[g_nLv].boxName  = bxName;
+   g_lv[g_nLv].lineName = ln;
+   g_lv[g_nLv].boxName  = bx;
    g_nLv++;
   }
 
@@ -285,77 +279,176 @@ void RemoveLevel(int i)
   }
 
 // ================================================================
-// HELPER : reset everything for a full recalculation
+// HELPER : alert / push
+// ================================================================
+string TrendLabel(int trend)
+  {
+   if(trend ==  1) return "Bullish";
+   if(trend == -1) return "Bearish";
+   return "Undefined";
+  }
+
+string PeriodStr()
+  {
+   switch(_Period)
+     {
+      case PERIOD_M1:  return "M1";
+      case PERIOD_M5:  return "M5";
+      case PERIOD_M15: return "M15";
+      case PERIOD_M30: return "M30";
+      case PERIOD_H1:  return "H1";
+      case PERIOD_H4:  return "H4";
+      case PERIOD_D1:  return "D1";
+      case PERIOD_W1:  return "W1";
+      case PERIOD_MN1: return "MN";
+      default:         return "TF?";
+     }
+  }
+
+void FireAlert(const string &msg, int confirmBar)
+  {
+   if(!InpAlerts && !InpPush) return;
+   if(g_lastAlertBar == confirmBar) return;  // already fired this bar
+   g_lastAlertBar = confirmBar;
+   if(InpAlerts)  Alert(msg);
+   if(InpPush)    SendNotification(msg);
+  }
+
+// ================================================================
+// HELPER : reset for full recalculation
 // ================================================================
 void ResetAll()
   {
    ObjectsDeleteAll(0, PFX);
    ArrayResize(g_lv, 0);
-   g_nLv      = 0;
-   g_lastPH   = 0;  g_lastPHBar = -1;
-   g_lastPL   = 0;  g_lastPLBar = -1;
-   g_trend    = 0;
-   g_mssLevel = 0;  g_mssActive = false;  g_mssBull = false;
+   g_nLv        = 0;
+   g_lastPH     = 0;  g_lastPHBar = -1;
+   g_lastPL     = 0;  g_lastPLBar = -1;
+   g_trend      = 0;
+   g_lastAlertBar = -1;
   }
 
 // ================================================================
-// MARKET-STRUCTURE LOGIC
-// Called once per confirmed pivot.
-// pivBar : absolute bar index (0=oldest) of the pivot
-// isHigh : true = pivot high, false = pivot low
-// price  : high[pivBar] or low[pivBar]
-// time[] : the main time array
+// SIGNAL + STRUCTURE LOGIC  (called once per confirmed pivot)
+//
+//  isHigh  = true → pivot high (potential LH/HH)
+//  price   = high[pivBar] or low[pivBar]
+//  pivBar  = absolute bar index of the pivot (0=oldest)
+//  confirmBar = bar where pivot was confirmed (pivBar + InpSwingRight)
+//  isLive  = confirmation happened on the live bar (alert eligible)
 // ================================================================
-void UpdateStructure(int pivBar, bool isHigh, double price,
-                     const datetime &time[], int total)
+void ProcessPivot(bool isHigh, double price, int pivBar, int confirmBar,
+                  bool isLive, const datetime &time[],
+                  double &bufWT[], double &bufCT[],
+                  double &bufChochBull[], double &bufChochBear[])
   {
+   string sym  = _Symbol;
+   string tf   = PeriodStr();
+   string tLbl = TrendLabel(g_trend);
+
    if(isHigh)
      {
-      if(g_lastPH == 0) { g_lastPH = price; g_lastPHBar = pivBar; return; }
+      // --- Classify the pivot high against last known high ---
+      bool isHH = (g_lastPH == 0 || price > g_lastPH);
+      bool isLH = (g_lastPH != 0 && price < g_lastPH);
 
-      if(price > g_lastPH)   // Higher High
+      if(isHH && g_trend == -1)
         {
-         if(g_trend == -1)   // Was bearish → CHoCH bullish
-           {
-            string n = PFX + "CHoCH_" + IntegerToString(pivBar);
-            DrawMSSLabel(n, "CHoCH", time[pivBar], price,
-                         InpMSSBullCol, false);
-            g_mssLevel  = g_lastPH;   // the LH that was exceeded
-            g_mssActive = true;
-            g_mssBull   = true;       // look for buy retrace
-           }
+         // ── CHoCH: bearish → bullish ───────────────────────────
+         DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pivBar),
+                        "CHoCH", time[pivBar], price, InpMSSBullCol, false);
+         bufChochBull[pivBar] = price;
          g_trend = 1;
-        }
-      else                    // Lower High
-        {
-         g_trend = (g_trend == 0) ? -1 : g_trend; // keep existing if defined
-         if(g_trend == 1) g_trend = -1;
-        }
-      g_lastPH = price;  g_lastPHBar = pivBar;
-     }
-   else  // pivot low
-     {
-      if(g_lastPL == 0) { g_lastPL = price; g_lastPLBar = pivBar; return; }
 
-      if(price < g_lastPL)   // Lower Low
-        {
-         if(g_trend == 1)    // Was bullish → CHoCH bearish
-           {
-            string n = PFX + "CHoCH_" + IntegerToString(pivBar);
-            DrawMSSLabel(n, "CHoCH", time[pivBar], price,
-                         InpMSSBearCol, true);
-            g_mssLevel  = g_lastPL;   // the HL that was broken
-            g_mssActive = true;
-            g_mssBull   = false;      // look for sell retrace
-           }
+         if(isLive)
+            FireAlert(sym + " " + tf +
+                      " | ⚡ CHoCH → Trend flipped BULLISH @ " +
+                      DoubleToString(price, _Digits), confirmBar);
+        }
+      else if(isHH && g_trend == 0)
+         g_trend = 1;
+      else if(isLH && g_trend == 1)
          g_trend = -1;
-        }
-      else                    // Higher Low
+      else if(isLH && g_trend == 0)
+         g_trend = -1;
+
+      // Update last pivot high
+      if(g_lastPH == 0 || price != g_lastPH)
+        { g_lastPH = price;  g_lastPHBar = pivBar; }
+
+      // ── SELL Signal on every confirmed LH ────────────────────
+      if(isLH && InpShowDots)
         {
-         g_trend = (g_trend == 0) ? 1 : g_trend;
-         if(g_trend == -1) g_trend = 1;
+         bool withTrend = (g_trend == -1);  // LH in bear = with-trend sell
+         if(withTrend)
+           {
+            bufWT[pivBar] = price;
+            if(isLive)
+               FireAlert(sym + " " + tf +
+                         " | 🔴 SELL  @ " + DoubleToString(price, _Digits) +
+                         "  | Trend: Bearish (With-Trend)", confirmBar);
+           }
+         else if(InpShowCTSig)
+           {
+            bufCT[pivBar] = price;
+            if(isLive)
+               FireAlert(sym + " " + tf +
+                         " | 🟠 SELL  @ " + DoubleToString(price, _Digits) +
+                         "  | Trend: " + tLbl + " (Counter-Trend)", confirmBar);
+           }
         }
-      g_lastPL = price;  g_lastPLBar = pivBar;
+     }
+   else // pivot low
+     {
+      // --- Classify the pivot low against last known low ---
+      bool isLL = (g_lastPL == 0 || price < g_lastPL);
+      bool isHL = (g_lastPL != 0 && price > g_lastPL);
+
+      if(isLL && g_trend == 1)
+        {
+         // ── CHoCH: bullish → bearish ───────────────────────────
+         DrawChochLabel(PFX + "CHoCH_" + IntegerToString(pivBar),
+                        "CHoCH", time[pivBar], price, InpMSSBearCol, true);
+         bufChochBear[pivBar] = price;
+         g_trend = -1;
+
+         if(isLive)
+            FireAlert(sym + " " + tf +
+                      " | ⚡ CHoCH → Trend flipped BEARISH @ " +
+                      DoubleToString(price, _Digits), confirmBar);
+        }
+      else if(isLL && g_trend == 0)
+         g_trend = -1;
+      else if(isHL && g_trend == -1)
+         g_trend = 1;
+      else if(isHL && g_trend == 0)
+         g_trend = 1;
+
+      // Update last pivot low
+      if(g_lastPL == 0 || price != g_lastPL)
+        { g_lastPL = price;  g_lastPLBar = pivBar; }
+
+      // ── BUY Signal on every confirmed HL ─────────────────────
+      if(isHL && InpShowDots)
+        {
+         bool withTrend = (g_trend == 1);  // HL in bull = with-trend buy
+         if(withTrend)
+           {
+            bufWT[pivBar] = price;
+            if(isLive)
+               FireAlert(sym + " " + tf +
+                         " | 🟢 BUY   @ " + DoubleToString(price, _Digits) +
+                         "  | Trend: Bullish (With-Trend)", confirmBar);
+           }
+         else if(InpShowCTSig)
+           {
+            bufCT[pivBar] = price;
+            if(isLive)
+               FireAlert(sym + " " + tf +
+                         " | 🟡 BUY   @ " + DoubleToString(price, _Digits) +
+                         "  | Trend: Bearish (Counter-Trend)", confirmBar);
+           }
+        }
      }
   }
 
@@ -374,99 +467,99 @@ int OnCalculate(const int rates_total,
                 const long     &volume[],
                 const int      &spread[])
   {
+   if(rates_total < InpSwingLeft + InpSwingRight + 1) return prev_calculated;
+
    // --- Full recalculation ---
    if(prev_calculated == 0)
      {
       ResetAll();
-      ArrayInitialize(BufPH,   0);
-      ArrayInitialize(BufPL,   0);
-      ArrayInitialize(BufBuy,  0);
-      ArrayInitialize(BufSell, 0);
+      ArrayInitialize(BufBuyWT,   0);
+      ArrayInitialize(BufBuyCT,   0);
+      ArrayInitialize(BufSellWT,  0);
+      ArrayInitialize(BufSellCT,  0);
+      ArrayInitialize(BufChochB,  0);
+      ArrayInitialize(BufChochBr, 0);
      }
 
-   // --- How far back to (re)start processing ---
-   // Pivots confirmed InpSwingRight bars after the actual pivot,
-   // so we must look back InpSwingRight extra bars on incremental runs.
+   // Reprocess from (prev_calculated - InpSwingRight - 1) to catch
+   // pivots whose confirmation bar falls in the new range.
    int startBar = (prev_calculated == 0)
                   ? InpSwingLeft
                   : MathMax(InpSwingLeft, prev_calculated - InpSwingRight - 1);
 
-   datetime tNow = time[rates_total - 1];  // latest bar time (for extending objects)
-
-   double bw1 = 0.001 * InpBoxWidth;  // mirrors Pine's boxWid1
+   datetime tNow    = time[rates_total - 1];
+   double   bw1     = 0.001 * InpBoxWidth;
+   bool     isLive  = (prev_calculated > 0); // only fire alerts on incremental runs
 
    // ================================================================
    // MAIN BAR LOOP
    // ================================================================
    for(int i = startBar; i < rates_total; i++)
      {
-      // ---- Pivot check: the actual pivot bar is i - InpSwingRight ----
-      int pBar = i - InpSwingRight;
+      int pBar = i - InpSwingRight;   // actual pivot bar
       if(pBar < InpSwingLeft) continue;
 
       bool newPH = IsPivotHigh(high, pBar, InpSwingLeft, InpSwingRight, rates_total);
       bool newPL = IsPivotLow (low,  pBar, InpSwingLeft, InpSwingRight, rates_total);
 
-      // --- Create level objects for new pivots -----------------------
-      if(newPH && BufPH[pBar] == 0.0)
+      // ---- Process new pivot HIGH --------------------------------
+      if(newPH && BufSellWT[pBar] == 0.0 && BufSellCT[pBar] == 0.0
+         && BufChochB[pBar] == 0.0)
         {
          double phPrice = high[pBar];
          double boxTop  = phPrice * (1.0 + bw1);
-         double boxBot  = phPrice;  // TYPE 1: bot = pivot price
+         double boxBot  = phPrice;
 
-         string lnName  = PFX + "LH_" + IntegerToString(pBar);
-         string bxName  = PFX + "BH_" + IntegerToString(pBar);
+         string ln = PFX + "LH_" + IntegerToString(pBar);
+         string bx = PFX + "BH_" + IntegerToString(pBar);
 
-         DrawLine(lnName, phPrice,   time[pBar], time[i], InpHighColor);
-         DrawBox (bxName, boxTop, boxBot, time[pBar], time[i], InpHighColor);
+         DrawLine(ln, phPrice, time[pBar], time[i], InpHighColor);
+         DrawBox (bx, boxTop, boxBot, time[pBar], time[i], InpHighColor);
+         AddLevel(phPrice, boxTop, boxBot, time[pBar], true, ln, bx);
 
-         AddLevel(phPrice, boxTop, boxBot, time[pBar], true, lnName, bxName);
-
-         // Dot on the pivot bar
-         if(InpShowDots) BufPH[pBar] = phPrice;
-
-         // Market structure update
-         UpdateStructure(pBar, true, phPrice, time, rates_total);
+         // Signal + structure update (passes sell buffers for highs)
+         ProcessPivot(true, phPrice, pBar, i,
+                      isLive && i == rates_total - 1,
+                      time, BufSellWT, BufSellCT, BufChochB, BufChochBr);
         }
 
-      if(newPL && BufPL[pBar] == 0.0)
+      // ---- Process new pivot LOW ---------------------------------
+      if(newPL && BufBuyWT[pBar] == 0.0 && BufBuyCT[pBar] == 0.0
+         && BufChochBr[pBar] == 0.0)
         {
          double plPrice = low[pBar];
          double boxBot2 = plPrice * (1.0 - bw1);
-         double boxTop2 = plPrice;  // TYPE 1: top = pivot price
+         double boxTop2 = plPrice;
 
-         string lnName  = PFX + "LL_" + IntegerToString(pBar);
-         string bxName  = PFX + "BL_" + IntegerToString(pBar);
+         string ln = PFX + "LL_" + IntegerToString(pBar);
+         string bx = PFX + "BL_" + IntegerToString(pBar);
 
-         DrawLine(lnName, plPrice,   time[pBar], time[i], InpLowColor);
-         DrawBox (bxName, boxTop2, boxBot2, time[pBar], time[i], InpLowColor);
+         DrawLine(ln, plPrice, time[pBar], time[i], InpLowColor);
+         DrawBox (bx, boxTop2, boxBot2, time[pBar], time[i], InpLowColor);
+         AddLevel(plPrice, boxTop2, boxBot2, time[pBar], false, ln, bx);
 
-         AddLevel(plPrice, boxTop2, boxBot2, time[pBar], false, lnName, bxName);
-
-         if(InpShowDots) BufPL[pBar] = plPrice;
-
-         UpdateStructure(pBar, false, plPrice, time, rates_total);
+         // Signal + structure update (passes buy buffers for lows)
+         ProcessPivot(false, plPrice, pBar, i,
+                      isLive && i == rates_total - 1,
+                      time, BufBuyWT, BufBuyCT, BufChochB, BufChochBr);
         }
 
-      // --- Update all active levels (extend right edge) --------------
-      // Only on the current bar (i == rates_total-1) to avoid O(n²) on full recalc
+      // ---- Extend / fill-check on live bar only -----------------
       if(i == rates_total - 1)
         {
          int j = 0;
          while(j < g_nLv)
            {
-            double lvPrice = g_lv[j].price;
-            bool   filled  = (high[i] >= lvPrice && low[i] <= lvPrice);
+            double lp     = g_lv[j].price;
+            bool   filled = (high[i] >= lp && low[i] <= lp);
+            color  col    = g_lv[j].isHigh ? InpHighColor : InpLowColor;
 
             if(filled && InpHideFilled)
-              {
-               RemoveLevel(j);   // deletes objects and removes from array
-               continue;
-              }
+              { RemoveLevel(j); continue; }
 
             if(filled && InpExtendFill)
               {
-               // Stop extending – remove tracking but keep drawn objects as-is
+               // Stop extending – keep drawn objects frozen in place
                ObjectDelete(0, g_lv[j].lineName);
                ObjectDelete(0, g_lv[j].boxName);
                g_lv[j] = g_lv[g_nLv - 1];
@@ -475,58 +568,19 @@ int OnCalculate(const int rates_total,
                continue;
               }
 
-            if(!InpExtendFill)
-              {
-               // Don't extend past confirmation bar – already drawn to time[i]
-               // Nothing to update; just leave as-is
-               j++;
-               continue;
-              }
+            if(!InpExtendFill) { j++; continue; }
 
-            // Extend right edge to current bar
-            color col = g_lv[j].isHigh ? InpHighColor : InpLowColor;
-            DrawLine(g_lv[j].lineName, lvPrice,
-                     g_lv[j].t1, tNow, col);
+            // Extend right edge
+            DrawLine(g_lv[j].lineName, lp, g_lv[j].t1, tNow, col);
             DrawBox (g_lv[j].boxName,
                      g_lv[j].boxTop, g_lv[j].boxBot,
                      g_lv[j].t1, tNow, col);
 
-            // Cap object count (mirrors Pine's 500 limit)
             if(g_nLv >= MAX_OBJECTS) RemoveLevel(0);
-
             j++;
            }
         }
-
-      // --- MSS level line & signal generation ------------------------
-      if(g_mssActive && i == rates_total - 1)
-        {
-         color mssCol = g_mssBull ? InpMSSBullCol : InpMSSBearCol;
-
-         // Find t1 for the MSS level line (use creation bar)
-         datetime mssT1 = (g_mssBull)
-                          ? time[g_lastPHBar < 0 ? 0 : g_lastPHBar]
-                          : time[g_lastPLBar < 0 ? 0 : g_lastPLBar];
-         DrawMSSLine(g_mssLevel, mssT1, tNow, mssCol);
-        }
-
-      // --- Signal: price returns to MSS level ------------------------
-      if(InpShowSignals && g_mssActive)
-        {
-         if(g_mssBull && low[i] <= g_mssLevel && BufBuy[i] == 0.0)
-           {
-            BufBuy[i]   = low[i];
-            g_mssActive = false;  // one signal per CHoCH
-            ObjectDelete(0, PFX + "MSS_LVL");
-           }
-         if(!g_mssBull && high[i] >= g_mssLevel && BufSell[i] == 0.0)
-           {
-            BufSell[i]  = high[i];
-            g_mssActive = false;
-            ObjectDelete(0, PFX + "MSS_LVL");
-           }
-        }
-     }  // end main bar loop
+     }
 
    return rates_total;
   }
