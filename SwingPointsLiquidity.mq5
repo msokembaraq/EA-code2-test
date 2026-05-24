@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.80"
+#property version   "1.81"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -331,7 +331,7 @@ void FireSignal(const string &dir, const string &label,
    dedupBar = confirmBar;
 
    string msg = dir + " " + _Symbol + " " + DoubleToString(sigPrice, _Digits) +
-                " | " + label +
+                (StringLen(label) > 0 ? " | " + label : "") +
                 " | SL: "  + PriceStr(sl)  +
                 " | TP1: " + PriceStr(tp1) +
                 " | TP2: " + PriceStr(tp2) +
@@ -716,7 +716,7 @@ int OnCalculate(const int rates_total,
                   FindSellTPs(eph, etp1, etp2, etp3);
                   if(CheckMinRR(false, eph, epSL))
                     {
-                     string epDirS = "RISKY SELL"; string epLblS = "Bear?";
+                     string epDirS = "RISKY SELL"; string epLblS = "";
                      FireSignal(epDirS, epLblS, eph, epSL, etp1, etp2, etp3,
                                 i, isLive && i == rates_total - 1, g_lastProbSellBar);
                     }
@@ -734,7 +734,7 @@ int OnCalculate(const int rates_total,
                   FindBuyTPs(epl, etp1, etp2, etp3);
                   if(CheckMinRR(true, epl, epSL))
                     {
-                     string epDirB = "RISKY BUY"; string epLblB = "Bull?";
+                     string epDirB = "RISKY BUY"; string epLblB = "";
                      FireSignal(epDirB, epLblB, epl, epSL, etp1, etp2, etp3,
                                 i, isLive && i == rates_total - 1, g_lastProbBuyBar);
                     }
@@ -836,7 +836,7 @@ int OnCalculate(const int rates_total,
               {
                BufSellCT[pBar] = ph;
                if(CheckMinRR(false, ph, sl))
-                  FireSignal("RISKY SELL", "Bull", ph, sl,
+                  FireSignal("RISKY SELL", "C-T", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastSellAlertBar);
@@ -926,7 +926,7 @@ int OnCalculate(const int rates_total,
               {
                BufBuyCT[pBar] = pl;
                if(CheckMinRR(true, pl, sl))
-                  FireSignal("RISKY BUY", "Bear", pl, sl,
+                  FireSignal("RISKY BUY", "C-T", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastBuyAlertBar);
