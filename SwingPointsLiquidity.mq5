@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.40"
+#property version   "1.50"
 #property indicator_chart_window
 #property indicator_plots 6
 
@@ -146,6 +146,7 @@ bool     g_mssBull   = false;
 int      g_lastBuyAlertBar  = -1;
 int      g_lastSellAlertBar = -1;
 int      g_lastMSSAlertBar  = -1;
+int      g_chochBar         = -1;  // bar index of most recent CHoCH (for MSS skip guard)
 
 // ================================================================
 // OnInit
@@ -438,6 +439,7 @@ void ResetAll()
    g_lastBuyAlertBar  = -1;
    g_lastSellAlertBar = -1;
    g_lastMSSAlertBar  = -1;
+   g_chochBar         = -1;
   }
 
 // ================================================================
@@ -593,7 +595,6 @@ int OnCalculate(const int rates_total,
          BufPivHProc[pBar] = 1.0;   // mark as processed FIRST
 
          double ph = high[pBar];
-         double confirmClose = close[i];  // price when signal is confirmed
 
          // Draw liquidity line + box
          string ln = PFX + "LH_" + IntegerToString(pBar);
@@ -616,9 +617,10 @@ int OnCalculate(const int rates_total,
             FindMSSZones(legStart, pBar, true,
                          high, low, open, close, time, rates_total, chochSeq);
             // FIX: SL for BUY MSS = last swing LOW (structural support below zones)
-            g_mssSL   = (g_lastPL > 0) ? g_lastPL : ph * 0.999;
-            g_mssBull = true;
-            g_trend   = 1;
+            g_mssSL    = (g_lastPL > 0) ? g_lastPL : ph * 0.999;
+            g_mssBull  = true;
+            g_trend    = 1;
+            g_chochBar = i;
            }
          else if(isHH)
            {
@@ -627,18 +629,18 @@ int OnCalculate(const int rates_total,
          else
            {
             // LH → SELL signal
-            // FIX: evaluate withTrend from priorTrend, then update g_trend
+            // Trend does NOT flip on a single LH — only CHoCH flips trend.
             bool withTrend = (priorTrend == -1);
-            if(priorTrend == 1 || priorTrend == 0) g_trend = -1;
 
-            // sigPrice = market price at confirmation; sl = the LH pivot (structural high)
             double tp1, tp2, tp3;
-            FindSellTPs(confirmClose, tp1, tp2, tp3);
+            FindSellTPs(ph, tp1, tp2, tp3);
+            // SL = previous structural High (above entry); fallback if no prior PH yet
+            double sl = (g_lastPH > ph) ? g_lastPH : ph * 1.001;
 
             if(withTrend)
               {
                BufSellBear[pBar] = ph;
-               FireSignal("SELL", "Bear", confirmClose, ph,
+               FireSignal("SELL", "Bear", ph, sl,
                           tp1, tp2, tp3, i,
                           isLive && i == rates_total - 1,
                           g_lastSellAlertBar);
@@ -646,7 +648,7 @@ int OnCalculate(const int rates_total,
             else if(InpShowCTSig)
               {
                BufSellCT[pBar] = ph;
-               FireSignal("SELL", "Bull", confirmClose, ph,
+               FireSignal("SELL", "Bull", ph, sl,
                           tp1, tp2, tp3, i,
                           isLive && i == rates_total - 1,
                           g_lastSellAlertBar);
@@ -663,7 +665,6 @@ int OnCalculate(const int rates_total,
          BufPivLProc[pBar] = 1.0;   // mark as processed FIRST
 
          double pl = low[pBar];
-         double confirmClose = close[i];
 
          string ln = PFX + "LL_" + IntegerToString(pBar);
          string bx = PFX + "BL_" + IntegerToString(pBar);
@@ -684,9 +685,10 @@ int OnCalculate(const int rates_total,
             FindMSSZones(legStart, pBar, false,
                          high, low, open, close, time, rates_total, chochSeq);
             // FIX: SL for SELL MSS = last swing HIGH (structural resistance above zones)
-            g_mssSL   = (g_lastPH > 0) ? g_lastPH : pl * 1.001;
-            g_mssBull = false;
-            g_trend   = -1;
+            g_mssSL    = (g_lastPH > 0) ? g_lastPH : pl * 1.001;
+            g_mssBull  = false;
+            g_trend    = -1;
+            g_chochBar = i;
            }
          else if(isLL)
            {
@@ -695,16 +697,18 @@ int OnCalculate(const int rates_total,
          else
            {
             // HL → BUY signal
+            // Trend does NOT flip on a single HL — only CHoCH flips trend.
             bool withTrend = (priorTrend == 1);
-            if(priorTrend == -1 || priorTrend == 0) g_trend = 1;
 
             double tp1, tp2, tp3;
-            FindBuyTPs(confirmClose, tp1, tp2, tp3);
+            FindBuyTPs(pl, tp1, tp2, tp3);
+            // SL = previous structural Low (below entry); fallback if no prior PL yet
+            double sl = (g_lastPL > 0 && g_lastPL < pl) ? g_lastPL : pl * 0.999;
 
             if(withTrend)
               {
                BufBuyBull[pBar] = pl;
-               FireSignal("BUY", "Bull", confirmClose, pl,
+               FireSignal("BUY", "Bull", pl, sl,
                           tp1, tp2, tp3, i,
                           isLive && i == rates_total - 1,
                           g_lastBuyAlertBar);
@@ -712,7 +716,7 @@ int OnCalculate(const int rates_total,
             else if(InpShowCTSig)
               {
                BufBuyCT[pBar] = pl;
-               FireSignal("BUY", "Bear", confirmClose, pl,
+               FireSignal("BUY", "Bear", pl, sl,
                           tp1, tp2, tp3, i,
                           isLive && i == rates_total - 1,
                           g_lastBuyAlertBar);
@@ -724,15 +728,9 @@ int OnCalculate(const int rates_total,
         }
 
       // ── MSS ZONE ENTRY CHECK ────────────────────────────────────
-      // Runs only AFTER the pivot blocks above, so zones created this
-      // iteration are checked against future bars only (the next tick).
-      // On the SAME bar as a CHoCH confirmation (i == rates_total-1)
-      // we skip zone checks to avoid firing on the breakout candle itself.
-      bool isChochBar = (i == rates_total - 1 &&
-                         (BufPivHProc[pBar] != 0.0 || BufPivLProc[pBar] != 0.0) &&
-                          i - InpSwingRight == pBar);
-
-      if(g_nMSSZones > 0 && !isChochBar)
+      // Skip on the exact bar where a CHoCH fired (g_chochBar) to avoid
+      // entering the breakout candle as an MSS trade.
+      if(g_nMSSZones > 0 && i != g_chochBar)
         {
          for(int z = 0; z < g_nMSSZones; z++)
            {
