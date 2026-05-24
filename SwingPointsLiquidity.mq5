@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.72"
+#property version   "1.73"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 8
@@ -87,6 +87,7 @@ input bool   InpTrackFlips   = true;             // Alert SBR / RBS on retests
 input int    InpApproachMode = 0;                // 0=Swing range  1=ATR  2=Fixed pips
 input double InpApproachMult = 0.5;             // Multiplier for swing / ATR modes
 input double InpApproachPips = 10.0;            // Pip distance for approach zone (mode 2)
+input int    InpRetestWindow = 200;             // Bars to watch broken zone for retest (0=unlimited)
 
 // ================================================================
 // BUFFERS  (6 plotted + 2 internal)
@@ -118,6 +119,8 @@ struct SLevel
    string   lineName;
    string   boxName;
    double   swingRange;      // pivot candle range (high-low) used for approach threshold
+   int      touches;         // number of approach episodes (shown in push notification)
+   int      brokenBar;       // bar index when level was broken (-1 = still active)
    bool     approached;      // approach alert active for current episode
    bool     broken;          // price closed through (level flipped)
    bool     flipApproached;  // SBR / RBS alert active for current episode
@@ -346,10 +349,11 @@ double GetApproachThreshold(double swingRange)
    return swingRange * InpApproachMult;  // mode 0: pivot candle range × multiplier
   }
 
-void FireLvlAlert(const string &tag, const string &rdy, double price)
+void FireLvlAlert(const string &tag, const string &rdy, double price, int touches)
   {
    if(!InpAlerts && !InpPush) return;
-   string msg = tag + " " + _Symbol + " " + DoubleToString(price, _Digits) + " | " + rdy;
+   string msg = tag + " " + _Symbol + " " + DoubleToString(price, _Digits) +
+                " | " + rdy + " | " + IntegerToString(touches) + "x";
    if(InpAlerts) Alert(msg);
    if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
   }
@@ -467,6 +471,8 @@ void AddLevel(double price, double top, double bot,
    g_lv[g_nLv].lineName      = ln;
    g_lv[g_nLv].boxName       = bx;
    g_lv[g_nLv].swingRange     = swingRange;
+   g_lv[g_nLv].touches       = 0;
+   g_lv[g_nLv].brokenBar     = -1;
    g_lv[g_nLv].approached    = false;
    g_lv[g_nLv].broken        = false;
    g_lv[g_nLv].flipApproached= false;
@@ -801,6 +807,7 @@ int OnCalculate(const int rates_total,
          if(broke)
            {
             g_lv[j].broken         = true;
+            g_lv[j].brokenBar      = i;
             g_lv[j].approached     = false;
             g_lv[j].flipApproached = false;
            }
@@ -845,21 +852,32 @@ int OnCalculate(const int rates_total,
               {
                if(inZone && !g_lv[j].approached)
                  {
+                  g_lv[j].touches++;
                   FireLvlAlert(g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT",
-                               g_lv[j].isHigh ? "SELL READY" : "BUY READY", lp);
+                               g_lv[j].isHigh ? "SELL READY" : "BUY READY",
+                               lp, g_lv[j].touches);
                   g_lv[j].approached = true;
                  }
                if(!inZone) g_lv[j].approached = false;
               }
             else if(InpTrackFlips)
               {
-               if(inFlipZone && !g_lv[j].flipApproached)
+               // Only alert within the retest window after the break
+               bool inWindow = (InpRetestWindow == 0) ||
+                               (g_lv[j].brokenBar >= 0 &&
+                                i - g_lv[j].brokenBar <= InpRetestWindow);
+               if(inWindow)
                  {
-                  FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
-                               g_lv[j].isHigh ? "BUY READY" : "SELL READY", lp);
-                  g_lv[j].flipApproached = true;
+                  if(inFlipZone && !g_lv[j].flipApproached)
+                    {
+                     g_lv[j].touches++;
+                     FireLvlAlert(g_lv[j].isHigh ? "RBS" : "SBR",
+                                  g_lv[j].isHigh ? "BUY READY" : "SELL READY",
+                                  lp, g_lv[j].touches);
+                     g_lv[j].flipApproached = true;
+                    }
+                  if(!inFlipZone) g_lv[j].flipApproached = false;
                  }
-               if(!inFlipZone) g_lv[j].flipApproached = false;
               }
            }
         }
@@ -942,6 +960,12 @@ int OnCalculate(const int rates_total,
             if(g_lv[j].broken)
               {
                if(!InpTrackFlips) { RemoveLevel(j); continue; }
+
+               // Remove once the retest window has expired
+               bool inWindow = (InpRetestWindow == 0) ||
+                               (g_lv[j].brokenBar >= 0 &&
+                                i - g_lv[j].brokenBar <= InpRetestWindow);
+               if(!inWindow) { RemoveLevel(j); continue; }
 
                // Double-break: flip role also broken → remove permanently
                bool doubleBroke = g_lv[j].isHigh
