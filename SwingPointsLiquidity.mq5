@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.82"
+#property version   "1.83"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -167,6 +167,8 @@ bool     g_mssBull   = false;
 int      g_lastBuyAlertBar  = -1;
 int      g_lastSellAlertBar = -1;
 int      g_lastMSSAlertBar  = -1;
+int      g_lastMSSBuySeq    = -1;   // chochSeq of last BUY MSS push (one per CHoCH)
+int      g_lastMSSSellSeq   = -1;   // chochSeq of last SELL MSS push (one per CHoCH)
 int      g_lastProbBuyBar   = -1;   // dedup for RISKY BUY early alerts
 int      g_lastProbSellBar  = -1;   // dedup for RISKY SELL early alerts
 int      g_chochBar         = -1;  // bar index of most recent CHoCH (for MSS skip guard)
@@ -518,6 +520,8 @@ void ResetAll()
    g_lastBuyAlertBar  = -1;
    g_lastSellAlertBar = -1;
    g_lastMSSAlertBar  = -1;
+   g_lastMSSBuySeq    = -1;
+   g_lastMSSSellSeq   = -1;
    g_lastProbBuyBar   = -1;
    g_lastProbSellBar  = -1;
    g_chochBar         = -1;
@@ -826,7 +830,7 @@ int OnCalculate(const int rates_total,
             if(withTrend)
               {
                BufSellBear[pBar] = ph;   // dot always drawn (shows structure)
-               if(CheckMinRR(false, ph, sl))
+               if(BufPivHEarly[pBar] == 0.0 && CheckMinRR(false, ph, sl))
                   FireSignal("SELL", "Bear", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
@@ -835,7 +839,7 @@ int OnCalculate(const int rates_total,
             else
               {
                BufSellCT[pBar] = ph;
-               if(CheckMinRR(false, ph, sl))
+               if(BufPivHEarly[pBar] == 0.0 && CheckMinRR(false, ph, sl))
                   FireSignal("RISKY SELL", "C-T BULL", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
@@ -916,7 +920,7 @@ int OnCalculate(const int rates_total,
             if(withTrend)
               {
                BufBuyBull[pBar] = pl;    // dot always drawn (shows structure)
-               if(CheckMinRR(true, pl, sl))
+               if(BufPivLEarly[pBar] == 0.0 && CheckMinRR(true, pl, sl))
                   FireSignal("BUY", "Bull", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
@@ -925,7 +929,7 @@ int OnCalculate(const int rates_total,
             else
               {
                BufBuyCT[pBar] = pl;
-               if(CheckMinRR(true, pl, sl))
+               if(BufPivLEarly[pBar] == 0.0 && CheckMinRR(true, pl, sl))
                   FireSignal("RISKY BUY", "C-T BEAR", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
@@ -1075,19 +1079,31 @@ int OnCalculate(const int rates_total,
                  {
                   BufBuyMSS[i] = entryPx;
                   FindBuyTPs(entryPx, tp1, tp2, tp3);
-                  FireSignal("BUY", zType, entryPx, g_mssSL,
-                             tp1, tp2, tp3, i,
-                             isLive && i == rates_total - 1,
-                             g_lastMSSAlertBar);
+                  // Trend gate: suppress if trend has since flipped bear
+                  // Dedup: only first zone entry per CHoCH fires push
+                  if(g_trend >= 0 && g_chochSeq != g_lastMSSBuySeq)
+                    {
+                     g_lastMSSBuySeq = g_chochSeq;
+                     FireSignal("BUY", zType, entryPx, g_mssSL,
+                                tp1, tp2, tp3, i,
+                                isLive && i == rates_total - 1,
+                                g_lastMSSAlertBar);
+                    }
                  }
                else
                  {
                   BufSellMSS[i] = entryPx;
                   FindSellTPs(entryPx, tp1, tp2, tp3);
-                  FireSignal("SELL", zType, entryPx, g_mssSL,
-                             tp1, tp2, tp3, i,
-                             isLive && i == rates_total - 1,
-                             g_lastMSSAlertBar);
+                  // Trend gate: suppress if trend has since flipped bull
+                  // Dedup: only first zone entry per CHoCH fires push
+                  if(g_trend <= 0 && g_chochSeq != g_lastMSSSellSeq)
+                    {
+                     g_lastMSSSellSeq = g_chochSeq;
+                     FireSignal("SELL", zType, entryPx, g_mssSL,
+                                tp1, tp2, tp3, i,
+                                isLive && i == rates_total - 1,
+                                g_lastMSSAlertBar);
+                    }
                  }
 
                g_mssZones[z].active = false;
