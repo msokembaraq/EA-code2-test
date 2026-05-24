@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.78"
+#property version   "1.79"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -54,7 +54,7 @@
 input group "=== Swing Detection ==="
 input int    InpSwingRight        = 15;          // Bars Right (confirmed signal + drawing)
 input int    InpSwingLeft         = 15;          // Bars Left
-input int    InpSwingRightSignal  = 5;           // Bars Right for early PROBABLE signal (0=off)
+input int    InpSwingRightSignal  = 5;           // Bars Right for early RISKY signal (0=off)
 
 input group "=== Display ==="
 input bool   InpShowBoxes    = true;             // Show Liquidity Boxes
@@ -168,8 +168,8 @@ bool     g_mssBull   = false;
 int      g_lastBuyAlertBar  = -1;
 int      g_lastSellAlertBar = -1;
 int      g_lastMSSAlertBar  = -1;
-int      g_lastProbBuyBar   = -1;   // dedup for PROBABLE BUY early alerts
-int      g_lastProbSellBar  = -1;   // dedup for PROBABLE SELL early alerts
+int      g_lastProbBuyBar   = -1;   // dedup for RISKY BUY early alerts
+int      g_lastProbSellBar  = -1;   // dedup for RISKY SELL early alerts
 int      g_chochBar         = -1;  // bar index of most recent CHoCH (for MSS skip guard)
 int      g_chochSeq         = 0;   // monotonic counter for unique MSS zone object names
 datetime g_lastExtTime      = 0;   // bar open time of last extension pass (P1: skip same-bar ticks)
@@ -696,7 +696,7 @@ int OnCalculate(const int rates_total,
    // ================================================================
    for(int i = startBar; i < rates_total; i++)
      {
-      // ── EARLY (PROBABLE) SIGNAL ──────────────────────────────────────
+      // ── EARLY (RISKY) SIGNAL ──────────────────────────────────────
       // Fires after InpSwingRightSignal confirmed right bars — earlier
       // warning than the full confirmed signal. May repaint if later bars
       // invalidate the pivot. R:R check still applies.
@@ -717,7 +717,7 @@ int OnCalculate(const int rates_total,
                   FindSellTPs(eph, etp1, etp2, etp3);
                   if(CheckMinRR(false, eph, epSL))
                     {
-                     string epDirS = "PROBABLE SELL"; string epLblS = "Bear?";
+                     string epDirS = "RISKY SELL"; string epLblS = "Bear?";
                      FireSignal(epDirS, epLblS, eph, epSL, etp1, etp2, etp3,
                                 i, isLive && i == rates_total - 1, g_lastProbSellBar);
                     }
@@ -735,7 +735,7 @@ int OnCalculate(const int rates_total,
                   FindBuyTPs(epl, etp1, etp2, etp3);
                   if(CheckMinRR(true, epl, epSL))
                     {
-                     string epDirB = "PROBABLE BUY"; string epLblB = "Bull?";
+                     string epDirB = "RISKY BUY"; string epLblB = "Bull?";
                      FireSignal(epDirB, epLblB, epl, epSL, etp1, etp2, etp3,
                                 i, isLive && i == rates_total - 1, g_lastProbBuyBar);
                     }
