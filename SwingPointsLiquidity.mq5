@@ -52,7 +52,7 @@
 // INPUTS
 // ================================================================
 input group "=== Swing Detection ==="
-input int    InpSwingRight   = 10;               // Bars Right
+input int    InpSwingRight   = 15;               // Bars Right
 input int    InpSwingLeft    = 15;               // Bars Left
 
 input group "=== Display ==="
