@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.81"
+#property version   "1.82"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -836,7 +836,7 @@ int OnCalculate(const int rates_total,
               {
                BufSellCT[pBar] = ph;
                if(CheckMinRR(false, ph, sl))
-                  FireSignal("RISKY SELL", "C-T", ph, sl,
+                  FireSignal("RISKY SELL", "C-T BULL", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastSellAlertBar);
@@ -926,7 +926,7 @@ int OnCalculate(const int rates_total,
               {
                BufBuyCT[pBar] = pl;
                if(CheckMinRR(true, pl, sl))
-                  FireSignal("RISKY BUY", "C-T", pl, sl,
+                  FireSignal("RISKY BUY", "C-T BEAR", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastBuyAlertBar);
