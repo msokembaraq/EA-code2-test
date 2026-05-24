@@ -284,8 +284,7 @@ void FireSignal(const string &dir,      // "BUY" or "SELL"
    if(g_lastAlertBar == confirmBar) return;   // one alert per bar
    g_lastAlertBar = confirmBar;
 
-   string msg = dir + " (" + _Symbol + " " + TFStr() +
-                " " + DoubleToString(sigPrice, _Digits) + ")" +
+   string msg = dir + " " + _Symbol + " " + DoubleToString(sigPrice, _Digits) +
                 " | " + label +
                 " | SL: "  + PriceStr(sl)  +
                 " | TP1: " + PriceStr(tp1) +
