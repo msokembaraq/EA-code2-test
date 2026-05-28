@@ -1,0 +1,1187 @@
+//+------------------------------------------------------------------+
+//|                                              ParabolicRSI_v2.mq5  |
+//|         Parabolic RSI + Rolling Segment + RBS/SBR + Range        |
+//|                  + Sequence Confluence Engine v2.2               |
+//|                  + Swing Proximity Gate + Fib Context            |
+//+------------------------------------------------------------------+
+#property copyright   "LHWANZU 1903"
+#property version     "2.20"
+#property indicator_separate_window
+#property indicator_buffers 8
+#property indicator_plots   6
+
+#property indicator_label1  "RSI"
+#property indicator_type1   DRAW_LINE
+#property indicator_color1  clrWhite
+#property indicator_width1  1
+
+#property indicator_label2  "SAR"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrOrange
+#property indicator_width2  1
+
+#property indicator_label3  "SigUp"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  clrOrange
+
+#property indicator_label4  "SigDn"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  clrDodgerBlue
+
+#property indicator_label5  "StrongUp"
+#property indicator_type5   DRAW_ARROW
+#property indicator_color5  clrLime
+
+#property indicator_label6  "StrongDn"
+#property indicator_type6   DRAW_ARROW
+#property indicator_color6  clrRed
+
+//════════════════════════════════════════════════════════════════════
+//  INPUTS
+//════════════════════════════════════════════════════════════════════
+input int      RSI_Length      = 10;
+input int      Upper_Threshold = 70;
+input int      Lower_Threshold = 30;
+input bool     DisplaySAR      = true;
+input double   SAR_Start       = 0.02;
+input double   SAR_Inc         = 0.02;
+input double   SAR_Max         = 0.2;
+
+input group "=== Rolling Segment ==="
+input int    InpRSFastLen    = 5;
+input int    InpRSSlowLen    = 10;
+input double InpRSFastThresh = 1.0;
+input double InpRSRevThresh  = 2.0;
+input int    InpATRLen       = 200;
+
+input group "=== Swing Detection (RBS/SBR + Range) ==="
+input int    InpSwingLeft      = 10;
+input int    InpSwingRight     = 15;
+input int    InpRangeMinPoints = 500;
+
+input group "=== HTF Structure Gate (SR Zones) ==="
+input bool   InpHTFGateEnable  = true;
+input string InpSRZonesDirVar  = "SRZONES_DIR";
+input string InpSRZonesTimeVar = "SRZONES_TIME";
+input int    InpHTFGateMaxBars = 20;
+
+input group "=== Sequence Engine ==="
+input bool   InpSeqEnable   = true;
+input int    InpSeqLookback = 10;
+
+input group "=== Swing Proximity Gate ==="
+input bool   InpSwingProxEnable = true;   // Hold confluence if near unbroken swing
+input double InpSwingProxATR    = 1.0;    // Distance threshold (x ATR) to nearest swing
+input int    InpSwingProxExpiry = 20;     // Bars before pending signal is discarded
+
+input group "=== Alerts ==="
+input bool   InpPushAll = true;
+input bool   InpAlerts  = false;
+input bool   InpPush    = true;
+
+//════════════════════════════════════════════════════════════════════
+//  SEQUENCE SIGNAL TYPE CONSTANTS
+//════════════════════════════════════════════════════════════════════
+#define SEQ_RBSSBR  1
+#define SEQ_RS      2
+#define SEQ_RSI_REV 3
+#define SEQ_RSI_NOW 4
+
+//════════════════════════════════════════════════════════════════════
+//  BUFFERS
+//════════════════════════════════════════════════════════════════════
+double RSI_Buffer[];
+double SAR_Buffer[];
+double SigUp_Buffer[];
+double SigDn_Buffer[];
+double StrongUp_Buffer[];
+double StrongDn_Buffer[];
+double IsBelow_Buffer[];
+double SAR_Internal[];
+
+//════════════════════════════════════════════════════════════════════
+//  HANDLES
+//════════════════════════════════════════════════════════════════════
+int g_rsiHandle = INVALID_HANDLE;
+int g_atrHandle = INVALID_HANDLE;
+
+//════════════════════════════════════════════════════════════════════
+//  RS BUFFERS
+//════════════════════════════════════════════════════════════════════
+double g_rsTrendArr[];
+double g_rollSegArr[];
+
+//════════════════════════════════════════════════════════════════════
+//  DIRECTION + TIMESTAMP TRACKERS
+//════════════════════════════════════════════════════════════════════
+int      g_lastRSRevDir   = 0;
+datetime g_lastRSRevTime  = 0;
+
+int      g_lastRSIRevDir  = 0;
+datetime g_lastRSIRevTime = 0;
+
+int      g_lastRSINowDir  = 0;
+datetime g_lastRSINowTime = 0;
+int      g_lastRBSSBRDir  = 0;
+
+datetime g_lastAlertTime      = 0;
+datetime g_lastRSIRevFireTime = 0;
+
+//════════════════════════════════════════════════════════════════════
+//  RANGE STATE
+//════════════════════════════════════════════════════════════════════
+bool   g_isRanging = false;
+double g_rangePH   = 0.0;
+double g_rangePL   = 0.0;
+
+//════════════════════════════════════════════════════════════════════
+//  MARKET STRUCTURE
+//════════════════════════════════════════════════════════════════════
+int g_msDir = 0;
+
+//════════════════════════════════════════════════════════════════════
+//  SEQUENCE STATE MACHINE
+//════════════════════════════════════════════════════════════════════
+int      g_pathA_dir     = 0;
+datetime g_pathA_armTime = 0;
+bool     g_pathA_armed   = false;
+
+int      g_pathB_dir     = 0;
+datetime g_pathB_armTime = 0;
+bool     g_pathB_armed   = false;
+
+datetime g_confluenceTime    = 0;
+int      g_confluenceDir     = 0;
+int      g_pathBLastFiredDir = 0;
+
+//════════════════════════════════════════════════════════════════════
+//  FIB CONTEXT — auto-anchored from nearest unbroken swings
+//  Static anchor: updates only when new HH or LL confirmed by close
+//  All SD levels derive from single range = fibHigh - fibLow
+//════════════════════════════════════════════════════════════════════
+bool   g_fibValid = false;
+double g_fibLow   = 0.0;   // 0.000 anchor — nearest swing low below price
+double g_fibHigh  = 0.0;   // 1.000 anchor — nearest swing high above price
+double g_fibSD1H  = 0.0;   // +0.5 range above high  (SD+1)
+double g_fibSD2H  = 0.0;   // +1.0 range above high  (SD+2)
+double g_fibSD1L  = 0.0;   // -0.5 range below low   (SD-1)
+double g_fibSD2L  = 0.0;   // -1.0 range below low   (SD-2)
+
+void CalcFibLevels()
+  {
+   if(g_fibHigh <= g_fibLow) { g_fibValid = false; return; }
+   double r   = g_fibHigh - g_fibLow;
+   g_fibSD1H  = g_fibHigh + 0.5 * r;
+   g_fibSD2H  = g_fibHigh + 1.0 * r;
+   g_fibSD1L  = g_fibLow  - 0.5 * r;
+   g_fibSD2L  = g_fibLow  - 1.0 * r;
+   g_fibValid = true;
+  }
+
+// Auto-anchor: find nearest unbroken swing H above and swing L below current price
+// Called on startup and on every confirmed bar (re-anchors on new HH or LL)
+void RecalcFibLevels(double curPrice)
+  {
+   double nearH = 0, nearL = 0;
+   double nearHDist = DBL_MAX, nearLDist = DBL_MAX;
+
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      if(g_lv[k].isHigh && g_lv[k].price > curPrice)
+        {
+         double d = g_lv[k].price - curPrice;
+         if(d < nearHDist) { nearHDist = d; nearH = g_lv[k].price; }
+        }
+      if(!g_lv[k].isHigh && g_lv[k].price < curPrice)
+        {
+         double d = curPrice - g_lv[k].price;
+         if(d < nearLDist) { nearLDist = d; nearL = g_lv[k].price; }
+        }
+     }
+
+   if(nearH <= 0 || nearL <= 0 || nearH <= nearL) return;
+
+   // Only re-anchor if HH or LL changed (no pointless recalc on every bar)
+   bool changed = (!g_fibValid ||
+                   nearH > g_fibHigh + _Point ||  // new higher high
+                   nearL < g_fibLow  - _Point);   // new lower low
+   if(!changed) return;
+
+   bool wasValid = g_fibValid;
+   g_fibHigh = nearH;
+   g_fibLow  = nearL;
+   CalcFibLevels();
+   Print("[FIB] ", wasValid ? "Re-anchored" : "Anchored",
+         " | Low=", DoubleToString(g_fibLow, _Digits),
+         " High=", DoubleToString(g_fibHigh, _Digits),
+         " | SD+1=", DoubleToString(g_fibSD1H, _Digits),
+         " SD-1=", DoubleToString(g_fibSD1L, _Digits),
+         " | Range=$", DoubleToString(g_fibHigh - g_fibLow, 2));
+  }
+
+// Returns fib zone label and sets bias: 1=buy zone -1=sell zone 0=neutral
+string GetFibZone(double price, int &bias)
+  {
+   bias = 0;
+   if(!g_fibValid) return "";
+   double r = g_fibHigh - g_fibLow;
+   if(r <= 0) return "";
+   double p = (price - g_fibLow) / r;   // normalized position 0=low 1=high
+
+   if(p <= -0.75) { bias =  1; return "SD-2 EXTREME DISCOUNT"; }
+   if(p <= -0.25) { bias =  1; return "SD-1 DISCOUNT EXT"; }
+   if(p <=  0.10) { bias =  1; return "FIB 0 ANCHOR LOW"; }
+   if(p <=  0.30) { bias =  1; return "FIB 0.25 DISCOUNT"; }
+   if(p <=  0.45) { bias =  1; return "FIB 0.382 DISCOUNT"; }
+   if(p <=  0.55) { bias =  0; return "FIB 0.5 EQ"; }
+   if(p <=  0.65) { bias = -1; return "FIB 0.618 PREMIUM"; }
+   if(p <=  0.85) { bias = -1; return "FIB 0.75 PREMIUM"; }
+   if(p <=  1.10) { bias = -1; return "FIB 1.0 ANCHOR HIGH"; }
+   if(p <=  1.35) { bias = -1; return "SD+1 PREMIUM EXT"; }
+   if(p <=  1.75) { bias = -1; return "SD+2 EXTREME PREMIUM"; }
+   if(p >   1.75) { bias = -1; return "SD+2+ ULTRA PREMIUM"; }
+   bias = 0; return "OUTSIDE FIB";
+  }
+
+// Appends fib zone context to any signal message
+// signalDir: 1=buy signal -1=sell signal 0=neutral/info
+string FibTag(double price, int signalDir)
+  {
+   if(!g_fibValid) return "";
+   int    bias = 0;
+   string zone = GetFibZone(price, bias);
+   if(zone == "") return "";
+
+   string tag = " | 📐 " + zone;
+
+   if(signalDir != 0)
+     {
+      if(bias == signalDir)             tag += " ✅";   // signal matches fib zone
+      else if(bias == -signalDir)       tag += " ⚠️";   // signal opposes fib zone
+      // bias==0 (equilibrium) — no extra marker, neutral
+     }
+   return tag;
+  }
+
+//════════════════════════════════════════════════════════════════════
+//  SWING PROXIMITY — PENDING SIGNAL SLOTS
+//  PATH A and PATH B are independent — each has its own pending slot
+//════════════════════════════════════════════════════════════════════
+struct PendingSignal
+  {
+   bool     active;
+   int      dir;          // 1=buy  -1=sell
+   string   msg;          // stored alert text — fires as-is + [SWING BREAK] appended
+   datetime armTime;      // bar time when signal was held
+   double   blockLevel;   // unbroken swing price blocking signal
+   int      barCount;     // confirmed bars elapsed since armed
+  };
+
+PendingSignal g_pendingA;   // PATH A — independent
+PendingSignal g_pendingB;   // PATH B — independent
+
+void ClearPending(PendingSignal &p)
+  { p.active=false; p.dir=0; p.msg=""; p.armTime=0; p.blockLevel=0; p.barCount=0; }
+
+void InitPendingSignals()
+  { ClearPending(g_pendingA); ClearPending(g_pendingB); }
+
+//════════════════════════════════════════════════════════════════════
+//  RBS/SBR LEVEL STRUCT
+//════════════════════════════════════════════════════════════════════
+struct SLevel
+  {
+   double   price, top, bot;
+   datetime t1;
+   bool     isHigh;
+   bool     broken;
+   bool     flipAlerted;
+  };
+
+SLevel g_lv[];
+int    g_nLv         = 0;
+int    g_lastFlipBar = -1;
+
+//+------------------------------------------------------------------+
+//  SWING PROXIMITY HELPER
+//  Returns nearest unbroken blocking swing price within InpSwingProxATR*atr
+//  BUY blocked by swing HIGH above price
+//  SELL blocked by swing LOW below price
+//+------------------------------------------------------------------+
+double FindBlockingSwing(int dir, double refPrice, double atr)
+  {
+   if(!InpSwingProxEnable || atr <= 0) return 0;
+   double threshold = InpSwingProxATR * atr;
+   double nearest   = 0;
+   double nearDist  = DBL_MAX;
+
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      if(dir ==  1 && !g_lv[k].isHigh) continue;  // BUY: only swing HIGHs block
+      if(dir == -1 &&  g_lv[k].isHigh) continue;  // SELL: only swing LOWs block
+
+      double dist = (dir == 1) ? (g_lv[k].price - refPrice)
+                                : (refPrice - g_lv[k].price);
+      if(dist <= 0) continue;  // swing already behind price
+      if(dist <= threshold && dist < nearDist)
+        { nearDist = dist; nearest = g_lv[k].price; }
+     }
+   return nearest;
+  }
+
+//+------------------------------------------------------------------+
+//  PENDING SIGNAL CHECK — called on every confirmed closed bar
+//  Checks break, expiry, and opposite-signal cancellation
+//+------------------------------------------------------------------+
+void CheckPendingSignals(const double &close[], const double &high[],
+                         const double &low[], int confirmBar,
+                         datetime barTime)
+  {
+   // ── Cancel pending if opposite confluence fired this bar ────────
+   // (handled inline in FireConfluenceA/B before this is called)
+
+   // ── PATH A ──────────────────────────────────────────────────────
+   if(g_pendingA.active)
+     {
+      g_pendingA.barCount++;
+
+      // Expiry check
+      if(g_pendingA.barCount > InpSwingProxExpiry)
+        {
+         Print("[SWING EXPIRED] PATH A ", (g_pendingA.dir==1?"BUY":"SELL"),
+               " discarded after ", InpSwingProxExpiry, " bars | ", _Symbol);
+         ClearPending(g_pendingA);
+        }
+      else
+        {
+         // Break check — candle CLOSE only, not wick
+         bool broken = (g_pendingA.dir == 1)
+                       ? (close[confirmBar] > g_pendingA.blockLevel)
+                       : (close[confirmBar] < g_pendingA.blockLevel);
+         if(broken)
+           {
+            FireAlert(g_pendingA.msg + " [SWING BREAK +" +
+                      DoubleToString(g_pendingA.barCount,0) + "bars]", true);
+            g_confluenceTime = barTime;
+            g_confluenceDir  = g_pendingA.dir;
+            ClearPending(g_pendingA);
+           }
+        }
+     }
+
+   // ── PATH B ──────────────────────────────────────────────────────
+   if(g_pendingB.active)
+     {
+      g_pendingB.barCount++;
+
+      if(g_pendingB.barCount > InpSwingProxExpiry)
+        {
+         Print("[SWING EXPIRED] PATH B ", (g_pendingB.dir==1?"BUY":"SELL"),
+               " discarded after ", InpSwingProxExpiry, " bars | ", _Symbol);
+         ClearPending(g_pendingB);
+        }
+      else
+        {
+         bool broken = (g_pendingB.dir == 1)
+                       ? (close[confirmBar] > g_pendingB.blockLevel)
+                       : (close[confirmBar] < g_pendingB.blockLevel);
+         if(broken)
+           {
+            FireAlert(g_pendingB.msg + " [SWING BREAK +" +
+                      DoubleToString(g_pendingB.barCount,0) + "bars]", true);
+            g_confluenceTime = barTime;
+            g_confluenceDir  = g_pendingB.dir;
+            ClearPending(g_pendingB);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//  ALERT
+//+------------------------------------------------------------------+
+void FireAlert(string msg, bool alwaysFire = false)
+  {
+   if(!InpPushAll && !alwaysFire) return;
+   Print("SIGNAL: ", msg);
+   if(InpAlerts) Alert(msg);
+   if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
+  }
+
+//+------------------------------------------------------------------+
+//  CONFLUENCE FIRE — PATH A + PATH B with swing proximity gate
+//  SBR/RBS calls pass atr=0 to bypass swing gate (exempt by design)
+//+------------------------------------------------------------------+
+void FireConfluenceA(int dir, datetime sigTime, double refPrice, double atr)
+  {
+   if(g_confluenceTime == sigTime && g_confluenceDir == dir) return;
+   string circle = (dir == 1) ? "🟢" : "🔴";
+   string side   = (dir == 1) ? "BUY" : "SELL";
+   string msg    = "🔥🔥" + circle + " CONFLUENCE " + side +
+                   " [PATH A] ✅ STRUCTURE | " + _Symbol + " " +
+                   EnumToString((ENUM_TIMEFRAMES)_Period) +
+                   FibTag(refPrice, dir);
+
+   // Opposite signal cancels pending PATH A
+   if(g_pendingA.active && g_pendingA.dir != dir)
+     {
+      Print("[SWING CANCEL] PATH A ", (g_pendingA.dir==1?"BUY":"SELL"),
+            " cancelled by opposite ", side, " | ", _Symbol);
+      ClearPending(g_pendingA);
+     }
+
+   double blockLevel = FindBlockingSwing(dir, refPrice, atr);
+   if(blockLevel > 0)
+     {
+      if(!g_pendingA.active || g_pendingA.dir != dir)
+        {
+         g_pendingA.active     = true;
+         g_pendingA.dir        = dir;
+         g_pendingA.msg        = msg;
+         g_pendingA.armTime    = sigTime;
+         g_pendingA.blockLevel = blockLevel;
+         g_pendingA.barCount   = 0;
+         Print("[SWING HOLD] PATH A ", side, " pending — swing at ",
+               DoubleToString(blockLevel, _Digits),
+               " | price:", DoubleToString(refPrice, _Digits), " | ", _Symbol);
+        }
+      return;
+     }
+
+   FireAlert(msg, true);
+   g_confluenceTime    = sigTime;
+   g_confluenceDir     = dir;
+   g_pathBLastFiredDir = dir;
+  }
+
+void FireConfluenceB(int dir, datetime sigTime, double refPrice, double atr)
+  {
+   if(g_confluenceTime == sigTime && g_confluenceDir == dir) return;
+   bool withStructure = (g_msDir != 0 && g_msDir == dir);
+   string fire   = withStructure ? "🔥🔥" : "🔥";
+   string circle = (dir == 1) ? "🟢" : "🔴";
+   string side   = (dir == 1) ? "BUY" : "SELL";
+   string msTag  = withStructure ? " ✅ MOMENTUM" : " ⚠️ COUNTER";
+   string msg    = fire + circle + " CONFLUENCE " + side +
+                   " [PATH B]" + msTag + " | " + _Symbol + " " +
+                   EnumToString((ENUM_TIMEFRAMES)_Period) +
+                   FibTag(refPrice, dir);
+
+   // Opposite signal cancels pending PATH B
+   if(g_pendingB.active && g_pendingB.dir != dir)
+     {
+      Print("[SWING CANCEL] PATH B ", (g_pendingB.dir==1?"BUY":"SELL"),
+            " cancelled by opposite ", side, " | ", _Symbol);
+      ClearPending(g_pendingB);
+     }
+
+   double blockLevel = FindBlockingSwing(dir, refPrice, atr);
+   if(blockLevel > 0)
+     {
+      if(!g_pendingB.active || g_pendingB.dir != dir)
+        {
+         g_pendingB.active     = true;
+         g_pendingB.dir        = dir;
+         g_pendingB.msg        = msg;
+         g_pendingB.armTime    = sigTime;
+         g_pendingB.blockLevel = blockLevel;
+         g_pendingB.barCount   = 0;
+         Print("[SWING HOLD] PATH B ", side, " pending — swing at ",
+               DoubleToString(blockLevel, _Digits),
+               " | price:", DoubleToString(refPrice, _Digits), " | ", _Symbol);
+        }
+      return;
+     }
+
+   FireAlert(msg, true);
+   g_confluenceTime = sigTime;
+   g_confluenceDir  = dir;
+  }
+
+//+------------------------------------------------------------------+
+//  SEQUENCE ENGINE
+//+------------------------------------------------------------------+
+void CheckSequence(int sigType, int dir, datetime sigTime,
+                   double refPrice, double atr)
+  {
+   if(!InpSeqEnable) return;
+
+   long lookbackSecs = (long)InpSeqLookback * (long)PeriodSeconds();
+
+   if(sigType == SEQ_RBSSBR)
+     {
+      if(g_pathA_armed && g_pathA_dir != dir)
+        {
+         FireAlert("🚫 SEQ CANCELLED | " + _Symbol + " " +
+                   EnumToString((ENUM_TIMEFRAMES)_Period) +
+                   " | Was:" + (g_pathA_dir == 1 ? "BUY" : "SELL") +
+                   " → Now:" + (dir == 1 ? "BUY" : "SELL"));
+        }
+      g_pathA_dir     = dir;
+      g_pathA_armTime = sigTime;
+      g_pathA_armed   = true;
+      if(g_pathB_armed && g_pathB_dir != dir)
+        { g_pathB_armed = false; g_pathB_dir = 0; g_pathB_armTime = 0; }
+
+      if(g_lastRSRevDir == dir && g_lastRSRevTime > 0)
+        {
+         long diff = (long)(sigTime - g_lastRSRevTime);
+         if(diff >= 0 && diff <= lookbackSecs)
+           // SBR/RBS exempt: atr=0 bypasses swing gate
+           { FireConfluenceA(dir, sigTime, refPrice, 0); g_pathA_armed = false; return; }
+        }
+      if(g_lastRSIRevDir == dir && g_lastRSIRevTime > 0)
+        {
+         long diff = (long)(sigTime - g_lastRSIRevTime);
+         if(diff >= 0 && diff <= lookbackSecs)
+           { FireConfluenceA(dir, sigTime, refPrice, 0); g_pathA_armed = false; return; }
+        }
+      if(g_lastRSINowDir == dir && g_lastRSINowTime > 0)
+        {
+         long diff = (long)(sigTime - g_lastRSINowTime);
+         if(diff >= 0 && diff <= lookbackSecs)
+           { FireConfluenceA(dir, sigTime, refPrice, 0); g_pathA_armed = false; return; }
+        }
+      return;
+     }
+
+   if(sigType == SEQ_RS)
+     {
+      if(g_pathA_armed && g_pathA_dir != dir)
+        { g_pathA_armed = false; g_pathA_dir = 0; g_pathA_armTime = 0; }
+      if(g_pathA_armed && g_pathA_dir == dir && sigTime >= g_pathA_armTime)
+        { FireConfluenceA(dir, sigTime, refPrice, atr); g_pathA_armed = false; return; }
+      if(g_pathB_armed && g_pathB_dir == dir && sigTime >= g_pathB_armTime)
+        { FireConfluenceB(dir, sigTime, refPrice, atr); g_pathB_armed = false; return; }
+      return;
+     }
+
+   if(sigType == SEQ_RSI_REV || sigType == SEQ_RSI_NOW)
+     {
+      if(g_pathA_armed && g_pathA_dir != dir)
+        { g_pathA_armed = false; g_pathA_dir = 0; g_pathA_armTime = 0; }
+      if(g_pathB_armed && g_pathB_dir != dir)
+        { g_pathB_armed = false; g_pathBLastFiredDir = 0; }
+
+      if(g_pathBLastFiredDir == dir) return;
+
+      if(g_pathA_armed && g_pathA_dir == dir && sigTime >= g_pathA_armTime)
+        { FireConfluenceA(dir, sigTime, refPrice, atr); g_pathA_armed = false; }
+
+      g_pathB_dir     = dir;
+      g_pathB_armTime = sigTime;
+      g_pathB_armed   = true;
+
+      if(g_lastRSRevDir == dir && g_lastRSRevTime > 0)
+        {
+         long diff = (long)(sigTime - g_lastRSRevTime);
+         if(diff >= 0 && diff <= lookbackSecs)
+           { FireConfluenceB(dir, sigTime, refPrice, atr); g_pathB_armed = false; }
+        }
+      return;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//  SAR CALCULATION
+//+------------------------------------------------------------------+
+void CalculateSAR(
+   int i,
+   double src,
+   double prev_src,
+   double prev_src2,
+   double &result,
+   bool &isBelow,
+   double &maxMin,
+   double &acceleration)
+  {
+   double src_high      = src + 1.0;
+   double src_low       = src - 1.0;
+   bool   isFirstTrendBar = false;
+
+   if(i <= RSI_Length + 2)
+     {
+      if(src > prev_src)
+        { isBelow = true;  maxMin = src_high; result = prev_src - 1.0; }
+      else
+        { isBelow = false; maxMin = src_low;  result = prev_src + 1.0; }
+      isFirstTrendBar = true;
+      acceleration    = SAR_Start;
+     }
+
+   result = result + acceleration * (maxMin - result);
+
+   if(isBelow)
+     {
+      if(result > src_low)
+        { isFirstTrendBar = true; isBelow = false;
+          result = MathMax(src_high, maxMin); maxMin = src_low; acceleration = SAR_Start; }
+     }
+   else
+     {
+      if(result < src_high)
+        { isFirstTrendBar = true; isBelow = true;
+          result = MathMin(src_low, maxMin); maxMin = src_high; acceleration = SAR_Start; }
+     }
+
+   if(!isFirstTrendBar)
+     {
+      if(isBelow)
+        { if(src_high > maxMin) { maxMin = src_high; acceleration = MathMin(acceleration + SAR_Inc, SAR_Max); } }
+      else
+        { if(src_low  < maxMin) { maxMin = src_low;  acceleration = MathMin(acceleration + SAR_Inc, SAR_Max); } }
+     }
+
+   if(isBelow)
+     {
+      result = MathMin(result, prev_src  - 1.0);
+      if(i > 1) result = MathMin(result, prev_src2 - 1.0);
+     }
+   else
+     {
+      result = MathMax(result, prev_src  + 1.0);
+      if(i > 1) result = MathMax(result, prev_src2 + 1.0);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//  ROLLING SEGMENT
+//+------------------------------------------------------------------+
+void CalcRS(const int rates_total, const int prev_calculated,
+            const double &close[], const double &atrRaw[],
+            const datetime &time[])
+  {
+   ArrayResize(g_rsTrendArr, rates_total);
+   ArrayResize(g_rollSegArr, rates_total);
+   ArrayInitialize(g_rsTrendArr, 0.0);
+   ArrayInitialize(g_rollSegArr, 0.0);
+
+   if(rates_total < InpATRLen + 2) return;
+
+   double rollSeg    = close[InpATRLen];
+   double rsTrend    = 1.0;
+   double actSlope   = 0.0;
+   bool   isFastMode = false;
+
+   g_rsTrendArr[InpATRLen] = rsTrend;
+   g_rollSegArr[InpATRLen] = rollSeg;
+
+   for(int i = InpATRLen + 1; i < rates_total; i++)
+     {
+      double atr = atrRaw[rates_total - 1 - i];
+      if(atr <= 0.0 || atr >= EMPTY_VALUE || !MathIsValidNumber(atr))
+        {
+         g_rsTrendArr[i] = rsTrend;
+         g_rollSegArr[i] = close[i];
+         continue;
+        }
+
+      double dist    = close[i] - rollSeg;
+      bool   bullRev = (rsTrend < 0) && ( dist >  InpRSRevThresh * atr);
+      bool   bearRev = (rsTrend > 0) && (-dist >  InpRSRevThresh * atr);
+
+      if(bullRev)      rsTrend =  1.0;
+      else if(bearRev) rsTrend = -1.0;
+
+      bool newFast = (MathAbs(dist) > InpRSFastThresh * atr);
+      if(bullRev || bearRev || (newFast != isFastMode) || actSlope == 0.0)
+        { isFastMode = newFast;
+          actSlope   = isFastMode ? atr / InpRSFastLen : atr / InpRSSlowLen; }
+
+      rollSeg += rsTrend * actSlope;
+
+      g_rsTrendArr[i] = rsTrend;
+      g_rollSegArr[i] = rollSeg;
+
+      if(i == rates_total - 2 && !g_isRanging && prev_calculated > 0)
+        {
+         double curAtr = atrRaw[rates_total - 1 - i];
+         if(bullRev && g_lastRSRevDir != 1)
+           {
+            g_lastRSRevDir  = 1;
+            g_lastRSRevTime = time[i];
+            FireAlert("📈 RS BUY EMA CROSS| " + _Symbol + " " +
+                      EnumToString((ENUM_TIMEFRAMES)_Period) +
+                      " | Price:" + DoubleToString(close[i], _Digits) +
+                      FibTag(close[i], 1));
+            CheckSequence(SEQ_RS, 1, time[i], close[i], curAtr);
+           }
+         else if(bearRev && g_lastRSRevDir != -1)
+           {
+            g_lastRSRevDir  = -1;
+            g_lastRSRevTime = time[i];
+            FireAlert("📉 RS SELL EMA CROSS | " + _Symbol + " " +
+                      EnumToString((ENUM_TIMEFRAMES)_Period) +
+                      " | Price:" + DoubleToString(close[i], _Digits) +
+                      FibTag(close[i], -1));
+            CheckSequence(SEQ_RS, -1, time[i], close[i], curAtr);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//  PIVOT HELPERS
+//+------------------------------------------------------------------+
+bool IsPivotHigh(const double &h[], int pos, int L, int R, int total)
+  {
+   if(pos - L < 0 || pos + R >= total) return false;
+   double v = h[pos];
+   for(int k = 1; k <= L; k++) if(h[pos-k] >= v) return false;
+   for(int k = 1; k <= R; k++) if(h[pos+k] >= v) return false;
+   return true;
+  }
+
+bool IsPivotLow(const double &l[], int pos, int L, int R, int total)
+  {
+   if(pos - L < 0 || pos + R >= total) return false;
+   double v = l[pos];
+   for(int k = 1; k <= L; k++) if(l[pos-k] <= v) return false;
+   for(int k = 1; k <= R; k++) if(l[pos+k] <= v) return false;
+   return true;
+  }
+
+void AddLevel(double price, double top, double bot, datetime t1, bool isHigh)
+  {
+   if(g_nLv >= 2000)
+     { for(int i = 0; i < g_nLv - 1; i++) g_lv[i] = g_lv[i+1]; g_nLv--; }
+   ArrayResize(g_lv, g_nLv + 1);
+   g_lv[g_nLv].price       = price;
+   g_lv[g_nLv].top         = top;
+   g_lv[g_nLv].bot         = bot;
+   g_lv[g_nLv].t1          = t1;
+   g_lv[g_nLv].isHigh      = isHigh;
+   g_lv[g_nLv].broken      = false;
+   g_lv[g_nLv].flipAlerted = false;
+   g_nLv++;
+  }
+
+//+------------------------------------------------------------------+
+//  MARKET STRUCTURE
+//+------------------------------------------------------------------+
+void UpdateMarketStructure()
+  {
+   double   sh1 = 0,  sh2 = 0;
+   datetime sht1 = 0, sht2 = 0;
+   double   sl1 = 0,  sl2 = 0;
+   datetime slt1 = 0, slt2 = 0;
+
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      if(g_lv[k].isHigh)
+        {
+         if(g_lv[k].t1 > sht1)
+           { sht2 = sht1; sh2 = sh1; sht1 = g_lv[k].t1; sh1 = g_lv[k].price; }
+         else if(g_lv[k].t1 > sht2)
+           { sht2 = g_lv[k].t1; sh2 = g_lv[k].price; }
+        }
+      else
+        {
+         if(g_lv[k].t1 > slt1)
+           { slt2 = slt1; sl2 = sl1; slt1 = g_lv[k].t1; sl1 = g_lv[k].price; }
+         else if(g_lv[k].t1 > slt2)
+           { slt2 = g_lv[k].t1; sl2 = g_lv[k].price; }
+        }
+     }
+
+   bool lowerHigh  = (sh1 > 0 && sh2 > 0 && sh1 < sh2);
+   bool lowerLow   = (sl1 > 0 && sl2 > 0 && sl1 < sl2);
+   bool higherHigh = (sh1 > 0 && sh2 > 0 && sh1 > sh2);
+   bool higherLow  = (sl1 > 0 && sl2 > 0 && sl1 > sl2);
+
+   if(lowerHigh  && lowerLow)       g_msDir = -1;
+   else if(higherHigh && higherLow) g_msDir =  1;
+  }
+
+//+------------------------------------------------------------------+
+//  GET NEXT N PIVOT TARGETS
+//+------------------------------------------------------------------+
+void GetNextPivots(bool isBuy, double refPrice, double &tp[], int n)
+  {
+   ArrayResize(tp, n);
+   ArrayInitialize(tp, 0.0);
+   double found[];
+   int    fCount = 0;
+
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      if( isBuy && !g_lv[k].isHigh) continue;
+      if(!isBuy &&  g_lv[k].isHigh) continue;
+      if( isBuy && g_lv[k].price <= refPrice) continue;
+      if(!isBuy && g_lv[k].price >= refPrice) continue;
+      ArrayResize(found, fCount + 1);
+      found[fCount++] = g_lv[k].price;
+     }
+
+   for(int a = 0; a < fCount - 1; a++)
+      for(int b = a + 1; b < fCount; b++)
+        {
+         bool sw = isBuy ? (found[b] < found[a]) : (found[b] > found[a]);
+         if(sw) { double tmp = found[a]; found[a] = found[b]; found[b] = tmp; }
+        }
+
+   for(int i = 0; i < n && i < fCount; i++)
+      tp[i] = found[i];
+  }
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   SetIndexBuffer(0, RSI_Buffer,      INDICATOR_DATA);
+   SetIndexBuffer(1, SAR_Buffer,      INDICATOR_DATA);
+   SetIndexBuffer(2, SigUp_Buffer,    INDICATOR_DATA);
+   SetIndexBuffer(3, SigDn_Buffer,    INDICATOR_DATA);
+   SetIndexBuffer(4, StrongUp_Buffer, INDICATOR_DATA);
+   SetIndexBuffer(5, StrongDn_Buffer, INDICATOR_DATA);
+   SetIndexBuffer(6, IsBelow_Buffer,  INDICATOR_CALCULATIONS);
+   SetIndexBuffer(7, SAR_Internal,    INDICATOR_CALCULATIONS);
+
+   PlotIndexSetInteger(1, PLOT_ARROW, 159);
+   PlotIndexSetInteger(2, PLOT_ARROW, 117);
+   PlotIndexSetInteger(3, PLOT_ARROW, 117);
+   PlotIndexSetInteger(4, PLOT_ARROW, 110);
+   PlotIndexSetInteger(5, PLOT_ARROW, 110);
+
+   g_atrHandle = iATR(NULL, 0, InpATRLen);
+   if(g_atrHandle == INVALID_HANDLE) return INIT_FAILED;
+
+   InitPendingSignals();
+   IndicatorSetString(INDICATOR_SHORTNAME, "LHWANZU 1903 v2.1");
+   return INIT_SUCCEEDED;
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+   if(g_rsiHandle != INVALID_HANDLE) IndicatorRelease(g_rsiHandle);
+  }
+
+//+------------------------------------------------------------------+
+int OnCalculate(
+   const int rates_total,
+   const int prev_calculated,
+   const datetime &time[],
+   const double   &open[],
+   const double   &high[],
+   const double   &low[],
+   const double   &close[],
+   const long     &tick_volume[],
+   const long     &volume[],
+   const int      &spread[])
+  {
+   if(rates_total < RSI_Length + 10) return 0;
+
+   if(g_rsiHandle == INVALID_HANDLE)
+     { g_rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Length, PRICE_CLOSE);
+       if(g_rsiHandle == INVALID_HANDLE) return 0; }
+
+   double rsiTemp[];
+   ArraySetAsSeries(rsiTemp, true);
+   if(CopyBuffer(g_rsiHandle, 0, 0, rates_total, rsiTemp) <= 0) return 0;
+
+   double atrRaw[];
+   ArraySetAsSeries(atrRaw, true);
+   bool atrReady = (CopyBuffer(g_atrHandle, 0, 0, rates_total, atrRaw) == rates_total);
+
+   if(prev_calculated == 0)
+     {
+      ArrayResize(g_lv, 0); g_nLv = 0;
+      g_lastFlipBar        = -1;
+      g_isRanging          = false; g_rangePH = 0.0; g_rangePL = 0.0;
+      g_lastRSIRevDir      = 0;     g_lastRSIRevTime  = 0;
+      g_lastRSINowDir      = 0;     g_lastRSINowTime  = 0;
+      g_lastRBSSBRDir      = 0;
+      g_lastRSRevDir       = 0;     g_lastRSRevTime   = 0;
+      g_lastAlertTime      = 0;
+      g_lastRSIRevFireTime = 0;
+      g_msDir              = 0;
+      g_pathA_dir          = 0; g_pathA_armTime = 0; g_pathA_armed = false;
+      g_pathB_dir          = 0; g_pathB_armTime = 0; g_pathB_armed = false;
+      g_confluenceTime     = 0; g_confluenceDir = 0;
+      g_pathBLastFiredDir  = 0;
+      InitPendingSignals();
+      g_fibValid = false; g_fibLow = 0; g_fibHigh = 0;
+      g_fibSD1H = 0; g_fibSD2H = 0; g_fibSD1L = 0; g_fibSD2L = 0;
+     }
+
+   if(atrReady)
+      CalcRS(rates_total, prev_calculated, close, atrRaw, time);
+
+   static double maxMin       = 0;
+   static double acceleration = SAR_Start;
+   static bool   isBelow      = false;
+
+   if(prev_calculated == 0)
+     { maxMin = 0; acceleration = SAR_Start; isBelow = false; }
+
+   int start = (prev_calculated == 0) ? RSI_Length : MathMax(prev_calculated - 1, RSI_Length);
+
+   //── ENGINE 1: RSI PSAR ─────────────────────────────────────────
+   for(int i = start; i < rates_total; i++)
+     {
+      RSI_Buffer[i]  = rsiTemp[rates_total - 1 - i];
+      double prev_rsi     = RSI_Buffer[i-1];
+      double prev_rsi2    = (i >= 2) ? RSI_Buffer[i-2] : RSI_Buffer[i-1];
+      double sar_result   = (i > 0) ? SAR_Internal[i-1] : RSI_Buffer[i];
+      bool   prev_isBelow = isBelow;
+
+      CalculateSAR(i, RSI_Buffer[i], prev_rsi, prev_rsi2,
+                   sar_result, isBelow, maxMin, acceleration);
+
+      SAR_Internal[i]   = sar_result;
+      IsBelow_Buffer[i] = isBelow ? 1 : 0;
+
+      if(DisplaySAR)
+         SAR_Buffer[i] = (i > 0 && IsBelow_Buffer[i] != IsBelow_Buffer[i-1])
+                         ? EMPTY_VALUE : sar_result;
+      else
+         SAR_Buffer[i] = EMPTY_VALUE;
+
+      bool sig_up   = (isBelow != prev_isBelow) && isBelow;
+      bool sig_dn   = (isBelow != prev_isBelow) && !isBelow;
+      bool s_sig_up = sig_up && (sar_result <= Lower_Threshold);
+      bool s_sig_dn = sig_dn && (sar_result >= Upper_Threshold);
+
+      double rsTrend    = (atrReady && i < rates_total) ? g_rsTrendArr[i] : 0.0;
+      bool   rsGateBull = (rsTrend > 0.0);
+      bool   rsGateBear = (rsTrend < 0.0);
+
+      bool gated_sig_up = sig_up && (sar_result >= Lower_Threshold) && (g_lastRBSSBRDir != -1);
+      bool gated_sig_dn = sig_dn && (sar_result <= Upper_Threshold) && (g_lastRBSSBRDir !=  1);
+
+      SigUp_Buffer[i]    = gated_sig_up ? sar_result : EMPTY_VALUE;
+      SigDn_Buffer[i]    = gated_sig_dn ? sar_result : EMPTY_VALUE;
+      StrongUp_Buffer[i] = s_sig_up     ? sar_result : EMPTY_VALUE;
+      StrongDn_Buffer[i] = s_sig_dn     ? sar_result : EMPTY_VALUE;
+
+      //── Range detection on confirmed closed bar ──────────────────
+      if(i == rates_total - 2)
+        {
+         double   recentPH = 0.0, recentPL = DBL_MAX;
+         datetime recentPHTime = 0, recentPLTime = 0;
+
+         for(int k = 0; k < g_nLv; k++)
+           {
+            if(g_lv[k].broken) continue;
+            if( g_lv[k].isHigh && g_lv[k].t1 > recentPHTime)
+              { recentPH = g_lv[k].price; recentPHTime = g_lv[k].t1; }
+            if(!g_lv[k].isHigh && g_lv[k].t1 > recentPLTime)
+              { recentPL = g_lv[k].price; recentPLTime = g_lv[k].t1; }
+           }
+
+         bool hasBothPivots = (recentPHTime > 0 && recentPLTime > 0);
+         bool wasRanging    = g_isRanging;
+
+         if(hasBothPivots)
+           {
+            g_rangePH          = recentPH;
+            g_rangePL          = recentPL;
+            double c           = close[i];
+            double rangeWidth  = (g_rangePH - g_rangePL) / _Point;
+            bool   inBox       = (c < g_rangePH && c > g_rangePL);
+            bool   tightEnough = (rangeWidth < InpRangeMinPoints);
+            g_isRanging        = inBox && tightEnough;
+
+            if(g_isRanging && !wasRanging)
+               FireAlert("⏸ RANGING — SIGNALS PAUSED | " + _Symbol + " " +
+                         EnumToString((ENUM_TIMEFRAMES)_Period) +
+                         " | Box:" + DoubleToString(g_rangePL, _Digits) +
+                         "-"       + DoubleToString(g_rangePH, _Digits) +
+                         " | Width:$" + DoubleToString(g_rangePH - g_rangePL, 2) +
+                         " | Min:$"   + DoubleToString(InpRangeMinPoints * _Point, 2), true);
+
+            if(!g_isRanging && wasRanging)
+               FireAlert("▶ RANGE BROKEN — SIGNALS LIVE | " + _Symbol + " " +
+                         EnumToString((ENUM_TIMEFRAMES)_Period) +
+                         " | Breakout:" + DoubleToString(c, _Digits), true);
+           }
+         else
+            g_isRanging = false;
+
+         // ── Check pending signals on every confirmed bar ──────────
+         // Note: runs even when ranging (hold through range by design)
+         if(prev_calculated > 0)
+            CheckPendingSignals(close, high, low, i, time[i]);
+        }
+
+      //── RSI alerts on confirmed closed bar ───────────────────────
+      if(i == rates_total - 2 && !g_isRanging && prev_calculated > 0)
+        {
+         double curAtr = atrReady ? atrRaw[rates_total - 1 - i] : 0;
+
+         if(s_sig_up && !(g_lastRSIRevDir == 1 &&
+            (time[i] - g_lastRSIRevFireTime) < (datetime)(InpSeqLookback * PeriodSeconds())))
+           { g_lastRSIRevDir = 1; g_lastRSIRevTime = time[i]; g_lastRSIRevFireTime = time[i];
+             FireAlert("RSI BUY REVERSAL ◈ " + (rsGateBull ? "✅ SAFE" : "⚠️ RISK") +
+                       " | " + _Symbol + " " + EnumToString((ENUM_TIMEFRAMES)_Period) +
+                       FibTag(close[i], 1));
+             g_lastAlertTime = time[i];
+             CheckSequence(SEQ_RSI_REV, 1, time[i], close[i], curAtr); }
+         else if(s_sig_dn && !(g_lastRSIRevDir == -1 &&
+            (time[i] - g_lastRSIRevFireTime) < (datetime)(InpSeqLookback * PeriodSeconds())))
+           { g_lastRSIRevDir = -1; g_lastRSIRevTime = time[i]; g_lastRSIRevFireTime = time[i];
+             FireAlert("RSI SELL REVERSAL ◈ " + (rsGateBear ? "✅ SAFE" : "⚠️ RISK") +
+                       " | " + _Symbol + " " + EnumToString((ENUM_TIMEFRAMES)_Period) +
+                       FibTag(close[i], -1));
+             g_lastAlertTime = time[i];
+             CheckSequence(SEQ_RSI_REV, -1, time[i], close[i], curAtr); }
+         else if(gated_sig_up && g_lastRSINowDir != 1 && time[i] != g_lastAlertTime)
+           { g_lastRSINowDir = 1; g_lastRSINowTime = time[i];
+             FireAlert("RSI BUY NOW ◇ | " + _Symbol + " " +
+                       EnumToString((ENUM_TIMEFRAMES)_Period) +
+                       FibTag(close[i], 1));
+             g_lastAlertTime = time[i];
+             CheckSequence(SEQ_RSI_NOW, 1, time[i], close[i], curAtr); }
+         else if(gated_sig_dn && g_lastRSINowDir != -1 && time[i] != g_lastAlertTime)
+           { g_lastRSINowDir = -1; g_lastRSINowTime = time[i];
+             FireAlert("RSI SELL NOW ◇ | " + _Symbol + " " +
+                       EnumToString((ENUM_TIMEFRAMES)_Period) +
+                       FibTag(close[i], -1));
+             g_lastAlertTime = time[i];
+             CheckSequence(SEQ_RSI_NOW, -1, time[i], close[i], curAtr); }
+        }
+     }
+
+   //── ENGINE 2: PIVOT DETECTION ──────────────────────────────────
+   int pivStart = (prev_calculated == 0)
+                  ? InpSwingLeft
+                  : MathMax(InpSwingLeft, prev_calculated - InpSwingRight - 1);
+
+   for(int i = pivStart; i < rates_total; i++)
+     {
+      int pBar = i - InpSwingRight;
+      if(pBar < InpSwingLeft) continue;
+
+      if(IsPivotHigh(high, pBar, InpSwingLeft, InpSwingRight, rates_total))
+        {
+         bool exists = false;
+         for(int k = 0; k < g_nLv; k++)
+            if(g_lv[k].isHigh && g_lv[k].t1 == time[pBar]) { exists = true; break; }
+         if(!exists)
+            AddLevel(high[pBar], high[pBar], low[pBar], time[pBar], true);
+        }
+
+      if(IsPivotLow(low, pBar, InpSwingLeft, InpSwingRight, rates_total))
+        {
+         bool exists = false;
+         for(int k = 0; k < g_nLv; k++)
+            if(!g_lv[k].isHigh && g_lv[k].t1 == time[pBar]) { exists = true; break; }
+         if(!exists)
+            AddLevel(low[pBar], high[pBar], low[pBar], time[pBar], false);
+        }
+
+      for(int j = 0; j < g_nLv; j++)
+        {
+         if(g_lv[j].broken) continue;
+         if(g_lv[j].isHigh ? (close[i] > g_lv[j].top) : (close[i] < g_lv[j].bot))
+            g_lv[j].broken = true;
+        }
+     }
+
+   UpdateMarketStructure();
+
+   // ── Fib context — re-anchor from updated swing data ────────────
+   // Runs every bar: only actually re-anchors when a new HH or LL is detected
+   if(rates_total >= 2)
+      RecalcFibLevels(close[rates_total - 2]);
+
+   //── ENGINE 3: RBS/SBR ──────────────────────────────────────────
+   int lastBar = rates_total - 1;
+   if(prev_calculated > 0 && lastBar != g_lastFlipBar && !g_isRanging)
+     {
+      g_lastFlipBar = lastBar;
+      int prevBar   = lastBar - 1;
+
+      for(int j = 0; j < g_nLv; j++)
+        {
+         if(!g_lv[j].broken)     continue;
+         if(g_lv[j].flipAlerted) continue;
+
+         //── RBS BUY ──────────────────────────────────────────────
+         if(g_lv[j].isHigh &&
+            close[prevBar] <= g_lv[j].top &&
+            close[lastBar]  > g_lv[j].top &&
+            g_lastRBSSBRDir != 1)
+           {
+            if(InpHTFGateEnable && GlobalVariableCheck(InpSRZonesDirVar))
+              {
+               double srDir = GlobalVariableGet(InpSRZonesDirVar);
+               if(srDir != 1.0)
+                 { Print("[HTF GATE] RBS BUY suppressed — SR Zones dir=", srDir); continue; }
+               if(GlobalVariableCheck(InpSRZonesTimeVar))
+                 {
+                  datetime srTime = (datetime)GlobalVariableGet(InpSRZonesTimeVar);
+                  if((time[lastBar] - srTime) > (datetime)(InpHTFGateMaxBars * PeriodSeconds()))
+                    { Print("[HTF GATE] RBS BUY suppressed — SR Zones signal too old"); continue; }
+                 }
+              }
+
+            g_lv[j].flipAlerted = true;
+            g_lastRBSSBRDir     = 1;
+            double tp[];
+            GetNextPivots(true, g_lv[j].top, tp, 3);
+            string tpStr = "";
+            for(int t = 0; t < 3; t++)
+               tpStr += " TP" + IntegerToString(t+1) + ":" +
+                        (tp[t] > 0 ? DoubleToString(tp[t], _Digits) : "N/A") +
+                        (t < 2 ? " |" : "");
+            FireAlert("RBS BUY NOW | " + _Symbol + " " +
+                      EnumToString((ENUM_TIMEFRAMES)_Period) +
+                      " | ENTRY:" + DoubleToString(g_lv[j].bot, _Digits) +
+                      "-"         + DoubleToString(g_lv[j].top, _Digits) +
+                      " | SL:"    + DoubleToString(g_lv[j].bot, _Digits) +
+                      " |"        + tpStr +
+                      FibTag(close[lastBar], 1));
+            // SBR/RBS exempt from swing gate: pass atr=0
+            CheckSequence(SEQ_RBSSBR, 1, time[lastBar], close[lastBar], 0);
+           }
+
+         //── SBR SELL ─────────────────────────────────────────────
+         if(!g_lv[j].isHigh &&
+            close[prevBar] >= g_lv[j].bot &&
+            close[lastBar]  < g_lv[j].bot &&
+            g_lastRBSSBRDir != -1)
+           {
+            if(InpHTFGateEnable && GlobalVariableCheck(InpSRZonesDirVar))
+              {
+               double srDir = GlobalVariableGet(InpSRZonesDirVar);
+               if(srDir != -1.0)
+                 { Print("[HTF GATE] SBR SELL suppressed — SR Zones dir=", srDir); continue; }
+               if(GlobalVariableCheck(InpSRZonesTimeVar))
+                 {
+                  datetime srTime = (datetime)GlobalVariableGet(InpSRZonesTimeVar);
+                  if((time[lastBar] - srTime) > (datetime)(InpHTFGateMaxBars * PeriodSeconds()))
+                    { Print("[HTF GATE] SBR SELL suppressed — SR Zones signal too old"); continue; }
+                 }
+              }
+
+            g_lv[j].flipAlerted = true;
+            g_lastRBSSBRDir     = -1;
+            double tp[];
+            GetNextPivots(false, g_lv[j].bot, tp, 3);
+            string tpStr = "";
+            for(int t = 0; t < 3; t++)
+               tpStr += " TP" + IntegerToString(t+1) + ":" +
+                        (tp[t] > 0 ? DoubleToString(tp[t], _Digits) : "N/A") +
+                        (t < 2 ? " |" : "");
+            FireAlert("SBR SELL NOW | " + _Symbol + " " +
+                      EnumToString((ENUM_TIMEFRAMES)_Period) +
+                      " | ENTRY:" + DoubleToString(g_lv[j].top, _Digits) +
+                      "-"         + DoubleToString(g_lv[j].bot, _Digits) +
+                      " | SL:"    + DoubleToString(g_lv[j].top, _Digits) +
+                      " |"        + tpStr +
+                      FibTag(close[lastBar], -1));
+            // SBR/RBS exempt from swing gate: pass atr=0
+            CheckSequence(SEQ_RBSSBR, -1, time[lastBar], close[lastBar], 0);
+           }
+        }
+     }
+
+   return rates_total;
+  }
+//+------------------------------------------------------------------+
