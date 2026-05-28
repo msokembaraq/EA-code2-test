@@ -1,0 +1,127 @@
+//+------------------------------------------------------------------+
+//|                                       RollingSegment_Chart.mq5   |
+//|                  Rolling Segment on Main Chart                   |
+//|                  LuxAlgo CC BY-NC-SA 4.0                         |
+//+------------------------------------------------------------------+
+#property copyright "LuxAlgo (CC BY-NC-SA 4.0)"
+#property link      "https://creativecommons.org/licenses/by-nc-sa/4.0/"
+#property version   "1.00"
+#property indicator_chart_window
+#property indicator_buffers 2
+#property indicator_plots   1
+
+#property indicator_label1  "Rolling Segment"
+#property indicator_type1   DRAW_COLOR_LINE
+#property indicator_color1  clrLimeGreen, clrRed
+#property indicator_style1  STYLE_SOLID
+#property indicator_width1  2
+
+//--- Inputs
+input group "=== Rolling Segment ==="
+input int    InpRSFastLen    = 5;
+input int    InpRSSlowLen    = 10;
+input double InpRSFastThresh = 1.0;
+input double InpRSRevThresh  = 2.0;
+input int    InpATRLen       = 200;
+
+input group "=== Display ==="
+input bool   InpShowLine     = true;   // ON/OFF toggle
+
+//--- Buffers
+double BufRS[];
+double BufRSColor[];
+
+//--- Handle
+int g_atrHandle = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   g_atrHandle = iATR(NULL, 0, InpATRLen);
+   if(g_atrHandle == INVALID_HANDLE) return INIT_FAILED;
+
+   SetIndexBuffer(0, BufRS,      INDICATOR_DATA);
+   SetIndexBuffer(1, BufRSColor, INDICATOR_COLOR_INDEX);
+
+   PlotIndexSetDouble (0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetString (0, PLOT_LABEL, "Rolling Segment");
+   PlotIndexSetInteger(0, PLOT_DRAW_TYPE, InpShowLine ? DRAW_COLOR_LINE : DRAW_NONE);
+   PlotIndexSetInteger(0, PLOT_LINE_STYLE, STYLE_SOLID);
+   PlotIndexSetInteger(0, PLOT_LINE_WIDTH, 2);
+   PlotIndexSetInteger(0, PLOT_COLOR_INDEXES, 2);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 0, clrLimeGreen);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 1, clrRed);
+
+   IndicatorSetString(INDICATOR_SHORTNAME, "RS (" + IntegerToString(InpRSFastLen) + "/" + IntegerToString(InpRSSlowLen) + ")");
+   return INIT_SUCCEEDED;
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   if(g_atrHandle != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+  }
+
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double   &open[],
+                const double   &high[],
+                const double   &low[],
+                const double   &close[],
+                const long     &tick_volume[],
+                const long     &volume[],
+                const int      &spread[])
+  {
+   if(rates_total < InpATRLen + 2) return 0;
+
+   double atrRaw[];
+   ArraySetAsSeries(atrRaw, true);
+   if(CopyBuffer(g_atrHandle, 0, 0, rates_total, atrRaw) < rates_total) return 0;
+
+   // Fill empty bars before ATR init
+   for(int j = 0; j < InpATRLen && j < rates_total; j++)
+     { BufRS[j] = EMPTY_VALUE; BufRSColor[j] = 0; }
+
+   // Stateless — recalculate from scratch every call
+   double rollSeg    = close[InpATRLen];
+   double rsTrend    = 1.0;
+   double actSlope   = 0.0;
+   bool   isFastMode = false;
+
+   BufRS[InpATRLen]      = rollSeg;
+   BufRSColor[InpATRLen] = 0;
+
+   for(int i = InpATRLen + 1; i < rates_total; i++)
+     {
+      double atr = atrRaw[rates_total - 1 - i];
+
+      if(atr <= 0.0 || atr >= EMPTY_VALUE || !MathIsValidNumber(atr))
+        {
+         BufRS[i]      = close[i];
+         BufRSColor[i] = (rsTrend > 0) ? 0 : 1;
+         continue;
+        }
+
+      double dist    = close[i] - rollSeg;
+      bool   bullRev = (rsTrend < 0) && ( dist >  InpRSRevThresh * atr);
+      bool   bearRev = (rsTrend > 0) && (-dist >  InpRSRevThresh * atr);
+
+      if(bullRev)      rsTrend =  1.0;
+      else if(bearRev) rsTrend = -1.0;
+
+      bool newFast = (MathAbs(dist) > InpRSFastThresh * atr);
+      if(bullRev || bearRev || (newFast != isFastMode) || actSlope == 0.0)
+        { isFastMode = newFast;
+          actSlope = isFastMode ? atr / InpRSFastLen : atr / InpRSSlowLen; }
+
+      rollSeg += rsTrend * actSlope;
+
+      BufRS[i]      = rollSeg;
+      BufRSColor[i] = (rsTrend > 0) ? 0 : 1;
+     }
+
+   return rates_total;
+  }
+//+------------------------------------------------------------------+

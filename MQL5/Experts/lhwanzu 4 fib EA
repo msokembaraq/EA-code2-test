@@ -1,0 +1,1829 @@
+//+------------------------------------------------------------------+
+//|                              LinerX_v9_FibST_EA.mq5             |
+//|  V9.1 — Fix pip scalar, SR backfill, cascade dead-zone          |
+//|  STRATEGY:                                                       |
+//|    ST flip at PD zone (discount/premium) → immediate entry       |
+//|    Cascade levels (RevL/RevH/FLIP-1/FLIP1H) bypass SR check      |
+//|    Role-flip levels bypass SR check (the flip IS the SR)         |
+//|    PO3 manipulation wick arms trade, next ST flip fires entry    |
+//|    Consolidation: wick to RevL/RevH fires direct entry           |
+//+------------------------------------------------------------------+
+#property copyright "LinerX v9.1"
+#property version   "9.1"
+#property description "LinerX v9.1 — ST + Fib PD Zone + Cascade + PO3 + Consolidation"
+#include <Trade/Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| ENUMS                                                            |
+//+------------------------------------------------------------------+
+enum ENUM_EA_MODE { EA_MODE_TRADE, EA_MODE_SIGNAL };
+
+//+------------------------------------------------------------------+
+//| STRUCTS                                                          |
+//+------------------------------------------------------------------+
+struct TrackedTrade
+{
+   ulong  ticket;
+   double openPrice;
+   double originalLots;
+   int    direction;
+   double slPrice;
+   double assignedTP;
+   int    tpBucket;
+};
+
+struct UnifiedManagedPos
+{
+   ulong  ticket;
+   int    direction;
+   double openPrice;
+   double riskDistance;
+   double highWaterMark;
+   bool   beDone;
+   bool   isEATrade;
+};
+
+struct PendingPosition
+{
+   int    direction;
+   double sl;
+   double assignedTP;
+   int    tpBucket;
+   string bucket;
+   double lot;
+   string engTag;
+   int    createdBar;
+};
+
+//+------------------------------------------------------------------+
+//| INPUTS                                                           |
+//+------------------------------------------------------------------+
+input group "════ EA MODE ════"
+input ENUM_EA_MODE EAMode = EA_MODE_TRADE;
+
+input group "════ SUPERTREND ════"
+input double ST_Multiplier    = 1.5;
+input int    ST_ATR_Periods   = 14;
+input bool   ST_UseWilderATR  = true;
+
+input group "════ TRADE SETTINGS ════"
+input double LotSize           = 0.02;
+input int    NumberOfPositions = 3;
+input int    MaxPositions      = 3;
+input int    MagicNumber       = 20260900;
+input int    Slippage          = 20;
+input bool   CloseOnOpposite   = true;
+input bool   ScaleOutMultiTP   = true;
+
+input group "════ HUMAN DELAY ════"
+input bool UseHumanDelay    = true;
+input uint HumanDelay_MinMs = 400;
+input uint HumanDelay_MaxMs = 1800;
+
+input group "════ SL / BE / TRAIL ════"
+input bool   UseATRBasedSL    = true;
+input double SL_ATR_Mult      = 1.5;
+input int    SL_Points        = 0;
+input int    VirtualSL_Points = 0;
+input bool   EnableTradeManager = true;
+input double TriggerBE_R      = 0.5;
+input int    BECushionPoints  = 5;
+input bool   UseCandleTrail   = true;
+
+input group "════ FIB ANCHOR ════"
+input ENUM_TIMEFRAMES Fib_HTF           = PERIOD_M12;
+input int             Fib_PivotLookback  = 3;
+input int             Fib_MaxHLGapBars   = 50;
+input double          Fib_BreakBuffer    = 5.0;   // pips
+input double          Fib_PDBuffer       = 5.0;   // pips tolerance for zone check
+
+input group "════ SR ZONES ════"
+input bool   InpRequireSR      = true;
+input int    SR_PivotLookback  = 5;
+input int    SR_MaxZones       = 30;
+input double SR_TolerancePips  = 15.0;
+
+input group "════ CONSOLIDATION ════"
+input bool   UseConsolidation  = true;
+input int    ADR_Period        = 14;
+input double Consol_Threshold  = 0.60;
+
+input group "════ NOTIFICATIONS ════"
+input bool UsePush    = true;
+input bool UseAlerts  = false;
+input bool LogVerbose = false;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — SuperTrend                                             |
+//+------------------------------------------------------------------+
+double g_st_up=0, g_st_dn=0, g_st_up_prev=0, g_st_dn_prev=0;
+int    g_st_trend=0;
+int    g_stATRHandle = INVALID_HANDLE;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — general                                                |
+//+------------------------------------------------------------------+
+int      g_barCount    = 0;
+double   g_priceScalar = 1.0;
+datetime g_lastNotify    = 0;
+datetime g_lastTradeNote = 0;
+CTrade   trade;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — trade tracking                                         |
+//+------------------------------------------------------------------+
+TrackedTrade      g_openTrades[200];
+int               g_openTradeCount = 0;
+UnifiedManagedPos g_unifiedPositions[];
+int               g_unifiedPosCount = 0;
+PendingPosition   g_pendingQueue[200];
+int               g_pendingCount  = 0;
+uint              g_lastOpenMs    = 0;
+uint              g_nextDelayMs   = 0;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — Fib levels                                             |
+//+------------------------------------------------------------------+
+bool   g_fibValid   = false;
+double g_fibRange   = 0;
+double g_f0         = 0;   // swing low  (discount zone floor)
+double g_f1         = 0;   // swing high (premium zone ceiling)
+double g_f025       = 0;   // role-flip (BUY after break up)
+double g_f0382      = 0;   // discount zone top
+double g_f05        = 0;   // equilibrium / mid S/R
+double g_f0618      = 0;   // premium zone bottom
+double g_f075       = 0;   // role-flip (SELL after break down)
+double g_fRevL      = 0;   // f0 - 0.5*range  (REVERSAL below)
+double g_fRevH      = 0;   // f1 + 0.5*range  (REVERSAL above)
+double g_fFlip1L    = 0;   // f0 - 1.0*range  (FLIP-1)
+double g_fFlip1H    = 0;   // f1 + 1.0*range  (FLIP2 / FLIP1H)
+
+//+------------------------------------------------------------------+
+//| GLOBALS — cascade / re-anchor state                              |
+//+------------------------------------------------------------------+
+bool   g_waitCeil     = false;  // after break UP: waiting for new ceiling pivot
+bool   g_waitFloor    = false;  // after break DOWN: waiting for new floor pivot
+double g_lockedFloor  = 0;      // locked swing low after break up
+double g_lockedCeil   = 0;      // locked swing high after break down
+
+//+------------------------------------------------------------------+
+//| GLOBALS — role-flip levels                                       |
+//+------------------------------------------------------------------+
+double g_flippedLevels[32];
+int    g_flippedDir[32];   // +1 = was BUY support → now SELL resistance
+                           // -1 = was SELL ceiling → now BUY support
+int    g_flippedCount = 0;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — PO3 manipulation wick arms                             |
+//+------------------------------------------------------------------+
+bool g_po3BuyArmed    = false;
+int  g_po3BuyArmedBar = 0;
+bool g_po3SellArmed   = false;
+int  g_po3SellArmedBar= 0;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — Consolidation                                          |
+//+------------------------------------------------------------------+
+bool   g_inConsol  = false;
+double g_adrValue  = 0;
+
+//+------------------------------------------------------------------+
+//| GLOBALS — SR levels (pivot-based on current TF)                  |
+//+------------------------------------------------------------------+
+double g_srLevels[60];     // price of each pivot level
+int    g_srTypes[60];      // +1 = pivot high (resistance), -1 = pivot low (support)
+int    g_srCount = 0;
+
+//+------------------------------------------------------------------+
+//| UTILITY FUNCTIONS                                                |
+//+------------------------------------------------------------------+
+
+void Log(string m)
+{
+   if(LogVerbose || StringFind(m,"ERROR")>=0 || StringFind(m,"FAIL")>=0 ||
+      StringFind(m,"BUY")>=0 || StringFind(m,"SELL")>=0 || StringFind(m,"FIB")>=0 ||
+      StringFind(m,"ST")>=0  || StringFind(m,"BE")>=0   || StringFind(m,"TRAIL")>=0 ||
+      StringFind(m,"CASCADE")>=0 || StringFind(m,"PO3")>=0 || StringFind(m,"CONSOL")>=0)
+      Print(m);
+}
+
+void Notify(string m, bool isTrade=false, bool isEntry=false)
+{
+   if(!UsePush) return;
+   if(EAMode==EA_MODE_SIGNAL && !isEntry) return;
+   datetime ts = isTrade ? g_lastTradeNote : g_lastNotify;
+   if(TimeCurrent()-ts < 3) return;
+   if(isTrade) g_lastTradeNote=TimeCurrent(); else g_lastNotify=TimeCurrent();
+   SendNotification(m);
+   if(UseAlerts) Alert(m);
+}
+
+double GetMinStop()
+{
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   long   sl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long   fl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   return (double)MathMax(sl,fl)*pt + pt;
+}
+
+ENUM_ORDER_TYPE_FILLING GetFill()
+{
+   long fm = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fm & ORDER_FILLING_FOK)    != 0) return ORDER_FILLING_FOK;
+   if((fm & ORDER_FILLING_IOC)    != 0) return ORDER_FILLING_IOC;
+   if((fm & ORDER_FILLING_RETURN) != 0) return ORDER_FILLING_RETURN;
+   return ORDER_FILLING_IOC;
+}
+
+double GetPointsize() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
+
+double ScaledPip() { return GetPointsize() * g_priceScalar; }
+
+double GetATRSlDist()
+{
+   double mn=GetMinStop(), raw=0;
+   double buf[1];
+   if(g_stATRHandle!=INVALID_HANDLE && CopyBuffer(g_stATRHandle,0,1,1,buf)>0) raw=buf[0];
+   if(raw<=0) return 0;
+   return MathMax(raw*SL_ATR_Mult, mn);
+}
+
+double GetSTATR(int shift=1)
+{
+   if(ST_UseWilderATR)
+   {
+      if(g_stATRHandle==INVALID_HANDLE) return 0;
+      double buf[1];
+      if(CopyBuffer(g_stATRHandle,0,shift,1,buf)<=0) return 0;
+      return buf[0];
+   }
+   double sum=0;
+   for(int i=shift; i<shift+ST_ATR_Periods; i++)
+   {
+      double hi=iHigh(_Symbol,PERIOD_CURRENT,i), lo=iLow(_Symbol,PERIOD_CURRENT,i);
+      double pc=iClose(_Symbol,PERIOD_CURRENT,i+1);
+      sum+=MathMax(hi-lo, MathMax(MathAbs(hi-pc), MathAbs(lo-pc)));
+   }
+   return sum/ST_ATR_Periods;
+}
+
+// Fixed-points fallback TP — used when fib is not valid
+void CalcLevels(int dir, double entry, double &slOut, double &tp1Out, double &tp2Out, double &tp3Out)
+{
+   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pip = ScaledPip();
+   double mn  = GetMinStop();
+   double slD = 0;
+   if(UseATRBasedSL) { double a=GetATRSlDist(); slD=(a>0)?a:MathMax(SL_Points*pip,mn); }
+   else              slD=(SL_Points>0)?MathMax(SL_Points*pip,mn):0;
+   double vsl = (VirtualSL_Points>0) ? VirtualSL_Points*GetPointsize() : MathMax(mn+ScaledPip(),mn);
+   vsl = MathMax(vsl, mn+ScaledPip());
+   double useSL = (slD>0) ? slD : vsl;
+   if(dir==1)
+   {
+      slOut  = NormalizeDouble(entry - useSL, dg);
+      tp1Out = NormalizeDouble(MathMax(entry+mn, entry+200.0*pip), dg);
+      tp2Out = NormalizeDouble(MathMax(tp1Out+mn, entry+400.0*pip), dg);
+      tp3Out = NormalizeDouble(MathMax(tp2Out+mn, entry+700.0*pip), dg);
+   }
+   else
+   {
+      slOut  = NormalizeDouble(entry + useSL, dg);
+      tp1Out = NormalizeDouble(MathMin(entry-mn, entry-200.0*pip), dg);
+      tp2Out = NormalizeDouble(MathMin(tp1Out-mn, entry-400.0*pip), dg);
+      tp3Out = NormalizeDouble(MathMin(tp2Out-mn, entry-700.0*pip), dg);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SUPERTREND ENGINE (Wilder ATR)                                   |
+//+------------------------------------------------------------------+
+int UpdateSuperTrend()
+{
+   double atr=GetSTATR(1); if(atr<=0) return 0;
+   double hi=iHigh(_Symbol,PERIOD_CURRENT,1), lo=iLow(_Symbol,PERIOD_CURRENT,1);
+   double cl=iClose(_Symbol,PERIOD_CURRENT,1);
+   double src=(hi+lo)/2.0, pbc=iClose(_Symbol,PERIOD_CURRENT,2);
+   double ru=src-ST_Multiplier*atr, rd=src+ST_Multiplier*atr, nu, nd;
+   if(g_st_up_prev==0) { nu=ru; nd=rd; }
+   else
+   {
+      nu=(pbc>g_st_up_prev)?MathMax(ru,g_st_up_prev):ru;
+      nd=(pbc<g_st_dn_prev)?MathMin(rd,g_st_dn_prev):rd;
+   }
+   int pt=g_st_trend;
+   g_st_up_prev=g_st_up; g_st_dn_prev=g_st_dn;
+   g_st_up=nu; g_st_dn=nd;
+   if(g_st_trend==0)            g_st_trend=(cl>nd)?1:-1;
+   else if(g_st_trend==-1&&cl>g_st_dn_prev) g_st_trend=1;
+   else if(g_st_trend== 1&&cl<g_st_up_prev) g_st_trend=-1;
+   int flip=0;
+   if(g_st_trend==1  && pt==-1) flip=1;
+   if(g_st_trend==-1 && pt== 1) flip=-1;
+   static uint sn=0; sn++;
+   if((LogVerbose && sn<=10) || flip!=0)
+      Print("═══ ST #",sn," bar=",g_barCount," trend=",pt,"→",g_st_trend," FLIP=",flip);
+   return flip;
+}
+
+//+------------------------------------------------------------------+
+//| FIB ANCHOR — compute all levels from low/high                    |
+//+------------------------------------------------------------------+
+void Fib_SetAnchor(double low, double high)
+{
+   if(high <= low) return;
+   g_f0    = low;
+   g_f1    = high;
+   double r = high - low;
+   g_f0382  = low + 0.382*r;
+   g_f05    = low + 0.500*r;
+   g_f0618  = low + 0.618*r;
+   g_f025   = low + 0.250*r;
+   g_f075   = low + 0.750*r;
+   g_fRevL  = low  - 0.500*r;
+   g_fRevH  = high + 0.500*r;
+   g_fFlip1L = low  - 1.000*r;
+   g_fFlip1H = high + 1.000*r;
+   g_fibValid = true;
+   g_fibRange = r;
+   // Reset PO3 arms on re-anchor (new structure = stale arms invalid)
+   g_po3BuyArmed=false; g_po3SellArmed=false;
+   Log(StringFormat("📐 FIB SET | 0=%.5f | 1=%.5f | Range=%.1fpts | 0.382=%.5f | 0.618=%.5f | 0.5=%.5f | RevL=%.5f | RevH=%.5f",
+       g_f0, g_f1, g_fibRange/ScaledPip(), g_f0382, g_f0618, g_f05, g_fRevL, g_fRevH));
+}
+
+//+------------------------------------------------------------------+
+//| FIB BACKFILL — find M12 swing H/L on startup (3-tier fallback)   |
+//+------------------------------------------------------------------+
+void Fib_Backfill()
+{
+   int total = iBars(_Symbol, Fib_HTF);
+   int scanWindow = 50;
+   int sr = MathMin(scanWindow + Fib_PivotLookback, total - Fib_PivotLookback - 2);
+   Print("💾 Fib Backfill: scanning recent ", sr, " ", EnumToString(Fib_HTF), " bars...");
+
+   // ── TIER 1: confirmed pivot H and L ───────────────────────────
+   double bH=0; int bHb=-1;
+   double bL=DBL_MAX; int bLb=-1;
+   for(int bar=Fib_PivotLookback; bar<=sr; bar++)
+   {
+      double h=iHigh(_Symbol,Fib_HTF,bar); bool ph=true;
+      for(int k=1;k<=Fib_PivotLookback&&ph;k++)
+      {
+         if(bar-k<0||bar+k>=total){ph=false;break;}
+         if(iHigh(_Symbol,Fib_HTF,bar-k)>=h||iHigh(_Symbol,Fib_HTF,bar+k)>=h) ph=false;
+      }
+      if(ph && bHb<0) { bH=h; bHb=bar; }
+
+      double l=iLow(_Symbol,Fib_HTF,bar); bool pl=true;
+      for(int k=1;k<=Fib_PivotLookback&&pl;k++)
+      {
+         if(bar-k<0||bar+k>=total){pl=false;break;}
+         if(iLow(_Symbol,Fib_HTF,bar-k)<=l||iLow(_Symbol,Fib_HTF,bar+k)<=l) pl=false;
+      }
+      if(pl && bLb<0) { bL=l; bLb=bar; }
+      if(bHb>=0 && bLb>=0) break;
+   }
+
+   // ── TIER 2: gap adjustment — search within MaxHLGapBars ───────
+   if(bHb>=0 && bLb>=0 && bH>bL && MathAbs(bHb-bLb)>Fib_MaxHLGapBars)
+   {
+      Print(StringFormat("⚠️ Fib Backfill: H(bar%d) L(bar%d) gap=%d > max=%d — adjusting",
+            bHb, bLb, MathAbs(bHb-bLb), Fib_MaxHLGapBars));
+      if(bHb > bLb)
+      {
+         bH=0; bHb=-1;
+         for(int bar=Fib_PivotLookback; bar<=bLb+Fib_MaxHLGapBars&&bar<=sr; bar++)
+         {
+            double h=iHigh(_Symbol,Fib_HTF,bar); bool ph=true;
+            for(int k=1;k<=Fib_PivotLookback&&ph;k++)
+            { if(bar-k<0||bar+k>=total){ph=false;break;}
+              if(iHigh(_Symbol,Fib_HTF,bar-k)>=h||iHigh(_Symbol,Fib_HTF,bar+k)>=h) ph=false; }
+            if(ph && bar!=bLb) { bH=h; bHb=bar; break; }
+         }
+      }
+      else
+      {
+         bL=DBL_MAX; bLb=-1;
+         for(int bar=Fib_PivotLookback; bar<=bHb+Fib_MaxHLGapBars&&bar<=sr; bar++)
+         {
+            double l=iLow(_Symbol,Fib_HTF,bar); bool pl=true;
+            for(int k=1;k<=Fib_PivotLookback&&pl;k++)
+            { if(bar-k<0||bar+k>=total){pl=false;break;}
+              if(iLow(_Symbol,Fib_HTF,bar-k)<=l||iLow(_Symbol,Fib_HTF,bar+k)<=l) pl=false; }
+            if(pl && bar!=bHb) { bL=l; bLb=bar; break; }
+         }
+      }
+   }
+
+   // ── TIER 3: raw range H/L fallback ────────────────────────────
+   if(bHb<0||bLb<0||bH<=bL)
+   {
+      double fbH=0; double fbL=DBL_MAX;
+      for(int bar=0; bar<=sr; bar++)
+      {
+         double h=iHigh(_Symbol,Fib_HTF,bar); if(h>fbH) fbH=h;
+         double l=iLow (_Symbol,Fib_HTF,bar); if(l<fbL) fbL=l;
+      }
+      if(fbH>fbL && fbH>0 && fbL<DBL_MAX)
+      {
+         bH=fbH; bL=fbL;
+         Print(StringFormat("💾 Fib Backfill: fallback raw range H=%.5f L=%.5f", bH, bL));
+      }
+      else
+      {
+         Print("⚠️ Fib Backfill: no valid anchor found");
+         Notify(StringFormat("⚠️ FIB NO ANCHOR|%s|waiting live pivot",_Symbol));
+         return;
+      }
+   }
+
+   Fib_SetAnchor(bL, bH);
+
+   // Check if price is already beyond range at startup
+   double cl = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double pip = ScaledPip();
+   if(cl > g_f1 + Fib_BreakBuffer*pip)
+   {
+      g_lockedFloor = g_f0;
+      g_waitCeil    = true;
+      Log(StringFormat("💾 Fib Backfill: price above 1 — CEILING SHIFT armed | lockedFloor=%.5f | RevH=%.5f",
+          g_lockedFloor, g_fRevH));
+   }
+   else if(cl < g_f0 - Fib_BreakBuffer*pip)
+   {
+      g_lockedCeil  = g_f1;
+      g_waitFloor   = true;
+      Log(StringFormat("💾 Fib Backfill: price below 0 — FLOOR SHIFT armed | lockedCeil=%.5f | RevL=%.5f",
+          g_lockedCeil, g_fRevL));
+   }
+
+   Print(StringFormat("💾 Fib Backfill DONE | L=%.5f(bar%d) H=%.5f(bar%d) | Range=%.1fpts",
+         bL, bLb, bH, bHb, g_fibRange/pip));
+   Notify(StringFormat("📐 FIB ANCHORED|%s|0=%.5f|1=%.5f|Range=%.0fpts|RevL=%.5f|RevH=%.5f",
+          _Symbol, g_f0, g_f1, g_fibRange/pip, g_fRevL, g_fRevH));
+}
+
+//+------------------------------------------------------------------+
+//| ROLE FLIP — record a level that reversed roles                   |
+//+------------------------------------------------------------------+
+// dir = +1 → was BUY floor, now SELL resistance on retest
+// dir = -1 → was SELL ceiling, now BUY support on retest
+void AddFlippedLevel(double price, int dir)
+{
+   if(price <= 0) return;
+   double tol = Fib_PDBuffer * ScaledPip() * 3.0;
+   for(int i=0; i<g_flippedCount; i++)
+      if(MathAbs(g_flippedLevels[i]-price)<=tol && g_flippedDir[i]==dir) return;
+   if(g_flippedCount >= 32)
+   {
+      for(int i=0; i<31; i++) { g_flippedLevels[i]=g_flippedLevels[i+1]; g_flippedDir[i]=g_flippedDir[i+1]; }
+      g_flippedCount=31;
+   }
+   g_flippedLevels[g_flippedCount] = price;
+   g_flippedDir[g_flippedCount]    = dir;
+   g_flippedCount++;
+   Log(StringFormat("📌 ROLE FLIP RECORDED | %.5f | %s",
+       price, dir==1?"BUY-floor→SELL-resistance":"SELL-ceiling→BUY-support"));
+}
+
+//+------------------------------------------------------------------+
+//| FIB UPDATE STATE — break detect + cascade + role flip + PO3      |
+//+------------------------------------------------------------------+
+void Fib_UpdateState()
+{
+   if(!g_fibValid) return;
+   double pip  = ScaledPip();
+   double bb   = Fib_BreakBuffer * pip;
+   double buf  = Fib_PDBuffer * pip;
+   double cl1  = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double hi1  = iHigh (_Symbol, PERIOD_CURRENT, 1);
+   double lo1  = iLow  (_Symbol, PERIOD_CURRENT, 1);
+
+   // ── STEP 1: break detection (only when NOT already waiting) ───
+   if(!g_waitCeil && !g_waitFloor)
+   {
+      if(cl1 > g_f1 + bb)
+      {
+         // Break UP: lock floor, set waitCeil, old f1 becomes BUY support
+         AddFlippedLevel(g_f1, -1); // old 1 SELL → now BUY support
+         g_lockedFloor = g_f0;
+         g_waitCeil    = true;
+         Log(StringFormat("🔺 FIB BREAK UP|0 FLOOR LOCKED=%.5f|waiting swing high near RevH=%.5f",
+             g_lockedFloor, g_fRevH));
+         Notify(StringFormat("🔺 FIB BREAK UP|%s|0=%.5f LOCKED|target RevH=%.5f",
+                _Symbol, g_lockedFloor, g_fRevH));
+         return;
+      }
+      if(cl1 < g_f0 - bb)
+      {
+         // Break DOWN: lock ceiling, set waitFloor, old f0 becomes SELL resistance
+         AddFlippedLevel(g_f0, +1); // old 0 BUY → now SELL resistance
+         g_lockedCeil  = g_f1;
+         g_waitFloor   = true;
+         Log(StringFormat("🔻 FIB BREAK DOWN|1 CEIL LOCKED=%.5f|waiting swing low near RevL=%.5f",
+             g_lockedCeil, g_fRevL));
+         Notify(StringFormat("🔻 FIB BREAK DOWN|%s|1=%.5f LOCKED|target RevL=%.5f",
+                _Symbol, g_lockedCeil, g_fRevL));
+         return;
+      }
+   }
+
+   // ── STEP 2: cascade — look for new pivot to re-anchor ─────────
+   if(g_waitCeil)
+   {
+      // Look for M12 pivot high near RevH (within 3×PDBuffer)
+      int total = iBars(_Symbol, Fib_HTF);
+      int prd   = Fib_PivotLookback;
+      double tol = buf * 3.0;
+      if(total >= prd*2+2)
+      {
+         double phH = iHigh(_Symbol, Fib_HTF, prd); bool isPH=true;
+         for(int k=1; k<=prd&&isPH; k++)
+            if(iHigh(_Symbol,Fib_HTF,prd-k)>=phH||iHigh(_Symbol,Fib_HTF,prd+k)>=phH) isPH=false;
+         if(isPH && phH > g_f1)
+         {
+            bool nearTarget = (MathAbs(phH-g_fRevH)<=tol*4 || phH>=g_fRevH-tol*4);
+            if(nearTarget)
+            {
+               AddFlippedLevel(g_fRevH, +1); // RevH held → stays SELL resistance
+               Fib_SetAnchor(g_lockedFloor, phH);
+               g_waitCeil = false;
+               Log(StringFormat("✅ FIB NEW CEILING | 0=%.5f (LOCKED) | 1=%.5f (NEW) | RevH=%.5f",
+                   g_f0, g_f1, g_fRevH));
+               Notify(StringFormat("✅ FIB CEILING SHIFT|%s|0=%.5f|1=%.5f|RevH=%.5f",
+                      _Symbol, g_f0, g_f1, g_fRevH));
+               return;
+            }
+         }
+      }
+      // Cascade continuation: if close breaks through current RevH
+      if(cl1 > g_fRevH + bb)
+      {
+         double oldRevH = g_fRevH;
+         // Anchor f1 at the actual bar high (where price truly extended), not the pre-defined RevH
+         double actualHigh = iHigh(_Symbol, _Period, 1);
+         double newF1 = MathMax(actualHigh, g_fRevH);
+         AddFlippedLevel(g_fRevH, -1); // RevH broke up → now BUY support on retest
+         Fib_SetAnchor(g_lockedFloor, newF1);
+         g_waitCeil = true; // still waiting — new RevH is next target
+         Log(StringFormat("🔺 FIB CASCADE↑|broke RevH %.5f|actual high=%.5f|next RevH target=%.5f", oldRevH, newF1, g_fRevH));
+         Notify(StringFormat("🔺 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, oldRevH, g_fRevH));
+      }
+      return;
+   }
+
+   if(g_waitFloor)
+   {
+      int total = iBars(_Symbol, Fib_HTF);
+      int prd   = Fib_PivotLookback;
+      double tol = buf * 3.0;
+      if(total >= prd*2+2)
+      {
+         double plL = iLow(_Symbol, Fib_HTF, prd); bool isPL=true;
+         for(int k=1; k<=prd&&isPL; k++)
+            if(iLow(_Symbol,Fib_HTF,prd-k)<=plL||iLow(_Symbol,Fib_HTF,prd+k)<=plL) isPL=false;
+         if(isPL && plL < g_f0)
+         {
+            bool nearTarget = (MathAbs(plL-g_fRevL)<=tol*4 || plL<=g_fRevL+tol*4);
+            if(nearTarget)
+            {
+               AddFlippedLevel(g_fRevL, -1); // RevL held → stays BUY support
+               Fib_SetAnchor(plL, g_lockedCeil);
+               g_waitFloor = false;
+               Log(StringFormat("✅ FIB NEW FLOOR | 0=%.5f (NEW) | 1=%.5f (LOCKED) | RevL=%.5f",
+                   g_f0, g_f1, g_fRevL));
+               Notify(StringFormat("✅ FIB FLOOR SHIFT|%s|0=%.5f|1=%.5f|RevL=%.5f",
+                      _Symbol, g_f0, g_f1, g_fRevL));
+               return;
+            }
+         }
+      }
+      // Cascade continuation: close broke through current RevL
+      if(cl1 < g_fRevL - bb)
+      {
+         double oldRevL = g_fRevL;
+         // Anchor f0 at the actual bar low (where price truly extended), not the pre-defined RevL
+         double actualLow = iLow(_Symbol, _Period, 1);
+         double newF0 = MathMin(actualLow, g_fRevL);
+         AddFlippedLevel(g_fRevL, +1); // RevL broke down → now SELL resistance on retest
+         Fib_SetAnchor(newF0, g_lockedCeil);
+         g_waitFloor = true; // still waiting — new RevL is next target
+         Log(StringFormat("🔻 FIB CASCADE↓|broke RevL %.5f|actual low=%.5f|next RevL target=%.5f", oldRevL, newF0, g_fRevL));
+         Notify(StringFormat("🔻 FIB CASCADE|%s|broke %.5f|next target=%.5f", _Symbol, oldRevL, g_fRevL));
+      }
+      return;
+   }
+
+   // ── STEP 6: PO3 manipulation wick detection ────────────────────
+   // BUY arm: wick below f0 (or below RevL) AND closes above f0
+   if(!g_po3BuyArmed)
+   {
+      bool wickBelowF0   = (lo1 < g_f0 - buf);
+      bool wickBelowRevL = (g_fRevL > 0 && lo1 < g_fRevL + buf);
+      bool closeAboveF0  = (cl1 > g_f0 - buf);
+      if((wickBelowF0 || wickBelowRevL) && closeAboveF0)
+      {
+         g_po3BuyArmed    = true;
+         g_po3BuyArmedBar = g_barCount;
+         Log(StringFormat("🎯 PO3 BUY ARMED | wick=%.5f closed=%.5f | f0=%.5f RevL=%.5f",
+             lo1, cl1, g_f0, g_fRevL));
+         Notify(StringFormat("🎯 PO3 BUY ARMED|%s|wick=%.5f|closed=%.5f",_Symbol,lo1,cl1));
+      }
+   }
+   // SELL arm: wick above f1 (or above RevH) AND closes below f1
+   if(!g_po3SellArmed)
+   {
+      bool wickAboveF1   = (hi1 > g_f1 + buf);
+      bool wickAboveRevH = (g_fRevH > 0 && hi1 > g_fRevH - buf);
+      bool closeBelowF1  = (cl1 < g_f1 + buf);
+      if((wickAboveF1 || wickAboveRevH) && closeBelowF1)
+      {
+         g_po3SellArmed    = true;
+         g_po3SellArmedBar = g_barCount;
+         Log(StringFormat("🎯 PO3 SELL ARMED | wick=%.5f closed=%.5f | f1=%.5f RevH=%.5f",
+             hi1, cl1, g_f1, g_fRevH));
+         Notify(StringFormat("🎯 PO3 SELL ARMED|%s|wick=%.5f|closed=%.5f",_Symbol,hi1,cl1));
+      }
+   }
+
+   // ── STEP 7: clear PO3 arms after 5 bars ───────────────────────
+   if(g_po3BuyArmed  && g_barCount - g_po3BuyArmedBar  > 5)
+   { g_po3BuyArmed  = false; Log("⏰ PO3 BUY ARM expired"); }
+   if(g_po3SellArmed && g_barCount - g_po3SellArmedBar > 5)
+   { g_po3SellArmed = false; Log("⏰ PO3 SELL ARM expired"); }
+}
+
+//+------------------------------------------------------------------+
+//| SR UPDATE — pivot-based SR on current TF                         |
+//+------------------------------------------------------------------+
+void SR_Update()
+{
+   int total = iBars(_Symbol, PERIOD_CURRENT);
+   if(total < SR_PivotLookback*2+3) return;
+   int prd = SR_PivotLookback;
+
+   // Check for new pivot high
+   double s1 = iHigh(_Symbol, PERIOD_CURRENT, prd); bool isPH=true;
+   for(int k=1; k<=prd&&isPH; k++)
+   {
+      if(prd-k<0||prd+k>=total){isPH=false;break;}
+      if(iHigh(_Symbol,PERIOD_CURRENT,prd+k)>=s1||iHigh(_Symbol,PERIOD_CURRENT,prd-k)>=s1) isPH=false;
+   }
+   if(isPH)
+   {
+      bool ex=false;
+      for(int k=0; k<g_srCount; k++)
+         if(g_srTypes[k]==1 && MathAbs(g_srLevels[k]-s1)<_Point){ex=true;break;}
+      if(!ex && g_srCount < SR_MaxZones*2)
+      {
+         // Shift array if full
+         if(g_srCount >= SR_MaxZones*2)
+         { for(int i=0;i<g_srCount-1;i++){g_srLevels[i]=g_srLevels[i+1];g_srTypes[i]=g_srTypes[i+1];}
+           g_srCount--; }
+         g_srLevels[g_srCount] = s1;
+         g_srTypes[g_srCount]  = 1; // pivot high = resistance
+         g_srCount++;
+         Log(StringFormat("📍 SR Pivot H @ %.5f", s1));
+      }
+   }
+
+   // Check for new pivot low
+   double s2 = iLow(_Symbol, PERIOD_CURRENT, prd); bool isPL=true;
+   for(int k=1; k<=prd&&isPL; k++)
+   {
+      if(prd-k<0||prd+k>=total){isPL=false;break;}
+      if(iLow(_Symbol,PERIOD_CURRENT,prd+k)<=s2||iLow(_Symbol,PERIOD_CURRENT,prd-k)<=s2) isPL=false;
+   }
+   if(isPL)
+   {
+      bool ex=false;
+      for(int k=0; k<g_srCount; k++)
+         if(g_srTypes[k]==-1 && MathAbs(g_srLevels[k]-s2)<_Point){ex=true;break;}
+      if(!ex && g_srCount < SR_MaxZones*2)
+      {
+         if(g_srCount >= SR_MaxZones*2)
+         { for(int i=0;i<g_srCount-1;i++){g_srLevels[i]=g_srLevels[i+1];g_srTypes[i]=g_srTypes[i+1];}
+           g_srCount--; }
+         g_srLevels[g_srCount] = s2;
+         g_srTypes[g_srCount]  = -1; // pivot low = support
+         g_srCount++;
+         Log(StringFormat("📍 SR Pivot L @ %.5f", s2));
+      }
+   }
+
+   // Prune old levels that are too far from current price
+   double curPrice = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double maxDist  = g_fibRange > 0 ? g_fibRange * 3.0 : curPrice * 0.05;
+   for(int i=g_srCount-1; i>=0; i--)
+   {
+      if(MathAbs(g_srLevels[i]-curPrice) > maxDist)
+      {
+         for(int j=i;j<g_srCount-1;j++){g_srLevels[j]=g_srLevels[j+1];g_srTypes[j]=g_srTypes[j+1];}
+         g_srCount--;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SR BACKFILL — load historical pivot S/R levels on startup        |
+//+------------------------------------------------------------------+
+void SR_Backfill()
+{
+   int total = iBars(_Symbol, PERIOD_CURRENT);
+   int prd   = SR_PivotLookback;
+   if(total < prd*2+3) return;
+   int scanBars = MathMin(total - prd - 1, SR_MaxZones * 8);
+   g_srCount = 0;
+
+   for(int bar = prd; bar < scanBars && g_srCount < SR_MaxZones*2; bar++)
+   {
+      double h = iHigh(_Symbol,PERIOD_CURRENT,bar); bool isPH=true;
+      for(int k=1; k<=prd&&isPH; k++)
+      {
+         if(bar-k<0||bar+k>=total){isPH=false;break;}
+         if(iHigh(_Symbol,PERIOD_CURRENT,bar-k)>=h||iHigh(_Symbol,PERIOD_CURRENT,bar+k)>=h) isPH=false;
+      }
+      if(isPH)
+      {
+         bool ex=false;
+         for(int k=0;k<g_srCount;k++) if(g_srTypes[k]==1&&MathAbs(g_srLevels[k]-h)<_Point){ex=true;break;}
+         if(!ex&&g_srCount<SR_MaxZones*2){g_srLevels[g_srCount]=h;g_srTypes[g_srCount]=1;g_srCount++;}
+      }
+      double l = iLow(_Symbol,PERIOD_CURRENT,bar); bool isPL=true;
+      for(int k=1; k<=prd&&isPL; k++)
+      {
+         if(bar-k<0||bar+k>=total){isPL=false;break;}
+         if(iLow(_Symbol,PERIOD_CURRENT,bar-k)<=l||iLow(_Symbol,PERIOD_CURRENT,bar+k)<=l) isPL=false;
+      }
+      if(isPL)
+      {
+         bool ex=false;
+         for(int k=0;k<g_srCount;k++) if(g_srTypes[k]==-1&&MathAbs(g_srLevels[k]-l)<_Point){ex=true;break;}
+         if(!ex&&g_srCount<SR_MaxZones*2){g_srLevels[g_srCount]=l;g_srTypes[g_srCount]=-1;g_srCount++;}
+      }
+   }
+   Print(StringFormat("📍 SR Backfill: %d levels loaded (scanned %d bars, lookback=%d)",
+         g_srCount, scanBars, prd));
+}
+
+//+------------------------------------------------------------------+
+//| SR HAS CONFLUENCE                                                |
+//+------------------------------------------------------------------+
+bool SR_HasConfluence(int direction, double price)
+{
+   double tol = SR_TolerancePips * ScaledPip();
+
+   // All key fib levels act as S/R — being near any of them = confluence
+   if(g_fibValid)
+   {
+      double fibSR[9];
+      fibSR[0]=g_f0; fibSR[1]=g_f025; fibSR[2]=g_f0382; fibSR[3]=g_f05;
+      fibSR[4]=g_f0618; fibSR[5]=g_f075; fibSR[6]=g_f1;
+      fibSR[7]=g_fRevL; fibSR[8]=g_fRevH;
+      for(int i=0; i<9; i++)
+         if(fibSR[i]>0 && MathAbs(price-fibSR[i])<=tol) return true;
+   }
+
+   for(int i=0; i<g_srCount; i++)
+   {
+      if(MathAbs(g_srLevels[i] - price) > tol) continue;
+      if(direction == 1  && g_srTypes[i] == -1) return true;  // BUY: near support (pivot low)
+      if(direction == -1 && g_srTypes[i] ==  1) return true;  // SELL: near resistance (pivot high)
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CALC TP — fib-based TPs                                          |
+//+------------------------------------------------------------------+
+void CalcTP(int direction, double entry, double &slOut,
+            double &tp1Out, double &tp2Out, double &tp3Out)
+{
+   if(!g_fibValid || g_fibRange <= 0)
+   { CalcLevels(direction, entry, slOut, tp1Out, tp2Out, tp3Out); return; }
+
+   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pip = ScaledPip();
+   double mn  = GetMinStop();
+   double slD = 0;
+   if(UseATRBasedSL) { double a=GetATRSlDist(); slD=(a>0)?a:MathMax(SL_Points*pip,mn); }
+   else              slD=(SL_Points>0)?MathMax(SL_Points*pip,mn):0;
+   double vsl = (VirtualSL_Points>0) ? VirtualSL_Points*GetPointsize() : MathMax(mn+ScaledPip(),mn);
+   vsl = MathMax(vsl, mn+ScaledPip());
+   double useSL = (slD>0) ? slD : vsl;
+
+   if(direction == 1)
+   {
+      slOut  = NormalizeDouble(entry - useSL, dg);
+      tp1Out = NormalizeDouble(g_f05,  dg);                          // equilibrium
+      tp2Out = NormalizeDouble(g_waitCeil ? g_f1 : g_f075, dg);     // cascade: f1, else role-flip
+      tp3Out = NormalizeDouble(g_waitCeil ? g_fFlip1H : g_fRevH, dg); // cascade: FLIP1H, else RevH
+
+      // Enforce minimum distances — use 3 pips minimum so TP1 is never trivially close
+      double minTP = MathMax(mn, 3.0 * pip);
+      tp1Out = MathMax(tp1Out, entry + minTP);
+      tp2Out = MathMax(tp2Out, tp1Out + mn);
+      tp3Out = MathMax(tp3Out, tp2Out + mn);
+
+      // If tp1 would be below or at entry (e.g. cascade buy above f05), use proportional TPs
+      if(tp1Out <= entry + minTP)
+      {
+         double revDist = MathAbs(g_fRevH - entry);
+         if(revDist > mn*3)
+         {
+            tp1Out = NormalizeDouble(entry + revDist*0.33, dg);
+            tp2Out = NormalizeDouble(entry + revDist*0.66, dg);
+            tp3Out = NormalizeDouble(g_waitCeil ? g_fFlip1H : g_fRevH, dg);
+            tp1Out = MathMax(tp1Out, entry+mn);
+            tp2Out = MathMax(tp2Out, tp1Out+mn);
+            tp3Out = MathMax(tp3Out, tp2Out+mn);
+         }
+         else
+         { CalcLevels(direction, entry, slOut, tp1Out, tp2Out, tp3Out); return; }
+      }
+   }
+   else
+   {
+      slOut  = NormalizeDouble(entry + useSL, dg);
+      tp1Out = NormalizeDouble(g_f05,  dg);                           // equilibrium
+      tp2Out = NormalizeDouble(g_waitFloor ? g_f0 : g_f025, dg);     // cascade: f0, else role-flip
+      tp3Out = NormalizeDouble(g_waitFloor ? g_fFlip1L : g_fRevL, dg); // cascade: FLIP-1, else RevL
+
+      // Enforce minimum distances — use 3 pips minimum so TP1 is never trivially close
+      double minTP = MathMax(mn, 3.0 * pip);
+      tp1Out = MathMin(tp1Out, entry - minTP);
+      tp2Out = MathMin(tp2Out, tp1Out - mn);
+      tp3Out = MathMin(tp3Out, tp2Out - mn);
+
+      // If tp1 would be above or at entry (e.g. cascade sell below f05)
+      if(tp1Out >= entry - minTP)
+      {
+         double revDist = MathAbs(entry - g_fRevL);
+         if(revDist > mn*3)
+         {
+            tp1Out = NormalizeDouble(entry - revDist*0.33, dg);
+            tp2Out = NormalizeDouble(entry - revDist*0.66, dg);
+            tp3Out = NormalizeDouble(g_waitFloor ? g_fFlip1L : g_fRevL, dg);
+            tp1Out = MathMin(tp1Out, entry-mn);
+            tp2Out = MathMin(tp2Out, tp1Out-mn);
+            tp3Out = MathMin(tp3Out, tp2Out-mn);
+         }
+         else
+         { CalcLevels(direction, entry, slOut, tp1Out, tp2Out, tp3Out); return; }
+      }
+   }
+   Log(StringFormat("📐 CalcTP | %s | entry=%.5f | SL=%.5f | TP1=%.5f | TP2=%.5f | TP3=%.5f",
+       direction==1?"BUY":"SELL", entry, slOut, tp1Out, tp2Out, tp3Out));
+}
+
+//+------------------------------------------------------------------+
+//| TRADE QUEUE + HUMAN DELAY                                        |
+//+------------------------------------------------------------------+
+int GetTrackedTpBucket(ulong ticket)
+{
+   for(int i=0; i<g_openTradeCount; i++)
+      if(g_openTrades[i].ticket==ticket) return g_openTrades[i].tpBucket;
+   return -1;
+}
+
+void OpenPositions(int direction, double signalClose, double sl, double tp1, double tp2, double tp3)
+{
+   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double ml  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double mx  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double ls  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double lot = NormalizeDouble(MathMax(ml, MathMin(mx, MathFloor(LotSize/ls)*ls)), 2);
+
+   // Same-direction count check — runners (tpBucket==0) are excluded so they
+   // don't permanently block new signals in the same direction
+   int sameDirCount=0;
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong t=PositionGetTicket(i); if(!t||!PositionSelectByTicket(t)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=(ulong)MagicNumber) continue;
+      int pt2=(int)PositionGetInteger(POSITION_TYPE);
+      if((direction==1&&pt2==POSITION_TYPE_BUY)||(direction==-1&&pt2==POSITION_TYPE_SELL))
+      {
+         if(GetTrackedTpBucket(t)==0) continue; // runner — managed by trail, doesn't block new entries
+         sameDirCount++;
+      }
+   }
+   if(sameDirCount>0)
+   { Log(StringFormat("⏭️ %s skipped — %d open same-dir (runners excluded)", direction==1?"BUY":"SELL", sameDirCount)); return; }
+
+   // Clear pending queue if opposite direction
+   if(CloseOnOpposite && g_pendingCount>0 && g_pendingQueue[0].direction!=direction)
+   { Log("🗑️ Cleared opposite pending queue"); g_pendingCount=0; }
+
+   // Close opposing positions
+   if(CloseOnOpposite)
+   {
+      for(int i=PositionsTotal()-1; i>=0; i--)
+      {
+         ulong t=PositionGetTicket(i); if(!t||!PositionSelectByTicket(t)) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+         if((ulong)PositionGetInteger(POSITION_MAGIC)!=(ulong)MagicNumber) continue;
+         int pt2=(int)PositionGetInteger(POSITION_TYPE);
+         bool isOpp=(direction==1&&pt2==POSITION_TYPE_SELL)||(direction==-1&&pt2==POSITION_TYPE_BUY);
+         if(!isOpp) continue;
+         if(GetTrackedTpBucket(t)==0) { Log("🏃 Runner #"+IntegerToString((int)t)+" exempt"); continue; }
+         trade.PositionClose(t);
+         Log("Closed opposite #"+IntegerToString((int)t));
+      }
+   }
+
+   // Count existing EA positions
+   int ex=0;
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong t=PositionGetTicket(i);
+      if(t>0&&PositionSelectByTicket(t)&&PositionGetString(POSITION_SYMBOL)==_Symbol
+         &&(ulong)PositionGetInteger(POSITION_MAGIC)==(ulong)MagicNumber) ex++;
+   }
+   int slots=MathMin(NumberOfPositions, MathMax(0, MaxPositions-ex));
+   if(slots<=0) { Log("⛔ MaxPositions reached"); return; }
+
+   // Distribute across TP levels — always keep 1 runner
+   int toClose = MathMax(0, slots-1);
+   int tp1Count=0, tp2Count=0, tp3Count=0, c1=0, c2=0, c3=0;
+   if(toClose>=1) tp1Count=1;
+   if(toClose>=2) tp2Count=1;
+   if(toClose>=3) tp3Count=1;
+
+   for(int pos=0; pos<slots && g_pendingCount<200; pos++)
+   {
+      double aT=0; int tB=0; string bk="RUNNER";
+      if(ScaleOutMultiTP)
+      {
+         if(c1<tp1Count)      { aT=tp1; tB=1; bk="TP1"; c1++; }
+         else if(c2<tp2Count) { aT=tp2; tB=2; bk="TP2"; c2++; }
+         else if(c3<tp3Count) { aT=tp3; tB=3; bk="TP3"; c3++; }
+         else                 { aT=0;   tB=0; bk="RUNNER"; }
+      }
+      else { aT=tp3; tB=3; bk="TP3"; }
+      int idx=g_pendingCount++;
+      g_pendingQueue[idx].direction  = direction;
+      g_pendingQueue[idx].sl         = sl;
+      g_pendingQueue[idx].assignedTP = aT;
+      g_pendingQueue[idx].tpBucket   = tB;
+      g_pendingQueue[idx].bucket     = bk;
+      g_pendingQueue[idx].lot        = lot;
+      g_pendingQueue[idx].engTag     = " [ST-FIB]";
+      g_pendingQueue[idx].createdBar = g_barCount;
+   }
+   Log("📋 Queued "+IntegerToString(slots)+" positions [ST-FIB]");
+   g_lastOpenMs  = GetTickCount()-HumanDelay_MaxMs;
+   g_nextDelayMs = HumanDelay_MinMs + MathRand()%(MathMax(1,HumanDelay_MaxMs-HumanDelay_MinMs)+1);
+}
+
+void OpenOneFromQueue()
+{
+   if(g_pendingCount<=0) return;
+   int ex=0;
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong t=PositionGetTicket(i);
+      if(t>0&&PositionSelectByTicket(t)&&PositionGetString(POSITION_SYMBOL)==_Symbol
+         &&(ulong)PositionGetInteger(POSITION_MAGIC)==(ulong)MagicNumber) ex++;
+   }
+   if(ex>=MaxPositions) { Log("⛔ MaxPos — clearing queue"); g_pendingCount=0; return; }
+
+   PendingPosition p=g_pendingQueue[0];
+   for(int i=0; i<g_pendingCount-1; i++) g_pendingQueue[i]=g_pendingQueue[i+1];
+   g_pendingCount--;
+
+   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double pip = ScaledPip();
+   double mn  = GetMinStop();
+   double bp  = (p.direction==1) ? SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+                                 : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   // TP from queue — calculated at signal time
+   double nTP = p.assignedTP;
+
+   // SL: recalculate fresh from fill price
+   double nSL=0, sdFresh=0;
+   if(UseATRBasedSL) { double a=GetATRSlDist(); sdFresh=(a>0)?a:MathMax(SL_Points*pip,mn); }
+   else sdFresh=(SL_Points>0)?MathMax(SL_Points*pip,mn):0;
+   if(sdFresh>0)
+      nSL=(p.direction==1)?NormalizeDouble(bp-sdFresh,dg):NormalizeDouble(bp+sdFresh,dg);
+   else
+   {
+      double vsl=(VirtualSL_Points>0)?VirtualSL_Points*GetPointsize():MathMax(mn+ScaledPip(),mn);
+      vsl=MathMax(vsl,mn+ScaledPip());
+      nSL=(p.direction==1)?NormalizeDouble(bp-vsl,dg):NormalizeDouble(bp+vsl,dg);
+      Log(StringFormat("📌 SL recalc at fill: %.5f [VirtualSL=%.1fpts]", nSL, vsl/GetPointsize()));
+   }
+
+   // Validate SL
+   if(nSL>0)
+   {
+      if(p.direction==1  && nSL>=bp)    { Log("⛔ BUY SL above entry — aborting");  return; }
+      if(p.direction==-1 && nSL<=bp)    { Log("⛔ SELL SL below entry — aborting"); return; }
+      if(p.direction==1  && nSL>=bp-mn) { Log("⛔ BUY SL too close"); return; }
+      if(p.direction==-1 && nSL<=bp+mn) { Log("⛔ SELL SL too close"); return; }
+   }
+
+   // Validate TP — switch to runner if inverted
+   if(nTP>0)
+   {
+      if(p.direction==1  && nTP<=bp+mn) { Log("⛔ BUY TP below entry — using RUNNER");  nTP=0; }
+      if(p.direction==-1 && nTP>=bp-mn) { Log("⛔ SELL TP above entry — using RUNNER"); nTP=0; }
+   }
+
+   double pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   int    jit=MathRand()%3;
+   double jp=NormalizeDouble(bp+(p.direction==1?jit*pt:-jit*pt),dg);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFilling(GetFill());
+   string cmt="LinerX V9.0 "+p.bucket;
+   bool ok=(p.direction==1)?trade.PositionOpen(_Symbol,ORDER_TYPE_BUY, p.lot,jp,nSL,nTP,cmt)
+                           :trade.PositionOpen(_Symbol,ORDER_TYPE_SELL,p.lot,jp,nSL,nTP,cmt);
+   if(ok)
+   {
+      ulong tk=trade.ResultOrder();
+      if(tk>0 && PositionSelectByTicket(tk) && g_openTradeCount<200)
+      {
+         int idx=g_openTradeCount++;
+         double op=PositionGetDouble(POSITION_PRICE_OPEN);
+         g_openTrades[idx].ticket=tk;
+         g_openTrades[idx].openPrice=op;
+         g_openTrades[idx].originalLots=p.lot;
+         g_openTrades[idx].direction=p.direction;
+         g_openTrades[idx].slPrice=nSL;
+         g_openTrades[idx].assignedTP=nTP;
+         g_openTrades[idx].tpBucket=p.tpBucket;
+         Log("✅ "+cmt+" #"+IntegerToString((int)tk)+" @"+DoubleToString(op,dg)+
+             (nSL>0?" SL="+DoubleToString(nSL,dg)+(UseATRBasedSL?" [ATR]":" [Fx]"):" SL=NONE")+
+             (nTP>0?" TP="+DoubleToString(nTP,dg):" RUNNER"));
+      }
+   }
+   else Log("❌ Open FAILED err="+IntegerToString(GetLastError()));
+}
+
+void ProcessQueue()
+{
+   if(g_pendingCount<=0) return;
+   if(!UseHumanDelay) { while(g_pendingCount>0) OpenOneFromQueue(); return; }
+   uint now=GetTickCount();
+   if(now-g_lastOpenMs < g_nextDelayMs) return;
+   for(int b=0; b<2 && g_pendingCount>0; b++)
+   { OpenOneFromQueue(); g_lastOpenMs=now; }
+   g_nextDelayMs=HumanDelay_MinMs+MathRand()%(MathMax(1,HumanDelay_MaxMs-HumanDelay_MinMs)+1);
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE TRADE — TP hit monitoring                                 |
+//+------------------------------------------------------------------+
+void ManageTrade()
+{
+   for(int i=g_openTradeCount-1; i>=0; i--)
+   {
+      if(!PositionSelectByTicket(g_openTrades[i].ticket))
+      { for(int j=i;j<g_openTradeCount-1;j++) g_openTrades[j]=g_openTrades[j+1]; g_openTradeCount--; continue; }
+      if(g_openTrades[i].tpBucket==0 || g_openTrades[i].assignedTP<=0) continue;
+      if(!PositionSelectByTicket(g_openTrades[i].ticket)) continue;
+      double brokerTP=PositionGetDouble(POSITION_TP);
+      if(brokerTP>0 && MathAbs(brokerTP-g_openTrades[i].assignedTP)>ScaledPip()) continue;
+      double cp=PositionGetDouble(POSITION_PRICE_CURRENT);
+      int    dir=g_openTrades[i].direction;
+      bool   hit=(dir==1)?(cp>=g_openTrades[i].assignedTP):(cp<=g_openTrades[i].assignedTP);
+      if(hit)
+      {
+         trade.SetTypeFilling(GetFill());
+         if(trade.PositionClose(g_openTrades[i].ticket))
+         {
+            Log("🎯 TP"+IntegerToString(g_openTrades[i].tpBucket)+" hit #"+IntegerToString((int)g_openTrades[i].ticket));
+            for(int j=i;j<g_openTradeCount-1;j++) g_openTrades[j]=g_openTrades[j+1];
+            g_openTradeCount--;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| UNIFIED TRADE MANAGER — BE + candle trail                        |
+//+------------------------------------------------------------------+
+double GetUnifiedR(ulong t, double op, double rd, int d)
+{
+   if(!PositionSelectByTicket(t)||rd<=0) return 0;
+   double cp=PositionGetDouble(POSITION_PRICE_CURRENT);
+   return ((d==POSITION_TYPE_BUY)?(cp-op):(op-cp))/rd;
+}
+
+double GetRiskDistance(ulong t, double op, int d)
+{
+   if(!PositionSelectByTicket(t)) return 0;
+   double sl=PositionGetDouble(POSITION_SL);
+   if(sl>0) return MathAbs(op-sl);
+   if(VirtualSL_Points>0) return VirtualSL_Points*GetPointsize();
+   if(SL_Points>0) return SL_Points*GetPointsize();
+   return 0;
+}
+
+void UnifiedScanAndEnroll()
+{
+   int dg=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong tk=PositionGetTicket(i); if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      ulong mg=(ulong)PositionGetInteger(POSITION_MAGIC);
+      bool isEA=(mg==MagicNumber); if(!isEA) continue;
+      bool found=false;
+      for(int j=0; j<g_unifiedPosCount; j++)
+      {
+         if(g_unifiedPositions[j].ticket==tk)
+         {
+            found=true;
+            double cp=PositionGetDouble(POSITION_PRICE_CURRENT);
+            if(g_unifiedPositions[j].direction==POSITION_TYPE_BUY)
+            { if(cp>g_unifiedPositions[j].highWaterMark) g_unifiedPositions[j].highWaterMark=cp; }
+            else
+            { if(cp<g_unifiedPositions[j].highWaterMark) g_unifiedPositions[j].highWaterMark=cp; }
+            break;
+         }
+      }
+      if(found) continue;
+      int d2=(int)PositionGetInteger(POSITION_TYPE);
+      if(d2!=POSITION_TYPE_BUY&&d2!=POSITION_TYPE_SELL) continue;
+      double op=PositionGetDouble(POSITION_PRICE_OPEN);
+      double rd=GetRiskDistance(tk,op,d2);
+      double cp=PositionGetDouble(POSITION_PRICE_CURRENT);
+      ArrayResize(g_unifiedPositions, g_unifiedPosCount+1);
+      g_unifiedPositions[g_unifiedPosCount].ticket        = tk;
+      g_unifiedPositions[g_unifiedPosCount].direction     = d2;
+      g_unifiedPositions[g_unifiedPosCount].openPrice     = op;
+      g_unifiedPositions[g_unifiedPosCount].riskDistance  = rd;
+      g_unifiedPositions[g_unifiedPosCount].highWaterMark = cp;
+      g_unifiedPositions[g_unifiedPosCount].beDone        = false;
+      g_unifiedPositions[g_unifiedPosCount].isEATrade     = isEA;
+      g_unifiedPosCount++;
+      // Late enrollment
+      if(rd>0) { double r=GetUnifiedR(tk,op,rd,d2); if(r>=TriggerBE_R) g_unifiedPositions[g_unifiedPosCount-1].beDone=true; }
+      // Apply ATR SL if missing
+      if(UseATRBasedSL && PositionGetDouble(POSITION_SL)==0)
+      { double a=GetATRSlDist(); if(a>0)
+        { double as=(d2==POSITION_TYPE_BUY)?NormalizeDouble(op-a,dg):NormalizeDouble(op+a,dg);
+          if(trade.PositionModify(tk,as,PositionGetDouble(POSITION_TP)))
+             g_unifiedPositions[g_unifiedPosCount-1].riskDistance=a; }}
+   }
+   // Remove closed positions
+   for(int i=g_unifiedPosCount-1; i>=0; i--)
+   {
+      if(!PositionSelectByTicket(g_unifiedPositions[i].ticket))
+      { for(int j=i;j<g_unifiedPosCount-1;j++) g_unifiedPositions[j]=g_unifiedPositions[j+1];
+        g_unifiedPosCount--;
+        ArrayResize(g_unifiedPositions, g_unifiedPosCount); }
+   }
+}
+
+void UnifiedManagePositions()
+{
+   if(!EnableTradeManager) return;
+   double pip  = ScaledPip();
+   int    dg   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double cush = BECushionPoints*pip;
+   double minSt= GetMinStop();
+   double bar1Open  = iOpen (_Symbol,PERIOD_CURRENT,1);
+   double bar1Close = iClose(_Symbol,PERIOD_CURRENT,1);
+   double bar1Low   = iLow  (_Symbol,PERIOD_CURRENT,1);
+   double bar1High  = iHigh (_Symbol,PERIOD_CURRENT,1);
+   bool   bar1Bull  = (bar1Close > bar1Open);
+   bool   bar1Bear  = (bar1Close < bar1Open);
+   int beCount=0; double beAvgR=0; double beSL=0;
+   int trailBuyCount=0; double trailBuyNewSL=0;
+   int trailSellCount=0; double trailSellNewSL=0;
+   int bePassedCount=0;
+
+   for(int i=0; i<g_unifiedPosCount; i++)
+   {
+      if(!PositionSelectByTicket(g_unifiedPositions[i].ticket)) continue;
+      int    d2  = g_unifiedPositions[i].direction;
+      double op  = g_unifiedPositions[i].openPrice;
+      double cp  = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double cSL = PositionGetDouble(POSITION_SL);
+      double cTP = PositionGetDouble(POSITION_TP);
+      if(d2==POSITION_TYPE_BUY){if(cp>g_unifiedPositions[i].highWaterMark)g_unifiedPositions[i].highWaterMark=cp;}
+      else                     {if(cp<g_unifiedPositions[i].highWaterMark)g_unifiedPositions[i].highWaterMark=cp;}
+
+      if(!g_unifiedPositions[i].beDone)
+      {
+         if(cSL>0){double liveDist=MathAbs(op-cSL);if(liveDist>0)g_unifiedPositions[i].riskDistance=liveDist;}
+         double rd=g_unifiedPositions[i].riskDistance; if(rd<=0) continue;
+         double r=GetUnifiedR(g_unifiedPositions[i].ticket,op,rd,d2);
+         if(r>=TriggerBE_R)
+         {
+            double be=(d2==POSITION_TYPE_BUY)?NormalizeDouble(op+cush,dg):NormalizeDouble(op-cush,dg);
+            bool improving=(d2==POSITION_TYPE_BUY)?(be>cSL+pip):(be<cSL-pip);
+            if(improving && MathAbs(cp-be)>=minSt)
+            { if(trade.PositionModify(g_unifiedPositions[i].ticket,be,cTP))
+              { g_unifiedPositions[i].beDone=true; beCount++; beAvgR+=r; beSL=be; } }
+            else
+            { g_unifiedPositions[i].beDone=true; bePassedCount++; beAvgR+=r; }
+         }
+         continue;
+      }
+
+      if(!UseCandleTrail || cSL<=0) continue;
+      if(d2==POSITION_TYPE_BUY)
+      {
+         if(!bar1Bull) continue;
+         double newSL=NormalizeDouble(bar1Low,dg);
+         if(newSL<=cSL+pip) continue;
+         if(newSL<=op)      continue;
+         if(cp-newSL<minSt) continue;
+         if(trade.PositionModify(g_unifiedPositions[i].ticket,newSL,cTP))
+         { trailBuyCount++; trailBuyNewSL=newSL; }
+      }
+      else
+      {
+         if(!bar1Bear) continue;
+         double newSL=NormalizeDouble(bar1High,dg);
+         if(newSL>=cSL-pip) continue;
+         if(newSL>=op)      continue;
+         if(newSL-cp<minSt) continue;
+         if(trade.PositionModify(g_unifiedPositions[i].ticket,newSL,cTP))
+         { trailSellCount++; trailSellNewSL=newSL; }
+      }
+   }
+   if(beCount>0)
+      Log(StringFormat("🛡️ BE | %d trade%s | avg R=%.2f | SL→%.5f",
+          beCount, beCount>1?"s":"", beAvgR/beCount, beSL));
+   if(bePassedCount>0)
+      Log(StringFormat("🛡️ BE PASSED | %d trade%s already protected | avg R=%.2f",
+          bePassedCount, bePassedCount>1?"s":"", beAvgR/bePassedCount));
+   if(trailBuyCount>0)
+      Log(StringFormat("📉 TRAIL BUY | %d trade%s | SL→%.5f",
+          trailBuyCount, trailBuyCount>1?"s":"", trailBuyNewSL));
+   if(trailSellCount>0)
+      Log(StringFormat("📈 TRAIL SELL | %d trade%s | SL→%.5f",
+          trailSellCount, trailSellCount>1?"s":"", trailSellNewSL));
+}
+
+//+------------------------------------------------------------------+
+//| CONSOLIDATION CHECK — direct entry on wick to RevL/RevH          |
+//+------------------------------------------------------------------+
+void Consol_Check()
+{
+   if(!UseConsolidation || !g_inConsol) return;
+   if(!g_fibValid) return;
+
+   double hi1 = iHigh (_Symbol, PERIOD_CURRENT, 1);
+   double lo1 = iLow  (_Symbol, PERIOD_CURRENT, 1);
+   double cl1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double buf = Fib_PDBuffer * ScaledPip() * 3.0;
+
+   // BUY: wick touches RevL or FLIP-1, close above RevL zone
+   if(g_fRevL > 0)
+   {
+      bool wickAtRevL  = (lo1 <= g_fRevL + buf);
+      bool closeAbove  = (cl1 > g_fRevL - buf);
+      if(wickAtRevL && closeAbove)
+      {
+         string msg=StringFormat("🟢 CONSOL BUY | wick=%.5f ≤ RevL=%.5f | cl=%.5f", lo1, g_fRevL, cl1);
+         Log(msg); Notify(msg, true, true);
+         double ep=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double sl,tp1,tp2,tp3;
+         CalcTP(1, ep, sl, tp1, tp2, tp3);
+         if(EAMode==EA_MODE_TRADE) OpenPositions(1, cl1, sl, tp1, tp2, tp3);
+         return;
+      }
+   }
+   if(g_fFlip1L > 0)
+   {
+      bool wickAtFlip1 = (lo1 <= g_fFlip1L + buf);
+      bool closeAbove  = (cl1 > g_fFlip1L - buf);
+      if(wickAtFlip1 && closeAbove)
+      {
+         string msg=StringFormat("🟢 CONSOL BUY FLIP-1 | wick=%.5f ≤ FLIP1L=%.5f | cl=%.5f", lo1, g_fFlip1L, cl1);
+         Log(msg); Notify(msg, true, true);
+         double ep=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double sl,tp1,tp2,tp3;
+         CalcTP(1, ep, sl, tp1, tp2, tp3);
+         if(EAMode==EA_MODE_TRADE) OpenPositions(1, cl1, sl, tp1, tp2, tp3);
+         return;
+      }
+   }
+
+   // SELL: wick touches RevH or FLIP1H, close below RevH zone
+   if(g_fRevH > 0)
+   {
+      bool wickAtRevH  = (hi1 >= g_fRevH - buf);
+      bool closeBelow  = (cl1 < g_fRevH + buf);
+      if(wickAtRevH && closeBelow)
+      {
+         string msg=StringFormat("🔴 CONSOL SELL | wick=%.5f ≥ RevH=%.5f | cl=%.5f", hi1, g_fRevH, cl1);
+         Log(msg); Notify(msg, true, true);
+         double ep=SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double sl,tp1,tp2,tp3;
+         CalcTP(-1, ep, sl, tp1, tp2, tp3);
+         if(EAMode==EA_MODE_TRADE) OpenPositions(-1, cl1, sl, tp1, tp2, tp3);
+         return;
+      }
+   }
+   if(g_fFlip1H > 0)
+   {
+      bool wickAtFlip1H = (hi1 >= g_fFlip1H - buf);
+      bool closeBelow   = (cl1 < g_fFlip1H + buf);
+      if(wickAtFlip1H && closeBelow)
+      {
+         string msg=StringFormat("🔴 CONSOL SELL FLIP1H | wick=%.5f ≥ FLIP1H=%.5f | cl=%.5f", hi1, g_fFlip1H, cl1);
+         Log(msg); Notify(msg, true, true);
+         double ep=SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double sl,tp1,tp2,tp3;
+         CalcTP(-1, ep, sl, tp1, tp2, tp3);
+         if(EAMode==EA_MODE_TRADE) OpenPositions(-1, cl1, sl, tp1, tp2, tp3);
+         return;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ADR CONSOLIDATION CHECK                                          |
+//+------------------------------------------------------------------+
+void ADR_Check()
+{
+   if(!UseConsolidation) return;
+   int dTotal = iBars(_Symbol, PERIOD_D1);
+   if(dTotal < ADR_Period+2) { g_inConsol=false; return; }
+   double totalRange=0;
+   for(int i=1; i<=ADR_Period; i++)
+      totalRange += iHigh(_Symbol,PERIOD_D1,i) - iLow(_Symbol,PERIOD_D1,i);
+   g_adrValue = totalRange / ADR_Period;
+
+   // Get M5 bars today to compute intraday range
+   int m5PerDay = 288; // 24h * 60min / 5min
+   int barsToday = MathMin(m5PerDay, iBars(_Symbol, PERIOD_CURRENT)-1);
+   double todayHi=-DBL_MAX, todayLo=DBL_MAX;
+   for(int i=0; i<barsToday; i++)
+   {
+      double h=iHigh(_Symbol,PERIOD_CURRENT,i);
+      double l=iLow (_Symbol,PERIOD_CURRENT,i);
+      if(h>todayHi) todayHi=h;
+      if(l<todayLo) todayLo=l;
+   }
+   double todayRange = (todayHi>todayLo && todayHi>-DBL_MAX) ? todayHi-todayLo : 0;
+   bool contracted = (g_adrValue>0 && todayRange < g_adrValue*Consol_Threshold && barsToday>=48);
+
+   if(contracted != g_inConsol)
+   {
+      g_inConsol = contracted;
+      if(contracted)
+         Log(StringFormat("📦 CONSOLIDATION | ADR=%.0fpts today=%.0fpts(%.0f%%)",
+             g_adrValue/ScaledPip(), todayRange/ScaledPip(), todayRange/g_adrValue*100.0));
+      else
+         Log("📦 CONSOLIDATION CLEARED | price expanding");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| EXECUTE SIGNAL — clean entry gate                                |
+//+------------------------------------------------------------------+
+void ExecuteSignal(int direction)
+{
+   // Bar guard — prevent duplicate execution same bar same direction
+   static int lastExecBarBuy  = 0;
+   static int lastExecBarSell = 0;
+   if(direction== 1 && g_barCount==lastExecBarBuy)
+   { Log("⏭️ ExecuteSignal BUY skipped — already executed bar "+IntegerToString(g_barCount)); return; }
+   if(direction==-1 && g_barCount==lastExecBarSell)
+   { Log("⏭️ ExecuteSignal SELL skipped — already executed bar "+IntegerToString(g_barCount)); return; }
+   if(direction== 1) lastExecBarBuy  = g_barCount;
+   if(direction==-1) lastExecBarSell = g_barCount;
+
+   if(!g_fibValid)
+   { Log("❌ ExecuteSignal: no fib anchor"); return; }
+
+   int    dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double ep  = (direction==1) ? SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+                               : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double pip = ScaledPip();
+   double buf = Fib_PDBuffer * pip;
+
+   // ── PO3 check: skip zone/SR gate, arm fires the entry ─────────
+   bool isPO3 = (direction==1 && g_po3BuyArmed) || (direction==-1 && g_po3SellArmed);
+   if(isPO3)
+   {
+      string msg=StringFormat("%s %s PO3 ENTRY | @%.5f | RevL=%.5f RevH=%.5f",
+                  direction==1?"🟢":"🔴", direction==1?"BUY":"SELL", ep, g_fRevL, g_fRevH);
+      Log(msg); Notify(msg, true, true);
+      double sl,tp1,tp2,tp3;
+      CalcTP(direction, ep, sl, tp1, tp2, tp3);
+      if(EAMode==EA_MODE_TRADE) OpenPositions(direction, ep, sl, tp1, tp2, tp3);
+      if(direction==1)  { g_po3BuyArmed=false;  }
+      else              { g_po3SellArmed=false; }
+      return;
+   }
+
+   // ── Zone check ─────────────────────────────────────────────────
+   bool inDiscountZone = (ep >= g_f0 - buf && ep <= g_f0382 + buf);
+   bool inPremiumZone  = (ep >= g_f0618 - buf && ep <= g_f1 + buf);
+   bool nearRevL       = (g_fRevL>0  && MathAbs(ep-g_fRevL)  <= buf*3);
+   bool nearFlip1L     = (g_fFlip1L>0 && MathAbs(ep-g_fFlip1L) <= buf*3);
+   bool nearRevH       = (g_fRevH>0  && MathAbs(ep-g_fRevH)  <= buf*3);
+   bool nearFlip1H     = (g_fFlip1H>0 && MathAbs(ep-g_fFlip1H) <= buf*3);
+   // f0382 as SELL resistance: discount-zone-ceiling rejection when ST flips down
+   bool atF0382Reject  = (g_f0382>0 && ep >= g_f0382 - buf*3 && ep <= g_f0382 + buf*3);
+   // f0618 as BUY support: premium-zone-floor bounce when ST flips up
+   bool atF0618Bounce  = (g_f0618>0 && ep >= g_f0618 - buf*3 && ep <= g_f0618 + buf*3);
+
+   // Check role-flip levels
+   bool atRoleFlipBuy  = false;
+   bool atRoleFlipSell = false;
+   for(int i=0; i<g_flippedCount; i++)
+   {
+      if(g_flippedLevels[i]<=0) continue;
+      if(direction==1  && g_flippedDir[i]==-1 && MathAbs(ep-g_flippedLevels[i])<=buf*3)
+         atRoleFlipBuy = true;
+      if(direction==-1 && g_flippedDir[i]==+1 && MathAbs(ep-g_flippedLevels[i])<=buf*3)
+         atRoleFlipSell= true;
+   }
+
+   bool isCascadeLevel = false;
+   bool zoneOK         = false;
+   string zoneTag      = "";
+
+   if(direction==1)
+   {
+      // During cascade DOWN (g_waitFloor), the floor is still breaking — block counter-trend BUY
+      // in the regular discount zone. Only cascade-specific BUY levels (RevL, role-flips) allowed.
+      if(inDiscountZone && !g_waitFloor) { zoneOK=true; zoneTag="DISCOUNT"; }
+      if(nearRevL)       { zoneOK=true; zoneTag="RevL"; isCascadeLevel=true; }
+      if(nearFlip1L)     { zoneOK=true; zoneTag="FLIP-1"; isCascadeLevel=true; }
+      // Block ROLE-FLIP-BUY during cascade DOWN — bearish structure means old BUY flips are invalidated
+      if(atRoleFlipBuy && !g_waitFloor)  { zoneOK=true; zoneTag="ROLE-FLIP-BUY"; isCascadeLevel=true; }
+      // F0618 bounce: blocked during any active cascade AND must not overwrite a cascade-level match
+      if(atF0618Bounce && !g_waitCeil && !g_waitFloor && !isCascadeLevel)
+         { zoneOK=true; zoneTag="F0618-SUPP"; }
+      // Cascade UP: with-trend BUY just above/below f1 (tight pullback to the breakout level)
+      if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1-buf && ep<g_f1+(g_fRevH-g_f1)*0.5)
+         { zoneOK=true; zoneTag="CASCADE-PULLBACK"; isCascadeLevel=true; }
+      // Cascade DOWN: lower half of the extension range (RevL to midpoint below f0) — reversal BUY
+      if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0-(g_f0-g_fRevL)*0.5 && ep>=g_fRevL-buf*3)
+         { zoneOK=true; zoneTag="CASCADE-LOWER"; isCascadeLevel=true; }
+   }
+   else
+   {
+      // During cascade UP (g_waitCeil), the ceiling is still breaking — block counter-trend SELL
+      // in the regular premium zone. Only cascade-specific SELL levels (RevH, role-flips) allowed.
+      if(inPremiumZone && !g_waitCeil)  { zoneOK=true; zoneTag="PREMIUM"; }
+      if(nearRevH)        { zoneOK=true; zoneTag="RevH"; isCascadeLevel=true; }
+      if(nearFlip1H)      { zoneOK=true; zoneTag="FLIP1H"; isCascadeLevel=true; }
+      // Block ROLE-FLIP-SELL during cascade UP — bullish structure means old SELL flips are invalidated
+      if(atRoleFlipSell && !g_waitCeil)  { zoneOK=true; zoneTag="ROLE-FLIP-SELL"; isCascadeLevel=true; }
+      // F0382 rejection: blocked during any active cascade AND must not overwrite a cascade-level match
+      if(atF0382Reject && !g_waitFloor && !g_waitCeil && !isCascadeLevel)
+         { zoneOK=true; zoneTag="F0382-REJ"; }
+      // Cascade DOWN: with-trend SELL in upper half of RevL→f0 (bounce into the breakdown zone)
+      if(g_waitFloor && g_fRevL<g_f0 && ep<=g_f0+buf && ep>g_f0-(g_f0-g_fRevL)*0.5)
+         { zoneOK=true; zoneTag="CASCADE-BOUNCE"; isCascadeLevel=true; }
+      // Cascade UP: upper half of the extension range (midpoint between f1 and RevH) — reversal SELL
+      if(g_waitCeil && g_fRevH>g_f1 && ep>=g_f1+(g_fRevH-g_f1)*0.5 && ep<=g_fRevH+buf*3)
+         { zoneOK=true; zoneTag="CASCADE-UPPER"; isCascadeLevel=true; }
+   }
+
+   if(!zoneOK)
+   {
+      string cascadeNote = (g_waitFloor&&direction==1)?" [CASCADE-DOWN: discount BUY suspended]":
+                           (g_waitCeil &&direction==-1)?" [CASCADE-UP: premium SELL suspended]":"";
+      Log(StringFormat("🚫 %s BLOCKED | price %.5f not in valid zone | f0=%.5f f0382=%.5f f0618=%.5f f1=%.5f%s",
+          direction==1?"BUY":"SELL", ep, g_f0, g_f0382, g_f0618, g_f1, cascadeNote));
+      return;
+   }
+
+   // ── SR check ─────────────────────────────────────────────────────
+   // Skip for: cascade/role-flip levels (isCascadeLevel), and pure zone trades
+   // (PREMIUM/DISCOUNT) where the fib zone itself is the confluence.
+   bool needsSRCheck = InpRequireSR && !isCascadeLevel
+                       && zoneTag!="PREMIUM" && zoneTag!="DISCOUNT";
+   if(needsSRCheck)
+   {
+      if(!SR_HasConfluence(direction, ep))
+      {
+         Log(StringFormat("⏳ %s %s | no SR confluence @ %.5f | skipping entry",
+             direction==1?"BUY":"SELL", zoneTag, ep));
+         return;
+      }
+   }
+
+   // ── Entry passed all checks ────────────────────────────────────
+   // PREMIUM SELL confirms bearish structure → clear all bullish role-flip levels (old resistance ≠ support)
+   // DISCOUNT BUY confirms bullish structure → clear all bearish role-flip levels (old support ≠ resistance)
+   if(direction == -1 && zoneTag == "PREMIUM")
+   {
+      int cleared = 0;
+      for(int i = 0; i < g_flippedCount; i++)
+         if(g_flippedDir[i] == -1) { g_flippedLevels[i] = 0; cleared++; }
+      if(cleared > 0) Log(StringFormat("🔄 PREMIUM SELL: cleared %d bullish role-flip level(s)", cleared));
+   }
+   else if(direction == 1 && zoneTag == "DISCOUNT")
+   {
+      int cleared = 0;
+      for(int i = 0; i < g_flippedCount; i++)
+         if(g_flippedDir[i] == +1) { g_flippedLevels[i] = 0; cleared++; }
+      if(cleared > 0) Log(StringFormat("🔄 DISCOUNT BUY: cleared %d bearish role-flip level(s)", cleared));
+   }
+
+   double sl,tp1,tp2,tp3;
+   CalcTP(direction, ep, sl, tp1, tp2, tp3);
+   string emoji=(direction==1)?"🟢":"🔴";
+   string dirStr=(direction==1)?"BUY":"SELL";
+   string msg=StringFormat("%s %s | %s | @%.5f | SL=%.5f | TP1=%.5f TP2=%.5f TP3=%.5f",
+              emoji, dirStr, zoneTag, ep, sl, tp1, tp2, tp3);
+   Log(msg); Notify(msg, true, true);
+   if(EAMode==EA_MODE_TRADE) OpenPositions(direction, ep, sl, tp1, tp2, tp3);
+}
+
+//+------------------------------------------------------------------+
+//| DRAW FIB OBJECTS ON CHART                                        |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| STATE PERSISTENCE                                                |
+//+------------------------------------------------------------------+
+#define STATE_VER 1
+
+string StateFile()
+{
+   string tf=EnumToString(PERIOD_CURRENT); StringReplace(tf,":","_");
+   return "LinerX_v9_"+_Symbol+"_"+tf+"_"+IntegerToString(MagicNumber)+".state";
+}
+
+void SaveStateFile()
+{
+   int h=FileOpen(StateFile(),FILE_WRITE|FILE_BIN|FILE_COMMON);
+   if(h==INVALID_HANDLE) return;
+   FileWriteInteger(h, STATE_VER);
+   FileWriteLong(h, (long)TimeCurrent());
+   // SuperTrend state
+   FileWriteDouble(h, g_st_up);  FileWriteDouble(h, g_st_dn);
+   FileWriteDouble(h, g_st_up_prev); FileWriteDouble(h, g_st_dn_prev);
+   FileWriteInteger(h, g_st_trend);
+   FileWriteInteger(h, g_barCount);
+   // Fib anchor
+   FileWriteInteger(h, g_fibValid?1:0);
+   FileWriteDouble(h, g_f0); FileWriteDouble(h, g_f1);
+   // Cascade state
+   FileWriteInteger(h, g_waitFloor?1:0);
+   FileWriteInteger(h, g_waitCeil?1:0);
+   FileWriteDouble(h, g_lockedFloor);
+   FileWriteDouble(h, g_lockedCeil);
+   // Role-flip array
+   FileWriteInteger(h, g_flippedCount);
+   for(int i=0; i<g_flippedCount; i++)
+   { FileWriteDouble(h, g_flippedLevels[i]); FileWriteInteger(h, g_flippedDir[i]); }
+   // PO3 state
+   FileWriteInteger(h, g_po3BuyArmed?1:0);
+   FileWriteInteger(h, g_po3BuyArmedBar);
+   FileWriteInteger(h, g_po3SellArmed?1:0);
+   FileWriteInteger(h, g_po3SellArmedBar);
+   // Consolidation
+   FileWriteInteger(h, g_inConsol?1:0);
+   FileWriteDouble(h, g_adrValue);
+   // Open trades
+   FileWriteInteger(h, g_openTradeCount);
+   for(int i=0; i<g_openTradeCount; i++)
+   { FileWriteLong(h,(long)g_openTrades[i].ticket);
+     FileWriteDouble(h,g_openTrades[i].openPrice);
+     FileWriteDouble(h,g_openTrades[i].originalLots);
+     FileWriteInteger(h,g_openTrades[i].direction);
+     FileWriteDouble(h,g_openTrades[i].slPrice);
+     FileWriteDouble(h,g_openTrades[i].assignedTP);
+     FileWriteInteger(h,g_openTrades[i].tpBucket); }
+   FileClose(h);
+   Log("💾 State saved | ST="+IntegerToString(g_st_trend)+
+       " fib="+(g_fibValid?"VALID":"NONE")+
+       " waitFloor="+(g_waitFloor?"YES":"NO")+
+       " waitCeil="+(g_waitCeil?"YES":"NO")+
+       " flips="+IntegerToString(g_flippedCount)+
+       " consol="+(g_inConsol?"YES":"NO"));
+}
+
+void LoadStateFile()
+{
+   string fn=StateFile();
+   if(!FileIsExist(fn, FILE_COMMON)) return;
+   int h=FileOpen(fn, FILE_READ|FILE_BIN|FILE_COMMON);
+   if(h==INVALID_HANDLE) return;
+   int fmt=FileReadInteger(h);
+   if(fmt!=STATE_VER)
+   { FileClose(h); FileDelete(fn,FILE_COMMON);
+     Print("⚠️ State version mismatch (got ",fmt,") expected ",STATE_VER," — fresh start");
+     return; }
+   datetime ts=(datetime)FileReadLong(h);
+   // ST state
+   g_st_up      = FileReadDouble(h);  g_st_dn      = FileReadDouble(h);
+   g_st_up_prev = FileReadDouble(h);  g_st_dn_prev = FileReadDouble(h);
+   g_st_trend   = FileReadInteger(h);
+   g_barCount   = FileReadInteger(h);
+   int cb=iBars(_Symbol,PERIOD_CURRENT);
+   if(g_barCount>0 && MathAbs(g_barCount-cb)>5000) g_barCount=cb;
+   // Fib anchor
+   bool fv=(FileReadInteger(h)==1);
+   double fL=FileReadDouble(h), fH=FileReadDouble(h);
+   if(fv && fH>fL) Fib_SetAnchor(fL, fH);
+   // Cascade state
+   g_waitFloor   = (FileReadInteger(h)==1);
+   g_waitCeil    = (FileReadInteger(h)==1);
+   g_lockedFloor = FileReadDouble(h);
+   g_lockedCeil  = FileReadDouble(h);
+   // Role-flip array
+   int fc=FileReadInteger(h); g_flippedCount=0;
+   for(int i=0; i<fc&&i<32; i++)
+   { g_flippedLevels[i]=FileReadDouble(h); g_flippedDir[i]=FileReadInteger(h); g_flippedCount++; }
+   // PO3 state
+   g_po3BuyArmed    = (FileReadInteger(h)==1);
+   g_po3BuyArmedBar =  FileReadInteger(h);
+   g_po3SellArmed   = (FileReadInteger(h)==1);
+   g_po3SellArmedBar=  FileReadInteger(h);
+   // Consolidation
+   g_inConsol = (FileReadInteger(h)==1);
+   g_adrValue = FileReadDouble(h);
+   // Open trades
+   int sC=FileReadInteger(h); g_openTradeCount=0;
+   for(int i=0; i<sC&&i<200; i++)
+   { ulong tk=(ulong)FileReadLong(h);
+     double op=FileReadDouble(h); double ol=FileReadDouble(h);
+     int d=FileReadInteger(h);   double sp=FileReadDouble(h);
+     double aT=FileReadDouble(h); int tB=FileReadInteger(h);
+     if(PositionSelectByTicket(tk))
+     { int idx=g_openTradeCount++;
+       g_openTrades[idx].ticket=tk;      g_openTrades[idx].openPrice=op;
+       g_openTrades[idx].originalLots=ol; g_openTrades[idx].direction=d;
+       g_openTrades[idx].slPrice=sp;     g_openTrades[idx].assignedTP=aT;
+       g_openTrades[idx].tpBucket=tB; }}
+   FileClose(h);
+   if(g_waitCeil)
+      Log(StringFormat("💾 State: CEILING SHIFT restored | lockedFloor=%.5f | RevH=%.5f", g_lockedFloor, g_fRevH));
+   if(g_waitFloor)
+      Log(StringFormat("💾 State: FLOOR SHIFT restored | lockedCeil=%.5f | RevL=%.5f", g_lockedCeil, g_fRevL));
+   if(g_flippedCount>0)
+      Log(StringFormat("💾 State: %d flipped levels restored", g_flippedCount));
+   Log("💾 State loaded | trades="+IntegerToString(g_openTradeCount)+
+       " ST="+IntegerToString(g_st_trend)+" fib="+(g_fibValid?"VALID":"NONE")+
+       " consol="+(g_inConsol?"YES":"NO"));
+}
+
+//+------------------------------------------------------------------+
+//| ONINIT                                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   MathSrand(GetTickCount());
+   Print("════ LinerX v9.1 FibST EA ════");
+
+   // Price scalar — maps broker "point" to a trader "pip" of meaningful size.
+   // XAUUSD uses 2 decimal places (point=0.01); 1 pip = $1 = 100 points → scalar=100.
+   // 3-digit pairs: scalar=10.  Standard 4/5-digit forex: scalar=1.
+   {
+      int dg2 = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      if     (dg2 <= 2) g_priceScalar = 100.0;
+      else if(dg2 == 3) g_priceScalar = 10.0;
+      else              g_priceScalar = 1.0;
+      Print(StringFormat("📐 Price scalar: %.0f | %s (%d digits, point=%.5f) — 1 pip = %.4f",
+            g_priceScalar, _Symbol, dg2, GetPointsize(), GetPointsize()*g_priceScalar));
+   }
+
+   // ATR handle
+   g_stATRHandle = iATR(_Symbol, PERIOD_CURRENT, ST_ATR_Periods);
+   if(g_stATRHandle==INVALID_HANDLE && ST_UseWilderATR)
+   { Print("ERROR: ST ATR handle failed"); return INIT_FAILED; }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetAsyncMode(false);
+
+   // Reset globals
+   g_st_up=0; g_st_dn=0; g_st_up_prev=0; g_st_dn_prev=0; g_st_trend=0;
+   g_barCount = iBars(_Symbol, PERIOD_CURRENT);
+   ZeroMemory(g_openTrades); g_openTradeCount=0;
+   g_pendingCount=0; g_lastOpenMs=0; g_nextDelayMs=0;
+   g_fibValid=false; g_fibRange=0;
+   g_f0=0; g_f1=0; g_f025=0; g_f0382=0; g_f05=0; g_f0618=0; g_f075=0;
+   g_fRevL=0; g_fRevH=0; g_fFlip1L=0; g_fFlip1H=0;
+   g_waitCeil=false; g_waitFloor=false; g_lockedFloor=0; g_lockedCeil=0;
+   g_flippedCount=0;
+   ArrayInitialize(g_flippedLevels,0); ArrayInitialize(g_flippedDir,0);
+   g_po3BuyArmed=false; g_po3SellArmed=false;
+   g_inConsol=false; g_adrValue=0;
+   g_srCount=0;
+   ArrayResize(g_unifiedPositions,0); g_unifiedPosCount=0;
+
+   // Load state (must come before backfill to avoid redundant backfill)
+   LoadStateFile();
+
+   // Backfill fib if not valid
+   if(!g_fibValid) Fib_Backfill();
+   else
+   {
+      Log("💾 Fib restored from state | 0="+DoubleToString(g_f0,_Digits)+
+          " 1="+DoubleToString(g_f1,_Digits)+
+          " RevL="+DoubleToString(g_fRevL,_Digits)+
+          " RevH="+DoubleToString(g_fRevH,_Digits));
+   }
+
+   // Backfill SR pivot levels from historical bars
+   SR_Backfill();
+
+   Print("════ V9.0 INIT COMPLETE ════");
+   Print("Mode      : ", EAMode==EA_MODE_TRADE?"TRADE":"SIGNAL");
+   Print("SuperTrend: mult=",ST_Multiplier," ATR=",ST_ATR_Periods);
+   Print("Fib HTF   : ",EnumToString(Fib_HTF));
+   Print("Fib Valid : ", g_fibValid?"YES — 0="+DoubleToString(g_f0,_Digits)+" 1="+DoubleToString(g_f1,_Digits):"NO");
+   Print("RequireSR : ", InpRequireSR?"YES":"NO");
+   Print("Consol    : ", UseConsolidation?"YES":"NO");
+   Print("ATR SL    : ", UseATRBasedSL?"YES x"+DoubleToString(SL_ATR_Mult,1):"NO");
+   Print("==========================================================");
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| ONDEINIT                                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   SaveStateFile();
+   if(g_stATRHandle!=INVALID_HANDLE) IndicatorRelease(g_stATRHandle);
+   ArrayFree(g_unifiedPositions);
+   // Remove chart objects
+   ObjectsDeleteAll(0, "LX_FIB_");
+   Print("LinerX v9.0 removed. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| ONTICK                                                           |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   ProcessQueue();
+   ManageTrade();
+
+   datetime cBar=iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(EnableTradeManager) UnifiedScanAndEnroll();
+
+   // ── New bar ───────────────────────────────────────────────────
+   static datetime lastBar=0;
+   if(cBar==lastBar) return;
+   lastBar=cBar;
+   g_barCount++;
+
+   if(EnableTradeManager) UnifiedManagePositions();
+
+   // Consolidation ADR check
+   ADR_Check();
+
+   // SR pivot update
+   SR_Update();
+
+   // Fib: check for M12 HTF pivot re-anchor + state update + PO3
+   datetime cFib = iTime(_Symbol, Fib_HTF, 0);
+   static datetime lastFibHTFBar = 0;
+   if(g_fibValid && cFib!=lastFibHTFBar)
+   {
+      lastFibHTFBar = cFib;
+      Fib_UpdateState();  // includes pivot detection inside waitCeil/waitFloor
+   }
+   else if(g_fibValid)
+   {
+      // Still run PO3 + break detection on every M5 bar
+      Fib_UpdateState();
+   }
+
+   // Consolidation direct entry check (no ST flip needed)
+   if(g_inConsol && g_fibValid) Consol_Check();
+
+   // Draw fib levels on chart
+   // ── SUPERTREND — sole entry trigger ───────────────────────────
+   int stFlip = UpdateSuperTrend();
+   if(stFlip != 0)
+   {
+      double epCheck = (stFlip==1) ? SymbolInfoDouble(_Symbol,SYMBOL_ASK)
+                                   : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+      // Quick zone pre-check for notification
+      string zoneTag="";
+      if(g_fibValid)
+      {
+         double buf=Fib_PDBuffer*ScaledPip();
+         bool inDisc=(epCheck>=g_f0-buf&&epCheck<=g_f0382+buf);
+         bool inPrem=(epCheck>=g_f0618-buf&&epCheck<=g_f1+buf);
+         bool nearRevL=(g_fRevL>0&&MathAbs(epCheck-g_fRevL)<=buf*3);
+         bool nearRevH=(g_fRevH>0&&MathAbs(epCheck-g_fRevH)<=buf*3);
+         bool at382=(g_f0382>0&&MathAbs(epCheck-g_f0382)<=buf*3);
+         bool at618=(g_f0618>0&&MathAbs(epCheck-g_f0618)<=buf*3);
+         if(stFlip==1)
+            zoneTag=inDisc?"📗DISCOUNT":nearRevL?"📍RevL":at618?"📍F0618-SUPP":(g_po3BuyArmed?"🎯PO3":"📕OUT-OF-ZONE");
+         else
+            zoneTag=inPrem?"📕PREMIUM":nearRevH?"📍RevH":at382?"📍F0382-REJ":(g_po3SellArmed?"🎯PO3":"📗OUT-OF-ZONE");
+      }
+      Log(StringFormat("📡 ST FLIP %s | bar=%d | @%.5f | %s",
+          stFlip==1?"BUY":"SELL", g_barCount, epCheck, zoneTag));
+      Notify(StringFormat("📡 ST %s FLIP|%s|@%.5f|%s",
+             stFlip==1?"BUY":"SELL", _Symbol, epCheck, zoneTag));
+      ExecuteSignal(stFlip);
+   }
+}
