@@ -1,0 +1,2218 @@
+//+------------------------------------------------------------------+
+//|                                        RollingSegment_Chart.mq5  |
+//|                  Rolling Segment on Main Chart                   |
+//|               + Range Detection & Break Engine                   |
+//+------------------------------------------------------------------+
+#property version   "1.55"
+#property indicator_chart_window
+#property indicator_buffers 4
+#property indicator_plots   2
+
+//+------------------------------------------------------------------+
+//| LICENSE ENGINE                                                   |
+//+------------------------------------------------------------------+
+#define LIC_KEY 0xB1D11903
+
+struct LicEntry
+  {
+   uint encAccount;  // account number XOR LIC_KEY
+   uint encExpiry;   // expiry as YYYYMMDD XOR LIC_KEY
+  };
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  LICENSE BLOCK — REPLACE FOR EACH CLIENT                        ║
+// ║  Use HTML encoder tool to generate encoded values               ║
+// ╚══════════════════════════════════════════════════════════════════╝
+LicEntry g_licenses[] =
+  {
+   { 0xB0F8DEB6, 0xB09155FC },  // expiry=20991231 (lifetime) | acct=19515317
+   { 0x9868B0D6, 0xB0E4306C }   // expiry=20261231 | acct=700033493
+  }; // populate for each client — paste encoded entries here
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  END LICENSE BLOCK                                               ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+bool IsLicensed()
+  {
+   uint acct = (uint)AccountInfoInteger(ACCOUNT_LOGIN);
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   uint now = (uint)(dt.year * 10000 + dt.mon * 100 + dt.day);
+
+   if(ArraySize(g_licenses) == 0)
+     { Print("lhwanzuRS: No licenses configured | Account=", acct); return false; }
+
+   for(int i = 0; i < ArraySize(g_licenses); i++)
+     {
+      uint a = g_licenses[i].encAccount ^ LIC_KEY;
+      uint e = g_licenses[i].encExpiry  ^ LIC_KEY;
+      if(a == acct)
+        {
+         if(now <= e)
+           {
+            if(_UninitReason != REASON_CHARTCHANGE && _UninitReason != REASON_PARAMETERS)
+               Print("lhwanzuRS: License valid | Account=", acct, " Expiry=", e);
+            return true;
+           }
+         else
+           { Print("lhwanzuRS: License EXPIRED | Account=", acct, " Expiry=", e, " Today=", now); return false; }
+        }
+     }
+   Print("lhwanzuRS: Account not licensed | Account=", acct);
+   return false;
+  }
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  MASTER DISPLAY BLOCK — DELETE THIS BLOCK FOR CLIENT COPY       ║
+// ║  Replace with:  #property indicator_plots 0                     ║
+// ║  And shortname: "AME Signal Engine"                             ║
+// ╚══════════════════════════════════════════════════════════════════╝
+//--- Plot 1: Slow RS
+#property indicator_label1  "RS Slow"
+#property indicator_type1   DRAW_COLOR_LINE
+#property indicator_color1  clrLimeGreen, clrRed
+#property indicator_style1  STYLE_SOLID
+#property indicator_width1  2
+
+//--- Plot 2: Fast RS
+#property indicator_label2  "RS Fast"
+#property indicator_type2   DRAW_COLOR_LINE
+#property indicator_color2  clrLimeGreen, clrRed
+#property indicator_style2  STYLE_SOLID
+#property indicator_width2  1
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  END MASTER DISPLAY BLOCK                                        ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+//--- Inputs
+input group "=== Signal Timeframe ==="
+input ENUM_TIMEFRAMES InpSignalTF = PERIOD_M5;  // Signal TF — RS engines run on this TF
+input ENUM_TIMEFRAMES InpHTF      = PERIOD_M15;  // HTF — trend filter (slow=required, fast=secondary)
+
+input group "=== Slow Rolling Segment ==="
+input int    InpRSFastLen    = 5;
+input int    InpRSSlowLen    = 10;
+
+input group "=== Fast Rolling Segment ==="
+input int    InpRSFastLen2   = 3;
+input int    InpRSSlowLen2   = 5;
+
+input group "=== Common Settings ==="
+input double InpRSFastThresh = 1.0;
+input double InpRSRevThresh  = 1.5;
+input int    InpATRLen       = 150;
+input double InpRSMinSep     = 0.4;   // Min separation between slow/fast RS (×ATR) — 0=off
+
+input group "=== Range Detection Engine ==="
+input bool   InpEnableRange      = true;  // Use Range Engine to block signals
+input int    InpSwingLeft        = 15;    // Pivot Left bars (current TF)
+input int    InpSwingRight       = 10;    // Pivot Right bars (current TF)
+input double InpRangeMinATR      = 4.0;   // Range width < N×ATR = ranging
+input bool   InpRangeTrade       = false;  // Enable range trading (buy low/sell high)
+input double InpRangeTouchATR    = 0.5;   // Touch threshold from boundary (×ATR)
+input int    InpRangeMaxTouches  = 5;     // Max touches per boundary (default 5, then silent)
+
+enum EEngineMode
+  {
+   ENGINE_AB_ONLY  = 0,  // A/B signals only
+   ENGINE_RBS_ONLY = 1,  // RBS/SBR only
+   ENGINE_BOTH     = 2,  // A/B + RBS/SBR (default)
+  };
+
+input group "=== Signal & Alert Settings ==="
+input EEngineMode InpEngineMode   = ENGINE_BOTH;  // Signal engine mode
+input int    InpAlignBars      = 4;     // N Bars threshold for A+ Alignment (LTF bars)
+input bool   InpTrendOnlyMode  = true;  // Gate RBS/SBR by slow RS direction
+input bool   InpFibFilter      = true;  // Suppress RS push in EQ zone (0.318-0.786)
+input int    InpFVGExpiry      = 20;    // FVG/OB touch GV expiry (bars) — 0=off
+input bool   InpSDEarlyEntry   = false; // SD Early Entry — fire at SD level on FVG/OB touch (risky)
+
+input group "=== Consolidation History ==="
+input bool   InpHistEnabled    = true;  // Enable consolidation range memory
+input int    InpHistMaxRanges  = 5;     // Max saved ranges (1-5)
+input int    InpHistExpiryDays = 7;     // Range expiry in days (0=never)
+input double InpHistProximityATR = 0.5; // Proximity threshold to tag signal (×ATR)
+input bool   InpSendPush       = true;  // Send Mobile Push Notifications
+input bool   InpSendAlert      = false; // Show Desktop Alerts
+input bool   InpPrintLog       = true;  // Print to Expert Tab
+input bool   InpAlertA_Plus    = true;  // Alert A+
+input bool   InpAlertB_Plus    = true;  // Alert B+
+input bool   InpAlertBPlusPlus = true;  // Alert B++
+input int    InpBPPMaxBars     = 10;    // B++ max bars since pullback (0=unlimited, LTF bars)
+input bool   InpAlertRBSSBR    = true;  // Alert RBS/SBR structure retests
+input bool   InpSniperMode     = true;  // Sniper entry — watch for pullback + continuation
+
+input group "=== Display ==="
+input bool   InpShowLine      = true;  // ON/OFF toggle for both lines
+input double InpSLATRMult     = 1.0;   // ATR multiplier for SL below/above swing
+input double InpSLMaxATR      = 3.0;   // Max SL distance (×ATR) — fallback if swing too far
+input bool   InpZoneGV        = true;  // Read SR Zones GV for confluence tag
+input int    InpZoneGVExpiry  = 20;    // Zone GV expiry (bars) — 0=off
+
+//--- Buffers (drawn on current chart TF)
+double BufRS1[];
+double BufRSColor1[];
+double BufRS2[];
+double BufRSColor2[];
+
+//--- Handles
+int g_atrHandle    = INVALID_HANDLE;  // current TF ATR (display + range + entry/SL)
+int g_atrLTFHandle = INVALID_HANDLE;  // LTF ATR (RS signal engine)
+int g_atrHTFHandle = INVALID_HANDLE;  // HTF ATR (trend filter)
+
+//--- Range Engine State (M1 LTF pivots)
+struct SLevel {
+   double   price;
+   double   top;
+   double   bot;
+   datetime t1;
+   bool     isHigh;
+   bool     broken;
+   bool     flipAlerted;
+};
+
+SLevel g_lv[];
+int    g_nLv         = 0;
+bool   g_isRanging        = false;
+double g_rangePH          = 0.0;
+
+//--- Range Trade Mode State
+bool   g_rangeTradeActive = false;  // true = range confirmed, trading mode ON
+int    g_rangeBuyTouches  = 0;      // touches of range low boundary
+int    g_rangeSellTouches = 0;      // touches of range high boundary
+bool   g_rangeBuyArmed    = false;  // price entered buy zone this bar
+bool   g_rangeSellArmed   = false;  // price entered sell zone this bar
+
+//--- Consolidation Range History — last N confirmed ranges
+#define HIST_MAX 5
+struct HistRange
+  {
+   double   high;        // range top
+   double   low;         // range bottom
+   datetime confirmTime; // when break confirmed
+   int      breakDir;    // +1=broke BUY -1=broke SELL 0=unknown
+   int      touches;     // touch count before break (strength)
+   bool     valid;       // slot in use
+  };
+HistRange g_hist[HIST_MAX];
+int       g_histCount = 0;  // number of valid slots
+
+//--- External Fib Engine — auto-anchored from g_lv[] pivot array
+bool   g_fibValid        = false;
+double g_fibHigh         = 0.0;   // 1.0 anchor — nearest unbroken swing high above price
+double g_fibLow          = 0.0;   // 0.0 anchor — nearest unbroken swing low below price
+double g_fibSD1H         = 0.0;   // SD+1 = fibHigh + 0.5×range
+double g_fibSD2H         = 0.0;   // SD+2 = fibHigh + 1.0×range
+double g_fibSD1L         = 0.0;   // SD-1 = fibLow  - 0.5×range
+double g_fibSD2L         = 0.0;   // SD-2 = fibLow  - 1.0×range
+bool   g_fibSD1HConfirmed = false; // SD+1 aligns with historical range boundary
+bool   g_fibSD2HConfirmed = false; // SD+2 aligns with historical range boundary
+bool   g_fibSD1LConfirmed = false; // SD-1 aligns with historical range boundary
+bool   g_fibSD2LConfirmed = false; // SD-2 aligns with historical range boundary
+bool   g_fibRangeBreakUp   = false; // range broke upside — premium flips to RBS BUY
+bool   g_fibRangeBreakDown = false; // range broke downside — discount flips to SBR SELL
+double g_rangePL          = 0.0;
+bool   g_rangingNotified  = false;  // prevents re-firing ranging push on TF switch
+datetime g_rangingLastReminder = 0; // tracks last 30-min ranging reminder push
+datetime g_rangingBreakTime   = 0; // time of last range break — cooldown guard
+
+//--- PO3 state — break/retest/confirm engine
+enum EPO3State
+  {
+   PO3_NONE,    // no active watch
+   PO3_WATCH,   // broke out — watching for retest
+   PO3_RETEST,  // price returned to broken level — watching for close confirm/fail
+   PO3_INSIDE   // price closed back inside range — watching for double break
+  };
+EPO3State g_po3State      = PO3_NONE;
+int       g_po3BreakDir   = 0;      // direction of break: 1=broke high -1=broke low
+double    g_po3BreakHigh  = 0.0;    // range high at time of break
+double    g_po3BreakLow   = 0.0;    // range low at time of break
+int       g_po3BarCount   = 0;      // bars since last state change
+bool      g_po3Notified   = false;  // confirmed push sent
+bool      g_po3InRetest   = false;  // price currently in retest zone
+int       g_po3TouchesAtBreak = 0;  // touch count snapshot at range break — for HistSaveRange strength
+int       g_po3RangeBreakDir  = 0;  // direction of last confirmed range break
+int       g_po3RangeBreakBars = 0;  // bars since last confirmed range break (for RBS/SBR tag)
+
+//--- B++ state (LTF bar indices)
+int      g_lastPullbackDir  = 0;
+datetime g_lastPullbackTime = 0;
+int      g_lastPullbackBar  = -1;
+
+//--- Slow RS trend for RBS/SBR gate
+int      g_curRSTrend   = 0;
+
+//--- RBS/SBR last fired direction
+int      g_lastRBSSBRDir  = 0;
+datetime g_lastRBSSBRTime = 0;  // persisted — prevents re-fire on reload
+
+//--- LTF bar tracking — detect new LTF bar
+datetime g_lastLTFBarTime = 0;
+
+//--- HTF RS state (persisted across ticks, updated once per new LTF bar)
+double   g_htfRollSeg1    = 0.0;
+double   g_htfRsTrend1    = 1.0;
+double   g_htfRollSeg2    = 0.0;
+double   g_htfRsTrend2    = 1.0;
+int      g_htfPrevSlowDir = 0;
+int      g_htfPrevFastDir = 0;
+
+//--- HTF fast direction stability filter
+//    Fast RS must hold new direction for N consecutive HTF bars before accepted
+int      g_htfFastCandidateDir   = 0;   // direction candidate being held
+int      g_htfFastCandidateCount = 0;   // consecutive bars it has held
+int      g_htfFastConfirmedDir   = 0;   // last confirmed stable fast direction
+#define  HTF_FAST_MIN_HOLD 3            // minimum consecutive HTF bars to confirm fast flip
+
+//--- SNIPER STATE MACHINE
+// WATCH_NONE    = no active watch
+// WATCH_PULLBACK = signal fired, waiting for price to touch RS slow or fast line
+// WATCH_SETUP   = touched RS line, watching for consolidation candle + range break
+enum ESniperState { WATCH_NONE, WATCH_PULLBACK, WATCH_SETUP };
+
+ESniperState g_sniperState    = WATCH_NONE;
+int          g_sniperDir      = 0;
+double       g_sniperRSSlow   = 0.0;
+double       g_sniperRSFast   = 0.0;
+double       g_sniperConsHigh = 0.0;
+double       g_sniperConsLow  = 0.0;
+datetime     g_sniperConsTime = 0;
+string       g_sniperLabel    = "";
+int          g_lastSignalDir  = 0;  // direction of last fired RS signal (used by sniper/PO3)
+int          g_lastSignalBar  = -1; // LTF bar index of last fired RS signal — cooldown gate
+int          g_lastRSDir      = 0;  // RS-only direction for cooldown — never touched by PO3
+
+//+------------------------------------------------------------------+
+//| PERSISTENT STATE — GlobalVariables save/restore across TF switch |
+//| Keys are scoped to Symbol so multi-chart works independently     |
+//+------------------------------------------------------------------+
+#define GVK(k) ("LHRS_" + Symbol() + "_" + k)
+
+//+------------------------------------------------------------------+
+//| CONFIDENCE PREFIX — 🏦 BANK / 💎 GOLD                           |
+//| Scores confluence tags in a built message string                 |
+//| FIB ✅ = +1 | HIST ✅ = +1 | PO3 tag = +1 | RBS/SBR ✅ = +1    |
+//| score >= 3 → 🏦 BANK   (Tier 1 — full size)                     |
+//| score == 2 → 💎 GOLD   (Tier 2 — normal size)                   |
+//| score <= 1 → no prefix (read the tags yourself)                 |
+//+------------------------------------------------------------------+
+string ConfidencePrefix(const string &msg)
+  {
+   int score = 0;
+   if(StringFind(msg, "✅") >= 0)
+     {
+      // FIB zone confirmed
+      if(StringFind(msg, "📐") >= 0 && StringFind(msg, "✅") >= 0) score++;
+      // HIST confirmed
+      if(StringFind(msg, "📦") >= 0 && StringFind(msg, "✅") >= 0) score++;
+      // PO3 confirmation
+      if(StringFind(msg, "PO3") >= 0) score++;
+      // RBS or SBR role-flip confirmed
+      if(StringFind(msg, "RBS BUY ✅") >= 0 ||
+         StringFind(msg, "SBR SELL ✅") >= 0) score++;
+     }
+   if(score >= 3) return "🏦 BANK | ";
+   if(score == 2) return "💎 GOLD | ";
+   return "";
+  }
+
+//+------------------------------------------------------------------+
+//| FIB ENGINE — External PD/SD zone filter                         |
+//| Anchors from nearest unbroken g_lv[] pivots above/below price   |
+//| Directional lock: uses HTF slow trend (g_htfRsTrend1)           |
+//+------------------------------------------------------------------+
+void FibCalcLevels(double atrForTol = 0)
+  {
+   if(g_fibHigh <= g_fibLow) { g_fibValid = false; return; }
+   double r  = g_fibHigh - g_fibLow;
+   g_fibSD1H = g_fibHigh + 0.5 * r;
+   g_fibSD2H = g_fibHigh + 1.0 * r;
+   g_fibSD1L = g_fibLow  - 0.5 * r;
+   g_fibSD2L = g_fibLow  - 1.0 * r;
+   g_fibValid = true;
+
+   // Check SD levels against historical ranges — structural confirmation
+   // ATR-based tolerance (consistent with HistTag) capped at 15% of range
+   double tol = (atrForTol > 0 && atrForTol < EMPTY_VALUE) ?
+                MathMin(InpHistProximityATR * atrForTol, r * 0.15) :
+                r * 0.15;  // fallback to 15% if ATR unavailable
+   g_fibSD1HConfirmed = false;
+   g_fibSD2HConfirmed = false;
+   g_fibSD1LConfirmed = false;
+   g_fibSD2LConfirmed = false;
+
+   if(!InpHistEnabled) return;
+   datetime now = TimeCurrent();
+   long expiryMs = (long)InpHistExpiryDays * 86400;
+   int maxSlots  = MathMin(InpHistMaxRanges, HIST_MAX);
+   for(int h = 0; h < maxSlots; h++)
+     {
+      if(!g_hist[h].valid) continue;
+      if(InpHistExpiryDays > 0 && (long)now - (long)g_hist[h].confirmTime > expiryMs) continue;
+      double boundaries[2];
+      boundaries[0] = g_hist[h].high;
+      boundaries[1] = g_hist[h].low;
+      for(int b = 0; b < 2; b++)
+        {
+         if(!g_fibSD1HConfirmed && MathAbs(g_fibSD1H - boundaries[b]) <= tol) g_fibSD1HConfirmed = true;
+         if(!g_fibSD2HConfirmed && MathAbs(g_fibSD2H - boundaries[b]) <= tol) g_fibSD2HConfirmed = true;
+         if(!g_fibSD1LConfirmed && MathAbs(g_fibSD1L - boundaries[b]) <= tol) g_fibSD1LConfirmed = true;
+         if(!g_fibSD2LConfirmed && MathAbs(g_fibSD2L - boundaries[b]) <= tol) g_fibSD2LConfirmed = true;
+        }
+     }
+   if(InpPrintLog)
+     {
+      if(g_fibSD1HConfirmed) Print("[FIB] SD+1=", DoubleToString(g_fibSD1H,_Digits), " CONFIRMED by historical range | ", Symbol());
+      if(g_fibSD2HConfirmed) Print("[FIB] SD+2=", DoubleToString(g_fibSD2H,_Digits), " CONFIRMED by historical range | ", Symbol());
+      if(g_fibSD1LConfirmed) Print("[FIB] SD-1=", DoubleToString(g_fibSD1L,_Digits), " CONFIRMED by historical range | ", Symbol());
+      if(g_fibSD2LConfirmed) Print("[FIB] SD-2=", DoubleToString(g_fibSD2L,_Digits), " CONFIRMED by historical range | ", Symbol());
+     }
+  }
+
+void FibRecalc(double curPrice, double atr = 0)
+  {
+   double nearH = 0, nearL = 0;
+   double nearHDist = DBL_MAX, nearLDist = DBL_MAX;
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      if(g_lv[k].isHigh && g_lv[k].price > curPrice)
+        { double d = g_lv[k].price - curPrice; if(d < nearHDist) { nearHDist = d; nearH = g_lv[k].price; } }
+      if(!g_lv[k].isHigh && g_lv[k].price < curPrice)
+        { double d = curPrice - g_lv[k].price; if(d < nearLDist) { nearLDist = d; nearL = g_lv[k].price; } }
+     }
+   if(nearH <= 0 || nearL <= 0 || nearH <= nearL) return;
+   // Minimum range guard — new range must be at least InpRangeMinATR × ATR
+   // Prevents micro re-anchoring from tiny swing lows/highs
+   if(atr > 0 && (nearH - nearL) < atr * InpRangeMinATR)
+     {
+      if(InpPrintLog) Print("[FIB] Re-anchor skipped — range too small: ",
+            DoubleToString(nearH - nearL, 2), " < ", DoubleToString(atr * InpRangeMinATR, 2),
+            " | ", Symbol());
+      return;
+     }
+   bool wasValid = g_fibValid;
+   bool highSame = (MathAbs(nearH - g_fibHigh) <= _Point);
+   bool lowSame  = (MathAbs(nearL  - g_fibLow)  <= _Point);
+   if(wasValid && highSame && lowSame) return;
+   // Directional lock — HTF slow trend
+   if(wasValid)
+     {
+      int msDir = (g_htfRsTrend1 > 0) ? 1 : -1;
+      // Bull: ceiling only moves up
+      //       floor can move down only if drop > 2×ATR (genuine new HL, not micro swing)
+      // Bear: floor only moves down
+      //       ceiling can move up only if rise > 2×ATR (genuine new LH, not micro swing)
+      double tolerance = (atr > 0) ? atr * 2.0 : 0;
+      if(msDir ==  1)
+        {
+         if(nearH < g_fibHigh - _Point) return;
+         if(nearL < g_fibLow - _Point - tolerance) return;  // floor: allow small HL, block large drops
+        }
+      if(msDir == -1)
+        {
+         if(nearL > g_fibLow + _Point) return;
+         if(nearH > g_fibHigh + _Point + tolerance) return;  // ceiling: allow small LH, block large rises
+        }
+     }
+   g_fibHigh = nearH;
+   g_fibLow  = nearL;
+   FibCalcLevels(atr);
+   if(InpPrintLog) Print("[FIB] ", wasValid?"Re-anchored":"Anchored",
+         " Low=", DoubleToString(g_fibLow, _Digits),
+         " High=", DoubleToString(g_fibHigh, _Digits),
+         " Range=", DoubleToString(g_fibHigh - g_fibLow, 2));
+  }
+
+// Returns: 2=SD level  1=PD zone  0=EQ (suppress push)
+// After range break — premium/discount zones flip role
+int FibZoneClass(double price)
+  {
+   if(!g_fibValid || !InpFibFilter) return 1;  // filter off = always allow
+   double r = g_fibHigh - g_fibLow;
+   if(r <= 0) return 1;
+   double p = (price - g_fibLow) / r;
+   // SD levels — always PD class regardless of break direction
+   if(p <= -0.25 || p >= 1.35) return 2;
+   // After break UP: 0.618-1.05 zone flips to RBS BUY (PD class)
+   if(g_fibRangeBreakUp && p >= 0.618 && p <= 1.05) return 1;
+   // After break DOWN: 0.0-0.318 zone flips to SBR SELL (PD class)
+   if(g_fibRangeBreakDown && p >= 0.0 && p <= 0.318) return 1;
+   // Standard PD zones (no break)
+   if(p <= 0.236 || (p >= 0.786 && p < 1.05)) return 1;
+   return 0;  // EQ — suppress
+  }
+
+// Appends fib zone tag to signal message — zones flip on range break direction
+string FibTag(double price, int sigDir)
+  {
+   if(!g_fibValid) return "";
+   double r = g_fibHigh - g_fibLow;
+   if(r <= 0) return "";
+   double p = (price - g_fibLow) / r;
+   string zone = "";
+   int    bias = 0;
+   if(p <= -0.75)      { zone = "SD-2 DISCOUNT";    bias =  1; if(g_fibSD2LConfirmed) zone += " 📦HIST"; }
+   else if(p <= -0.25) { zone = "SD-1 DISCOUNT";    bias =  1; if(g_fibSD1LConfirmed) zone += " 📦HIST"; }
+   else if(p <=  0.10)
+     { bias = g_fibRangeBreakDown ? -1 :  1;
+       zone = g_fibRangeBreakDown ? "FIB 0 SBR SELL" : "FIB 0 DISCOUNT"; }
+   else if(p <=  0.236)
+     { bias = g_fibRangeBreakDown ? -1 :  1;
+       zone = g_fibRangeBreakDown ? "FIB 0.236 SBR SELL" : "FIB 0.236 DISC"; }
+   else if(p <=  0.318)
+     { bias = g_fibRangeBreakDown ? -1 :  0;
+       zone = g_fibRangeBreakDown ? "FIB 0.318 SBR SELL" : "FIB 0.318 EQ"; }
+   else if(p <=  0.50)  { zone = "FIB 0.5 EQ";       bias =  0; }
+   else if(p <=  0.618)
+     { bias = g_fibRangeBreakUp ?  1 :  0;
+       zone = g_fibRangeBreakUp ? "FIB 0.618 RBS BUY" : "FIB 0.618 EQ"; }
+   else if(p <=  0.786)
+     { bias = g_fibRangeBreakUp ?  1 : -1;
+       zone = g_fibRangeBreakUp ? "FIB 0.786 RBS BUY" : "FIB 0.786 PREM"; }
+   else if(p <=  1.05)
+     { bias = g_fibRangeBreakUp ?  1 : -1;
+       zone = g_fibRangeBreakUp ? "FIB 1.0 RBS BUY" : "FIB 1.0 PREM"; }
+   else if(p <=  1.35)  { zone = "SD+1 PREMIUM";     bias = -1; if(g_fibSD1HConfirmed) zone += " 📦HIST"; }
+   else                 { zone = "SD+2 PREMIUM";     bias = -1; if(g_fibSD2HConfirmed) zone += " 📦HIST"; }
+   string tag = " | 📐 " + zone;
+   if(sigDir != 0)
+     { if(bias == sigDir) tag += " ✅"; else if(bias == -sigDir) tag += " ⚠️"; }
+   tag += " [0=" + DoubleToString(g_fibLow, _Digits) +
+          " 1="  + DoubleToString(g_fibHigh, _Digits) + "]";
+   return tag;
+  }
+
+// Reads SPL_FVG_TOUCH_* GVs from Liquidity Signals
+// Returns tag string with FVG/OB confluence info
+// sigDir: 1=buy signal -1=sell signal
+string FVGZoneTag(int sigDir, datetime ltfBarTime)
+  {
+   if(InpFVGExpiry <= 0) return "";
+   if(!GlobalVariableCheck("SPL_FVG_TOUCH_TIME")) return "";
+   datetime touchTime = (datetime)(long)GlobalVariableGet("SPL_FVG_TOUCH_TIME");
+   long     expiryMs  = (long)InpFVGExpiry * (long)PeriodSeconds(InpSignalTF);
+   if((long)ltfBarTime - (long)touchTime > expiryMs) return "";
+   // Guard all dependent GV reads — fail safely to neutral if missing
+   if(!GlobalVariableCheck("SPL_FVG_TOUCH_DIR") ||
+      !GlobalVariableCheck("SPL_FVG_TOUCH_TYPE")) return "";
+   int    touchDir  = (int)GlobalVariableGet("SPL_FVG_TOUCH_DIR");
+   int    touchType = (int)GlobalVariableGet("SPL_FVG_TOUCH_TYPE");
+   double touchTop  = GlobalVariableCheck("SPL_MSS_TOP") ? GlobalVariableGet("SPL_MSS_TOP") : 0;
+   double touchBot  = GlobalVariableCheck("SPL_MSS_BOT") ? GlobalVariableGet("SPL_MSS_BOT") : 0;
+   string typeStr   = (touchType == 1) ? "FVG" : "OB";
+   string zoneStr   = (touchTop > 0 && touchBot > 0) ?
+                      " [" + DoubleToString(touchBot, _Digits) +
+                      "-"  + DoubleToString(touchTop, _Digits) + "]" : "";
+   // Mutually exclusive — no dead branch
+   return (touchDir == sigDir) ? " | 🔷 " + typeStr + " ✅" + zoneStr
+                                : " | 🔷 " + typeStr + " ⚠️" + zoneStr;
+  }
+
+// Save confirmed range to history — circular buffer, oldest overwritten
+// Called when range break is confirmed (PO3 confirm or double break)
+void HistSaveRange(double high, double low, datetime t, int breakDir, int touches)
+  {
+   if(!InpHistEnabled) return;
+   if(high <= 0 || low <= 0 || high <= low) return;
+   int maxSlots = MathMin(InpHistMaxRanges, HIST_MAX);
+   // Find oldest slot or first empty
+   int   slot     = 0;
+   datetime oldest = TimeCurrent();
+   for(int h = 0; h < maxSlots; h++)
+     {
+      if(!g_hist[h].valid) { slot = h; break; }
+      if(g_hist[h].confirmTime < oldest)
+        { oldest = g_hist[h].confirmTime; slot = h; }
+     }
+   g_hist[slot].high        = high;
+   g_hist[slot].low         = low;
+   g_hist[slot].confirmTime = t;
+   g_hist[slot].breakDir    = breakDir;
+   g_hist[slot].touches     = touches;
+   g_hist[slot].valid       = true;
+   // g_histCount not used for loop bounds — validity flags gate all loops
+   if(InpPrintLog) Print("[HIST] Saved range ", DoubleToString(low, _Digits),
+         "-", DoubleToString(high, _Digits),
+         " BreakDir=", (breakDir==1?"BUY":"SELL"),
+         " Touches=", touches, " slot=", slot, " | ", Symbol());
+  }
+
+// Check proximity to saved historical ranges — returns tag string
+// Returns closest matching range tag or ""
+string HistTag(double price, int sigDir, double atr)
+  {
+   if(!InpHistEnabled || atr <= 0 || atr >= EMPTY_VALUE || !MathIsValidNumber(atr)) return "";
+   int    maxSlots  = MathMin(InpHistMaxRanges, HIST_MAX);
+   double threshold = InpHistProximityATR * atr;
+   datetime now     = TimeCurrent();
+   long   expiryMs  = (long)InpHistExpiryDays * 86400;
+   string bestTag   = "";
+   double bestDist  = DBL_MAX;
+   for(int h = 0; h < maxSlots; h++)
+     {
+      if(!g_hist[h].valid) continue;
+      // Expiry check
+      if(InpHistExpiryDays > 0 && (long)now - (long)g_hist[h].confirmTime > expiryMs) continue;
+      double distH = MathAbs(price - g_hist[h].high);
+      double distL = MathAbs(price - g_hist[h].low);
+      double dist  = MathMin(distH, distL);
+      if(dist > threshold) continue;
+      if(dist >= bestDist) continue;
+      bestDist = dist;
+      // Determine role — did price break up or down from this range?
+      string rangeStr = DoubleToString(g_hist[h].low, _Digits) +
+                        "-" + DoubleToString(g_hist[h].high, _Digits);
+      bool nearHigh  = (distH < distL);
+      // ICT/SMC role-flip semantics:
+      // SELL break: both high AND low are bearish zones (resistance/continuation)
+      // BUY break:  both low AND high are bullish zones (support/continuation)
+      // Near HIGH after SELL break = SBR resistance = SELL aligned
+      // Near LOW  after SELL break = bearish continuation = SELL aligned (NOT BUY)
+      // Near LOW  after BUY break  = RBS support = BUY aligned
+      // Near HIGH after BUY break  = bullish continuation = BUY aligned
+      bool alignedBuy  = (g_hist[h].breakDir ==  1);  // BUY break = entire range is BUY territory
+      bool alignedSell = (g_hist[h].breakDir == -1);  // SELL break = entire range is SELL territory
+      string align = "";
+      if(sigDir ==  1 && alignedBuy)  align = " ✅";
+      if(sigDir == -1 && alignedSell) align = " ✅";
+      if(align == "") align = " ⚠️";
+      bestTag = " | 📦 HIST [" + rangeStr + "]" + align;
+     }
+   return bestTag;
+  }
+
+void GvSave()
+  {
+   // B++ pullback state
+   GlobalVariableSet(GVK("PBD"),  (double)g_lastPullbackDir);
+   GlobalVariableSet(GVK("PBTM"), (double)(long)g_lastPullbackTime);
+   GlobalVariableSet(GVK("PBB"),  (double)g_lastPullbackBar);
+
+   // RS trend + RBS/SBR gate
+   GlobalVariableSet(GVK("RST"),  (double)g_curRSTrend);
+   GlobalVariableSet(GVK("RBSD"), (double)g_lastRBSSBRDir);
+   GlobalVariableSet(GVK("RBST"), (double)(long)g_lastRBSSBRTime);
+
+   // HTF RS state
+   GlobalVariableSet(GVK("HS1"),  g_htfRollSeg1);
+   GlobalVariableSet(GVK("HT1"),  g_htfRsTrend1);
+   GlobalVariableSet(GVK("HS2"),  g_htfRollSeg2);
+   GlobalVariableSet(GVK("HT2"),  g_htfRsTrend2);
+   GlobalVariableSet(GVK("HPD1"), (double)g_htfPrevSlowDir);
+   GlobalVariableSet(GVK("HPD2"), (double)g_htfPrevFastDir);
+   GlobalVariableSet(GVK("HFC"),  (double)g_htfFastCandidateDir);
+   GlobalVariableSet(GVK("HFCC"), (double)g_htfFastCandidateCount);
+   GlobalVariableSet(GVK("HFCD"), (double)g_htfFastConfirmedDir);
+
+   // LTF bar dedup
+   GlobalVariableSet(GVK("LTFT"), (double)(long)g_lastLTFBarTime);
+
+   // Ranging state + box
+   GlobalVariableSet(GVK("RNG"),  g_isRanging  ? 1.0 : 0.0);
+   GlobalVariableSet(GVK("RPH"),  g_rangePH);
+   GlobalVariableSet(GVK("RPL"),  g_rangePL);
+   GlobalVariableSet(GVK("RNGN"), g_rangingNotified ? 1.0 : 0.0);
+   GlobalVariableSet(GVK("RNGT"), (double)(long)g_rangingLastReminder);
+   GlobalVariableSet(GVK("RNGB"), (double)(long)g_rangingBreakTime);
+   GlobalVariableSet(GVK("RTACT"), g_rangeTradeActive ? 1.0 : 0.0);
+   GlobalVariableSet(GVK("RTBT"),  (double)g_rangeBuyTouches);
+   GlobalVariableSet(GVK("RTST"),  (double)g_rangeSellTouches);
+   GlobalVariableSet(GVK("FRBUP"), g_fibRangeBreakUp   ? 1.0 : 0.0);
+   GlobalVariableSet(GVK("FRBDN"), g_fibRangeBreakDown ? 1.0 : 0.0);
+   // Consolidation history
+   for(int h = 0; h < HIST_MAX; h++)
+     {
+      string p = "H" + IntegerToString(h);
+      GlobalVariableSet(GVK(p+"H"), g_hist[h].high);
+      GlobalVariableSet(GVK(p+"L"), g_hist[h].low);
+      GlobalVariableSet(GVK(p+"T"), (double)(long)g_hist[h].confirmTime);
+      GlobalVariableSet(GVK(p+"D"), (double)g_hist[h].breakDir);
+      GlobalVariableSet(GVK(p+"S"), (double)g_hist[h].touches);
+      GlobalVariableSet(GVK(p+"V"), g_hist[h].valid ? 1.0 : 0.0);
+     }
+   GlobalVariableSet(GVK("PO3S"), (double)(int)g_po3State);
+   GlobalVariableSet(GVK("PO3D"), (double)g_po3BreakDir);
+   GlobalVariableSet(GVK("PO3H"), g_po3BreakHigh);
+   GlobalVariableSet(GVK("PO3L"), g_po3BreakLow);
+   GlobalVariableSet(GVK("PO3C"), (double)g_po3BarCount);
+   GlobalVariableSet(GVK("PO3N"), g_po3Notified  ? 1.0 : 0.0);
+   GlobalVariableSet(GVK("PO3R"), g_po3InRetest  ? 1.0 : 0.0);
+   GlobalVariableSet(GVK("PO3BD"), (double)g_po3RangeBreakDir);
+   GlobalVariableSet(GVK("PO3BB"), (double)g_po3RangeBreakBars);
+
+   // Sniper state
+   GlobalVariableSet(GVK("SNS"),  (double)(int)g_sniperState);
+   GlobalVariableSet(GVK("SND"),  (double)g_sniperDir);
+   GlobalVariableSet(GVK("SNRS1"), g_sniperRSSlow);
+   GlobalVariableSet(GVK("SNRS2"), g_sniperRSFast);
+   GlobalVariableSet(GVK("SNCH"),  g_sniperConsHigh);
+   GlobalVariableSet(GVK("SNCL"),  g_sniperConsLow);
+   GlobalVariableSet(GVK("SNCT"),  (double)(long)g_sniperConsTime);
+   GlobalVariableSet(GVK("LSD"),   (double)g_lastSignalDir);
+   GlobalVariableSet(GVK("LSB"),   (double)g_lastSignalBar);
+   GlobalVariableSet(GVK("LRSD"),  (double)g_lastRSDir);
+  }
+
+bool GvRestore()
+  {
+   // Require sentinel key — confirms a prior save for this symbol
+   if(!GlobalVariableCheck(GVK("PBD"))) return false;
+
+   g_lastPullbackDir    = (int)GlobalVariableGet(GVK("PBD"));
+   g_lastPullbackTime   = (datetime)(long)GlobalVariableGet(GVK("PBTM"));
+   g_lastPullbackBar    = (int)GlobalVariableGet(GVK("PBB"));
+
+   g_curRSTrend         = (int)GlobalVariableGet(GVK("RST"));
+   g_lastRBSSBRDir      = (int)GlobalVariableGet(GVK("RBSD"));
+   g_lastRBSSBRTime     = GlobalVariableCheck(GVK("RBST")) ? (datetime)(long)GlobalVariableGet(GVK("RBST")) : 0;
+
+   g_htfRollSeg1        = GlobalVariableGet(GVK("HS1"));
+   g_htfRsTrend1        = GlobalVariableGet(GVK("HT1"));
+   g_htfRollSeg2        = GlobalVariableGet(GVK("HS2"));
+   g_htfRsTrend2        = GlobalVariableGet(GVK("HT2"));
+   g_htfPrevSlowDir     = (int)GlobalVariableGet(GVK("HPD1"));
+   g_htfPrevFastDir     = (int)GlobalVariableGet(GVK("HPD2"));
+   g_htfFastCandidateDir   = GlobalVariableCheck(GVK("HFC"))  ? (int)GlobalVariableGet(GVK("HFC"))  : 0;
+   g_htfFastCandidateCount = GlobalVariableCheck(GVK("HFCC")) ? (int)GlobalVariableGet(GVK("HFCC")) : 0;
+   g_htfFastConfirmedDir   = GlobalVariableCheck(GVK("HFCD")) ? (int)GlobalVariableGet(GVK("HFCD")) : 0;
+
+   g_lastLTFBarTime     = (datetime)(long)GlobalVariableGet(GVK("LTFT"));
+
+   g_isRanging          = (GlobalVariableGet(GVK("RNG")) > 0.5);
+   g_rangePH            = GlobalVariableGet(GVK("RPH"));
+   g_rangePL            = GlobalVariableGet(GVK("RPL"));
+   g_rangingNotified      = GlobalVariableCheck(GVK("RNGN")) ? (GlobalVariableGet(GVK("RNGN")) > 0.5) : false;
+   g_rangingLastReminder  = GlobalVariableCheck(GVK("RNGT")) ? (datetime)(long)GlobalVariableGet(GVK("RNGT")) : 0;
+   g_rangingBreakTime     = GlobalVariableCheck(GVK("RNGB")) ? (datetime)(long)GlobalVariableGet(GVK("RNGB")) : 0;
+   g_rangeTradeActive   = GlobalVariableCheck(GVK("RTACT")) ? (GlobalVariableGet(GVK("RTACT")) > 0.5) : false;
+   g_rangeBuyTouches    = GlobalVariableCheck(GVK("RTBT"))  ? (int)GlobalVariableGet(GVK("RTBT"))  : 0;
+   g_rangeSellTouches   = GlobalVariableCheck(GVK("RTST"))  ? (int)GlobalVariableGet(GVK("RTST"))  : 0;
+   g_fibRangeBreakUp    = GlobalVariableCheck(GVK("FRBUP")) ? (GlobalVariableGet(GVK("FRBUP")) > 0.5) : false;
+   g_fibRangeBreakDown  = GlobalVariableCheck(GVK("FRBDN")) ? (GlobalVariableGet(GVK("FRBDN")) > 0.5) : false;
+   if(g_fibRangeBreakUp) g_fibRangeBreakDown = false;  // mutual exclusivity guard
+   // Consolidation history restore
+   g_histCount = 0;
+   for(int h = 0; h < HIST_MAX; h++)
+     {
+      string p = "H" + IntegerToString(h);
+      g_hist[h].valid = GlobalVariableCheck(GVK(p+"V")) ? (GlobalVariableGet(GVK(p+"V")) > 0.5) : false;
+      if(g_hist[h].valid)
+        {
+         g_hist[h].high        = GlobalVariableCheck(GVK(p+"H")) ? GlobalVariableGet(GVK(p+"H")) : 0;
+         g_hist[h].low         = GlobalVariableCheck(GVK(p+"L")) ? GlobalVariableGet(GVK(p+"L")) : 0;
+         g_hist[h].confirmTime = GlobalVariableCheck(GVK(p+"T")) ? (datetime)(long)GlobalVariableGet(GVK(p+"T")) : 0;
+         g_hist[h].breakDir    = GlobalVariableCheck(GVK(p+"D")) ? (int)GlobalVariableGet(GVK(p+"D")) : 0;
+         g_hist[h].touches     = GlobalVariableCheck(GVK(p+"S")) ? (int)GlobalVariableGet(GVK(p+"S")) : 0;
+         g_histCount++;
+        }
+     }
+   g_po3State    = GlobalVariableCheck(GVK("PO3S")) ? (EPO3State)(int)GlobalVariableGet(GVK("PO3S")) : PO3_NONE;
+   g_po3BreakDir = GlobalVariableCheck(GVK("PO3D")) ? (int)GlobalVariableGet(GVK("PO3D")) : 0;
+   g_po3BreakHigh= GlobalVariableCheck(GVK("PO3H")) ? GlobalVariableGet(GVK("PO3H")) : 0.0;
+   g_po3BreakLow = GlobalVariableCheck(GVK("PO3L")) ? GlobalVariableGet(GVK("PO3L")) : 0.0;
+   g_po3BarCount = GlobalVariableCheck(GVK("PO3C")) ? (int)GlobalVariableGet(GVK("PO3C")) : 0;
+   g_po3Notified = GlobalVariableCheck(GVK("PO3N")) ? (GlobalVariableGet(GVK("PO3N")) > 0.5) : false;
+   g_po3InRetest     = GlobalVariableCheck(GVK("PO3R"))  ? (GlobalVariableGet(GVK("PO3R"))  > 0.5) : false;
+   g_po3RangeBreakDir  = GlobalVariableCheck(GVK("PO3BD")) ? (int)GlobalVariableGet(GVK("PO3BD")) : 0;
+   g_po3RangeBreakBars = GlobalVariableCheck(GVK("PO3BB")) ? (int)GlobalVariableGet(GVK("PO3BB")) : 0;
+
+   // Sniper state
+   g_sniperState    = (ESniperState)(int)GlobalVariableGet(GVK("SNS"));
+   g_sniperDir      = (int)GlobalVariableGet(GVK("SND"));
+   g_sniperRSSlow   = GlobalVariableGet(GVK("SNRS1"));
+   g_sniperRSFast   = GlobalVariableGet(GVK("SNRS2"));
+   g_sniperConsHigh = GlobalVariableGet(GVK("SNCH"));
+   g_sniperConsLow  = GlobalVariableGet(GVK("SNCL"));
+   g_sniperConsTime = (datetime)(long)GlobalVariableGet(GVK("SNCT"));
+   g_lastSignalDir  = GlobalVariableCheck(GVK("LSD"))  ? (int)GlobalVariableGet(GVK("LSD"))  : 0;
+   g_lastSignalBar  = GlobalVariableCheck(GVK("LSB"))  ? (int)GlobalVariableGet(GVK("LSB"))  : -1;
+   g_lastRSDir      = GlobalVariableCheck(GVK("LRSD")) ? (int)GlobalVariableGet(GVK("LRSD")) : 0;
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| RANGE ENGINE HELPERS                                             |
+//+------------------------------------------------------------------+
+void AddLevel(double price, double top, double bot, datetime t1, bool isHigh)
+  {
+   if(g_nLv >= 2000)
+     {
+      for(int i = 0; i < g_nLv - 1; i++) g_lv[i] = g_lv[i+1];
+      g_nLv--;
+     }
+   if(g_nLv >= ArraySize(g_lv))
+      ArrayResize(g_lv, ArraySize(g_lv) + 256);
+
+   g_lv[g_nLv].price       = price;
+   g_lv[g_nLv].top         = top;
+   g_lv[g_nLv].bot         = bot;
+   g_lv[g_nLv].t1          = t1;
+   g_lv[g_nLv].isHigh      = isHigh;
+   g_lv[g_nLv].broken      = false;
+   g_lv[g_nLv].flipAlerted = false;
+   g_nLv++;
+  }
+
+//--- Forward declaration
+bool i_RangeCheck(const MqlRates &ltfRates[], const double &atrLTF[], int ltfTotal, int ltfLast, int rsFlip1);
+
+//+------------------------------------------------------------------+
+//| INITIALIZATION                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   if(!IsLicensed()) return INIT_FAILED;
+
+   // ATR on current TF — for display lines, range engine, entry/SL
+   g_atrHandle = iATR(NULL, 0, InpATRLen);
+   if(g_atrHandle == INVALID_HANDLE) return INIT_FAILED;
+
+   // ATR on signal TF — for RS engine
+   g_atrLTFHandle = iATR(NULL, InpSignalTF, InpATRLen);
+   if(g_atrLTFHandle == INVALID_HANDLE) return INIT_FAILED;
+
+   // ATR on HTF — for trend filter
+   g_atrHTFHandle = iATR(NULL, InpHTF, InpATRLen);
+   if(g_atrHTFHandle == INVALID_HANDLE) return INIT_FAILED;
+
+   SetIndexBuffer(0, BufRS1,      INDICATOR_DATA);
+   SetIndexBuffer(1, BufRSColor1, INDICATOR_COLOR_INDEX);
+   SetIndexBuffer(2, BufRS2,      INDICATOR_DATA);
+   SetIndexBuffer(3, BufRSColor2, INDICATOR_COLOR_INDEX);
+
+   // ╔═══════════════════════════════════════════════════════════════╗
+   // ║  MASTER DISPLAY BLOCK — DELETE THIS BLOCK FOR CLIENT COPY    ║
+   // ║  Replace shortname with: "AME Signal Engine"                 ║
+   // ╚═══════════════════════════════════════════════════════════════╝
+   PlotIndexSetDouble (0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetString (0, PLOT_LABEL, "Slow Rolling Segment");
+   PlotIndexSetInteger(0, PLOT_DRAW_TYPE, InpShowLine ? DRAW_COLOR_LINE : DRAW_NONE);
+   PlotIndexSetInteger(0, PLOT_LINE_STYLE, STYLE_SOLID);
+   PlotIndexSetInteger(0, PLOT_LINE_WIDTH, 2);
+   PlotIndexSetInteger(0, PLOT_COLOR_INDEXES, 2);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 0, clrLimeGreen);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 1, clrRed);
+
+   PlotIndexSetDouble (1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+   PlotIndexSetString (1, PLOT_LABEL, "Fast Rolling Segment");
+   PlotIndexSetInteger(1, PLOT_DRAW_TYPE, InpShowLine ? DRAW_COLOR_LINE : DRAW_NONE);
+   PlotIndexSetInteger(1, PLOT_LINE_STYLE, STYLE_SOLID);
+   PlotIndexSetInteger(1, PLOT_LINE_WIDTH, 1);
+   PlotIndexSetInteger(1, PLOT_COLOR_INDEXES, 2);
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, 0, clrLimeGreen);
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, 1, clrRed);
+
+   IndicatorSetString(INDICATOR_SHORTNAME, "Lhwanzu1903 AME");
+   // ╔═══════════════════════════════════════════════════════════════╗
+   // ║  END MASTER DISPLAY BLOCK                                     ║
+   // ╚═══════════════════════════════════════════════════════════════╝
+
+   string tfName = EnumToString(InpSignalTF);
+   StringReplace(tfName, "PERIOD_", "");
+   if(_UninitReason != REASON_CHARTCHANGE && _UninitReason != REASON_PARAMETERS)
+      Print("lhwanzuRS v1.55 | Signal TF: ", tfName, " | HTF: ", EnumToString(InpHTF), " | Display TF: ", EnumToString(Period()));
+      if(InpHistMaxRanges > HIST_MAX)
+         Print("[HIST] InpHistMaxRanges=", InpHistMaxRanges, " clamped to HIST_MAX=", HIST_MAX);
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   GvSave();  // Persist state across TF switch / indicator reload
+   if(g_atrHandle    != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+   if(g_atrLTFHandle != INVALID_HANDLE) IndicatorRelease(g_atrLTFHandle);
+   if(g_atrHTFHandle != INVALID_HANDLE) IndicatorRelease(g_atrHTFHandle);
+  }
+
+//+------------------------------------------------------------------+
+//| ENTRY/SL BUILDER (uses current TF ATR and current TF swings)    |
+//+------------------------------------------------------------------+
+string BuildEntryStr(int dir, double price, double atr)
+  {
+   double entryPad = atr * 0.5;
+   double entryLow, entryHigh;
+   if(dir == 1)
+     { entryLow  = NormalizeDouble(price - entryPad, _Digits);
+       entryHigh = NormalizeDouble(price,             _Digits); }
+   else
+     { entryLow  = NormalizeDouble(price,             _Digits);
+       entryHigh = NormalizeDouble(price + entryPad,  _Digits); }
+
+   double swingLevel = 0;
+   double nearDist   = DBL_MAX;
+
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(dir == 1 && !g_lv[k].isHigh)
+        {
+         if(g_lv[k].price < entryLow)
+           { double d = entryLow - g_lv[k].price; if(d < nearDist) { nearDist = d; swingLevel = g_lv[k].price; } }
+        }
+      else if(dir == -1 && g_lv[k].isHigh)
+        {
+         if(g_lv[k].price > entryHigh)
+           { double d = g_lv[k].price - entryHigh; if(d < nearDist) { nearDist = d; swingLevel = g_lv[k].price; } }
+        }
+     }
+
+   bool swingValid = (swingLevel > 0 &&
+                      (InpSLMaxATR <= 0 ||
+                       MathAbs((dir==1 ? entryLow : entryHigh) - swingLevel) <= InpSLMaxATR * atr));
+
+   double sl;
+   if(swingValid)
+      sl = NormalizeDouble(dir == 1 ? swingLevel - InpSLATRMult * atr
+                                    : swingLevel + InpSLATRMult * atr, _Digits);
+   else
+      sl = NormalizeDouble(dir == 1 ? entryLow  - InpSLATRMult * atr
+                                    : entryHigh + InpSLATRMult * atr, _Digits);
+
+   return " | Entry:" + DoubleToString(entryLow, _Digits) + "-" + DoubleToString(entryHigh, _Digits) +
+          " SL:" + DoubleToString(sl, _Digits);
+  }
+
+//+------------------------------------------------------------------+
+//| ZONE GV CONFLUENCE TAG                                           |
+//+------------------------------------------------------------------+
+string ZoneTag(int dir, double price, double atr, datetime barTime)
+  {
+   if(!InpZoneGV || InpZoneGVExpiry <= 0) return "";
+   string tag = "";
+   long expirySeconds = (long)InpZoneGVExpiry * PeriodSeconds(InpSignalTF);
+
+   // --- SR Zones / Liquidity Signals swing level tag ---
+   if(GlobalVariableCheck("SRZONES_DIR") && GlobalVariableCheck("SRZONES_TIME") && GlobalVariableCheck("SRZONES_PRICE"))
+     {
+      double gvDir   = GlobalVariableGet("SRZONES_DIR");
+      double gvPrice = GlobalVariableGet("SRZONES_PRICE");
+      double gvTime  = GlobalVariableGet("SRZONES_TIME");
+      if((int)gvDir == dir &&
+         (long)barTime - (long)gvTime <= expirySeconds &&
+         !(atr > 0 && MathAbs(price - gvPrice) > 2.0 * atr))
+         tag += " ZONE";
+     }
+
+   // --- CHoCH tag — structure change confirmed in same direction ---
+   if(GlobalVariableCheck("SPL_CHOCH_DIR") && GlobalVariableCheck("SPL_CHOCH_TIME"))
+     {
+      double chochDir  = GlobalVariableGet("SPL_CHOCH_DIR");
+      double chochTime = GlobalVariableGet("SPL_CHOCH_TIME");
+      if((int)chochDir == dir &&
+         (long)barTime - (long)chochTime <= expirySeconds)
+         tag += " CHoCH";
+     }
+
+   // --- MSS tag — FVG or OB zone entry in same direction ---
+   if(GlobalVariableCheck("SPL_MSS_DIR") && GlobalVariableCheck("SPL_MSS_TIME"))
+     {
+      double mssDir  = GlobalVariableGet("SPL_MSS_DIR");
+      double mssTime = GlobalVariableGet("SPL_MSS_TIME");
+      if((int)mssDir == dir &&
+         (long)barTime - (long)mssTime <= expirySeconds)
+        {
+         bool isFVG = GlobalVariableCheck("SPL_MSS_TYPE") && GlobalVariableGet("SPL_MSS_TYPE") > 0.5;
+         tag += isFVG ? " FVG" : " OB";
+        }
+     }
+
+   return tag;
+  }
+
+//+------------------------------------------------------------------+
+//| MAIN CALCULATIONS                                                |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double   &open[],
+                const double   &high[],
+                const double   &low[],
+                const double   &close[],
+                const long     &tick_volume[],
+                const long     &volume[],
+                const int      &spread[])
+  {
+   if(rates_total < InpATRLen + 2) return 0;
+
+   // --- Fresh load: restore persisted state or apply clean defaults ---
+   if(prev_calculated == 0)
+     {
+      // Always rescan pivots — can't be persisted cheaply
+      ArrayResize(g_lv, 0);
+      g_nLv = 0;
+
+      if(GvRestore())
+        {
+         if(InpPrintLog) Print("[STATE] Restored from GlobalVariables | Symbol=", Symbol(),
+               " PullbackDir=", g_lastPullbackDir,
+               " HTF Slow=", (g_htfRsTrend1>0?"BUY":"SELL"),
+               " Fast=", (g_htfRsTrend2>0?"BUY":"SELL"));
+         g_lastPullbackBar = -1;
+         g_lastSignalBar   = -1;  // stale bar index invalid after reload — reset cooldown
+        }
+      else
+        {
+         // No prior save found — full clean init
+         g_lastPullbackDir  = 0;
+         g_lastPullbackTime = 0;
+         g_lastPullbackBar  = -1;
+         g_curRSTrend       = 0;
+         g_lastRBSSBRDir    = 0;
+         g_lastRBSSBRTime   = 0;
+         g_htfRollSeg1 = 0.0; g_htfRsTrend1 = 1.0;
+         g_htfRollSeg2 = 0.0; g_htfRsTrend2 = 1.0;
+         g_htfPrevSlowDir = 0; g_htfPrevFastDir = 0;
+         g_htfFastCandidateDir = 0; g_htfFastCandidateCount = 0; g_htfFastConfirmedDir = 0;
+         g_sniperState = WATCH_NONE; g_sniperDir = 0;
+         g_sniperRSSlow = 0; g_sniperRSFast = 0;
+         g_sniperConsHigh = 0; g_sniperConsLow = 0;
+         g_sniperConsTime = 0; g_sniperLabel = "";
+         g_lastSignalDir = 0;
+         g_lastSignalBar = -1;
+         g_lastRSDir     = 0;
+         g_rangingNotified     = false;
+         g_rangingLastReminder = 0;
+         g_rangingBreakTime    = 0;
+         g_rangeTradeActive    = false;
+         g_rangeBuyTouches     = 0;
+         g_rangeSellTouches    = 0;
+         g_fibRangeBreakUp     = false;
+         g_fibRangeBreakDown   = false;
+         // Reset consolidation history on clean attach
+         for(int _h=0;_h<HIST_MAX;_h++) { g_hist[_h].valid=false; g_hist[_h].high=0; g_hist[_h].low=0; g_hist[_h].confirmTime=0; g_hist[_h].breakDir=0; g_hist[_h].touches=0; }
+         g_histCount = 0;
+         g_po3State    = PO3_NONE; g_po3BreakDir = 0;
+         g_po3BreakHigh = 0.0; g_po3BreakLow = 0.0;
+         g_po3BarCount = 0; g_po3Notified = false; g_po3InRetest = false;
+         g_po3RangeBreakDir = 0; g_po3RangeBreakBars = 0;
+        }
+
+      // ─── FIX #1: ALWAYS reset ranging state on fresh load ───────────────
+      g_isRanging       = false;
+      g_rangePH         = 0.0;
+      g_rangePL         = 0.0;
+      g_rangingNotified = false;  // always re-announce on fresh attach
+
+      // ─── FIX #2: ALWAYS zero LTF bar time to force first-run gate pass ───
+      // GvRestore() may have set g_lastLTFBarTime to the current live M1 bar.
+      // This would cause the ltfLastTime == g_lastLTFBarTime gate to fire,
+      // skipping pivot detection, HTF RS, RS engine, and all signal logic
+      // on the first pass — the entire signal engine silently does nothing
+      // until the NEXT M1 bar closes. Force 0 so the gate always passes once.
+      g_lastLTFBarTime = 0;
+     }
+
+   // --- Current TF ATR (display + range + entry/SL) ---
+   double atrRaw[];
+   ArraySetAsSeries(atrRaw, true);
+   if(CopyBuffer(g_atrHandle, 0, 0, rates_total, atrRaw) < rates_total) return 0;
+
+   // Fill empty bars before ATR init
+   for(int j = 0; j < InpATRLen && j < rates_total; j++)
+     {
+      BufRS1[j] = EMPTY_VALUE; BufRSColor1[j] = 0;
+      BufRS2[j] = EMPTY_VALUE; BufRSColor2[j] = 0;
+     }
+
+   // --- Display buffers: RS drawn on current TF bars ---
+   // NOTE: display lines use current TF close/ATR — visual only
+   //       signal engine below uses LTF data
+   double rollSeg1Disp   = close[InpATRLen];
+   double rsTrend1Disp   = 1.0;
+   double actSlope1Disp  = 0.0;
+   bool   isFast1Disp    = false;
+
+   double rollSeg2Disp   = close[InpATRLen];
+   double rsTrend2Disp   = 1.0;
+   double actSlope2Disp  = 0.0;
+   bool   isFast2Disp    = false;
+
+   BufRS1[InpATRLen]      = rollSeg1Disp;
+   BufRSColor1[InpATRLen] = 0;
+   BufRS2[InpATRLen]      = rollSeg2Disp;
+   BufRSColor2[InpATRLen] = 0;
+
+   for(int i = InpATRLen + 1; i < rates_total; i++)
+     {
+      double atr = atrRaw[rates_total - 1 - i];
+      if(atr <= 0.0 || atr >= EMPTY_VALUE || !MathIsValidNumber(atr))
+        {
+         BufRS1[i]      = close[i]; BufRSColor1[i] = (rsTrend1Disp > 0) ? 0 : 1;
+         BufRS2[i]      = close[i]; BufRSColor2[i] = (rsTrend2Disp > 0) ? 0 : 1;
+         continue;
+        }
+
+      double dist1 = close[i] - rollSeg1Disp;
+      bool bullRev1 = (rsTrend1Disp < 0) && (dist1  >  InpRSRevThresh * atr);
+      bool bearRev1 = (rsTrend1Disp > 0) && (-dist1 >  InpRSRevThresh * atr);
+      if(bullRev1) rsTrend1Disp = 1.0; else if(bearRev1) rsTrend1Disp = -1.0;
+      bool nf1 = (MathAbs(dist1) > InpRSFastThresh * atr);
+      if(bullRev1 || bearRev1 || (nf1 != isFast1Disp) || actSlope1Disp == 0.0)
+        { isFast1Disp = nf1; actSlope1Disp = isFast1Disp ? atr/InpRSFastLen : atr/InpRSSlowLen; }
+      rollSeg1Disp += rsTrend1Disp * actSlope1Disp;
+      BufRS1[i]      = rollSeg1Disp;
+      BufRSColor1[i] = (rsTrend1Disp > 0) ? 0 : 1;
+
+      double dist2 = close[i] - rollSeg2Disp;
+      bool bullRev2 = (rsTrend2Disp < 0) && (dist2  >  InpRSRevThresh * atr);
+      bool bearRev2 = (rsTrend2Disp > 0) && (-dist2 >  InpRSRevThresh * atr);
+      if(bullRev2) rsTrend2Disp = 1.0; else if(bearRev2) rsTrend2Disp = -1.0;
+      bool nf2 = (MathAbs(dist2) > InpRSFastThresh * atr);
+      if(bullRev2 || bearRev2 || (nf2 != isFast2Disp) || actSlope2Disp == 0.0)
+        { isFast2Disp = nf2; actSlope2Disp = isFast2Disp ? atr/InpRSFastLen2 : atr/InpRSSlowLen2; }
+      rollSeg2Disp += rsTrend2Disp * actSlope2Disp;
+      BufRS2[i]      = rollSeg2Disp;
+      BufRSColor2[i] = (rsTrend2Disp > 0) ? 0 : 1;
+     }
+
+   // ================================================================
+   // SIGNAL ENGINE — runs on LTF bars
+   // Only re-evaluate when a new LTF bar has closed
+   // ================================================================
+
+   // Fetch LTF rates
+   MqlRates ltfRates[];
+   ArraySetAsSeries(ltfRates, false);
+   int ltfTotal = CopyRates(NULL, InpSignalTF, 0, 3000, ltfRates);
+   if(ltfTotal < InpATRLen + 2) return rates_total;
+
+   // Confirmed last closed LTF bar
+   int ltfLast = ltfTotal - 2; // rates_total-2 equivalent on LTF
+   datetime ltfLastTime = ltfRates[ltfLast].time;
+
+   // Only process once per new LTF bar
+   if(ltfLastTime == g_lastLTFBarTime) return rates_total;
+   g_lastLTFBarTime = ltfLastTime;
+
+   // Fetch LTF ATR
+   double atrLTF[];
+   ArraySetAsSeries(atrLTF, false);
+   if(CopyBuffer(g_atrLTFHandle, 0, 0, ltfTotal, atrLTF) < ltfTotal) return rates_total;
+
+   // Current TF ATR for entry/SL and range (use last confirmed current bar)
+   double atrCur = atrRaw[1]; // index 1 = last confirmed current bar (series reversed)
+
+   // --- Pivot Detection Loop — M1 LTF ---
+   // Runs regardless of InpEnableRange — pivots feed FibRecalc/FibTag/SD engine.
+   // InpEnableRange only gates the ranging/signal-block behaviour in i_RangeCheck.
+   {
+      int pivStart = (prev_calculated == 0) ? InpSwingLeft : MathMax(InpSwingLeft, ltfLast - 50);
+      for(int p = pivStart; p <= ltfLast; p++)
+        {
+         int pBar = p - InpSwingRight;
+         if(pBar < InpSwingLeft || pBar + InpSwingRight > ltfLast) continue;
+
+         double ph = ltfRates[pBar].high;
+         double pl = ltfRates[pBar].low;
+         datetime pt = ltfRates[pBar].time;
+
+         bool isph = true;
+         for(int k = 1; k <= InpSwingLeft  && isph; k++) if(ltfRates[pBar-k].high >= ph) isph = false;
+         for(int k = 1; k <= InpSwingRight && isph; k++) if(ltfRates[pBar+k].high >= ph) isph = false;
+         if(isph)
+           {
+            bool exists = false;
+            for(int k = 0; k < g_nLv; k++)
+               if(g_lv[k].isHigh && g_lv[k].t1 == pt) { exists = true; break; }
+            if(!exists) AddLevel(ph, ph, pl, pt, true);
+           }
+
+         bool ispl = true;
+         for(int k = 1; k <= InpSwingLeft  && ispl; k++) if(ltfRates[pBar-k].low <= pl) ispl = false;
+         for(int k = 1; k <= InpSwingRight && ispl; k++) if(ltfRates[pBar+k].low <= pl) ispl = false;
+         if(ispl)
+           {
+            bool exists = false;
+            for(int k = 0; k < g_nLv; k++)
+               if(!g_lv[k].isHigh && g_lv[k].t1 == pt) { exists = true; break; }
+            if(!exists) AddLevel(pl, ph, pl, pt, false);
+           }
+
+         for(int j = 0; j < g_nLv; j++)
+           {
+            if(g_lv[j].broken) continue;
+            if(p < ltfLast)
+              {
+               if(g_lv[j].isHigh ? (ltfRates[p].close > g_lv[j].price) : (ltfRates[p].close < g_lv[j].price))
+                  g_lv[j].broken = true;
+              }
+           }
+        }
+     }
+
+   // ================================================================
+   // HTF RS ENGINE — updates g_htfRsTrend1/2 once per new LTF bar
+   // Uses same RS parameters as LTF engine (shared InpRS* inputs)
+   // ================================================================
+   {
+    MqlRates htfRates[];
+    ArraySetAsSeries(htfRates, false);
+    int htfTotal = CopyRates(NULL, InpHTF, 0, 1500, htfRates);
+
+    double atrHTF[];
+    ArraySetAsSeries(atrHTF, false);
+
+    if(htfTotal >= InpATRLen + 2 &&
+       CopyBuffer(g_atrHTFHandle, 0, 0, htfTotal, atrHTF) >= htfTotal)
+      {
+       double htfSeg1 = htfRates[InpATRLen].close, htfTrend1 = 1.0, htfSlope1 = 0.0; bool htfFast1 = false;
+       double htfSeg2 = htfRates[InpATRLen].close, htfTrend2 = 1.0, htfSlope2 = 0.0; bool htfFast2 = false;
+       int    htfLast = htfTotal - 2;
+
+       for(int hi = InpATRLen + 1; hi <= htfLast; hi++)
+         {
+          double hatr = atrHTF[hi];
+          if(hatr <= 0.0 || hatr >= EMPTY_VALUE || !MathIsValidNumber(hatr)) continue;
+
+          // HTF Slow RS
+          double hd1  = htfRates[hi].close - htfSeg1;
+          bool   hbR1 = (htfTrend1 < 0) && ( hd1 >  InpRSRevThresh * hatr);
+          bool   hbr1 = (htfTrend1 > 0) && (-hd1 >  InpRSRevThresh * hatr);
+          if(hbR1) htfTrend1 = 1.0; else if(hbr1) htfTrend1 = -1.0;
+          bool hnf1 = (MathAbs(hd1) > InpRSFastThresh * hatr);
+          if(hbR1 || hbr1 || (hnf1 != htfFast1) || htfSlope1 == 0.0)
+            { htfFast1 = hnf1; htfSlope1 = htfFast1 ? hatr/InpRSFastLen : hatr/InpRSSlowLen; }
+          htfSeg1 += htfTrend1 * htfSlope1;
+
+          // HTF Fast RS
+          double hd2  = htfRates[hi].close - htfSeg2;
+          bool   hbR2 = (htfTrend2 < 0) && ( hd2 >  InpRSRevThresh * hatr);
+          bool   hbr2 = (htfTrend2 > 0) && (-hd2 >  InpRSRevThresh * hatr);
+          if(hbR2) htfTrend2 = 1.0; else if(hbr2) htfTrend2 = -1.0;
+          bool hnf2 = (MathAbs(hd2) > InpRSFastThresh * hatr);
+          if(hbR2 || hbr2 || (hnf2 != htfFast2) || htfSlope2 == 0.0)
+            { htfFast2 = hnf2; htfSlope2 = htfFast2 ? hatr/InpRSFastLen2 : hatr/InpRSSlowLen2; }
+          htfSeg2 += htfTrend2 * htfSlope2;
+         }
+
+       // Persist final raw state
+       g_htfRollSeg1 = htfSeg1; g_htfRsTrend1 = htfTrend1;
+       g_htfRollSeg2 = htfSeg2; g_htfRsTrend2 = htfTrend2;
+
+       // HTF Fast stability filter — must hold N consecutive HTF bars before confirmed
+       int rawFast = (htfTrend2 > 0) ? 1 : -1;
+       if(rawFast == g_htfFastCandidateDir)
+         {
+          g_htfFastCandidateCount++;
+          if(g_htfFastCandidateCount >= HTF_FAST_MIN_HOLD)
+             g_htfFastConfirmedDir = g_htfFastCandidateDir;
+         }
+       else
+         {
+          // New candidate — reset counter
+          g_htfFastCandidateDir   = rawFast;
+          g_htfFastCandidateCount = 1;
+          // Don't update confirmed yet — must hold first
+         }
+
+       // Log only on confirmed direction change
+       int nowSlow = (g_htfRsTrend1 > 0) ? 1 : -1;
+       int nowFast = g_htfFastConfirmedDir != 0 ? g_htfFastConfirmedDir : rawFast;
+       if(InpPrintLog && (nowSlow != g_htfPrevSlowDir || nowFast != g_htfPrevFastDir))
+         {
+          Print("[HTF DIRECTION] Slow=", (nowSlow==1?"BUY":"SELL"),
+                " Fast=", (nowFast==1?"BUY":"SELL"),
+                " | ", Symbol(), " ", EnumToString(InpHTF));
+          g_htfPrevSlowDir = nowSlow;
+          g_htfPrevFastDir = nowFast;
+         }
+      }
+    else
+      {
+       if(InpPrintLog) Print("[HTF] Insufficient data — filter using last known state");
+      }
+   }
+
+   // HTF alignment helpers — slow uses raw, fast uses stability-filtered confirmed direction
+   int  htfSlowDir  = (g_htfRsTrend1 > 0) ? 1 : -1;
+   int  htfFastDir  = (g_htfFastConfirmedDir != 0) ? g_htfFastConfirmedDir : ((g_htfRsTrend2 > 0) ? 1 : -1);
+
+   // Recalc external fib anchors AFTER HTF RS engine — uses current-bar g_htfRsTrend1
+   // Note: pivot detection always runs — g_fibValid independent of InpEnableRange
+   // When range is active, fib is already anchored to range box — skip pivot hunt
+   if(!g_isRanging)
+      FibRecalc(ltfRates[ltfLast].close, atrCur);
+
+   // --- RS Signal Engine on LTF ---
+   // Run full LTF RS state machine
+   double rollSeg1  = ltfRates[InpATRLen].close;
+   double rsTrend1  = 1.0, actSlope1 = 0.0;
+   bool   isFast1   = false;
+   int    bsFlip1   = 0;
+
+   double rollSeg2  = ltfRates[InpATRLen].close;
+   double rsTrend2  = 1.0, actSlope2 = 0.0;
+   bool   isFast2   = false;
+   int    bsFlip2   = 0;
+
+   for(int i = InpATRLen + 1; i <= ltfLast; i++)
+     {
+      double atr = atrLTF[i];
+      if(atr <= 0.0 || atr >= EMPTY_VALUE || !MathIsValidNumber(atr)) continue;
+
+      // Slow RS
+      double d1    = ltfRates[i].close - rollSeg1;
+      bool   bR1   = (rsTrend1 < 0) && ( d1 >  InpRSRevThresh * atr);
+      bool   brR1  = (rsTrend1 > 0) && (-d1 >  InpRSRevThresh * atr);
+      double prev1 = rsTrend1;
+      if(bR1) rsTrend1 = 1.0; else if(brR1) rsTrend1 = -1.0;
+      if(rsTrend1 != prev1) bsFlip1 = 0; else bsFlip1++;
+      bool nf1 = (MathAbs(d1) > InpRSFastThresh * atr);
+      if(bR1 || brR1 || (nf1 != isFast1) || actSlope1 == 0.0)
+        { isFast1 = nf1; actSlope1 = isFast1 ? atr/InpRSFastLen : atr/InpRSSlowLen; }
+      rollSeg1 += rsTrend1 * actSlope1;
+
+      // Fast RS
+      double d2    = ltfRates[i].close - rollSeg2;
+      bool   bR2   = (rsTrend2 < 0) && ( d2 >  InpRSRevThresh * atr);
+      bool   brR2  = (rsTrend2 > 0) && (-d2 >  InpRSRevThresh * atr);
+      double prev2 = rsTrend2;
+      if(bR2) rsTrend2 = 1.0; else if(brR2) rsTrend2 = -1.0;
+      if(rsTrend2 != prev2) bsFlip2 = 0; else bsFlip2++;
+      bool nf2 = (MathAbs(d2) > InpRSFastThresh * atr);
+      if(bR2 || brR2 || (nf2 != isFast2) || actSlope2 == 0.0)
+        { isFast2 = nf2; actSlope2 = isFast2 ? atr/InpRSFastLen2 : atr/InpRSSlowLen2; }
+      rollSeg2 += rsTrend2 * actSlope2;
+     }
+
+   // Update RS trend tracker for RBS/SBR gate
+   int newTrend = (rsTrend1 > 0) ? 1 : -1;
+   if(newTrend != g_curRSTrend && g_curRSTrend != 0)
+      g_lastRBSSBRDir = 0;
+   g_curRSTrend = newTrend;
+
+   // --- Range Detection (M1 LTF — bsFlip1 now available) ---
+   i_RangeCheck(ltfRates, atrLTF, ltfTotal, ltfLast, bsFlip1);
+
+   // LTF close price at signal bar — used for entry/SL
+   double ltfClose = ltfRates[ltfLast].close;
+
+   // Signal TF label for push message
+   string tfLabel = EnumToString(InpSignalTF);
+   StringReplace(tfLabel, "PERIOD_", "");
+
+   // Separation check
+   double rsSep     = MathAbs(rollSeg1 - rollSeg2);
+   bool   linesClose = (InpRSMinSep > 0 && atrLTF[ltfLast] > 0 &&
+                        rsSep < InpRSMinSep * atrLTF[ltfLast]);
+
+if(!linesClose && (InpEngineMode == ENGINE_AB_ONLY || InpEngineMode == ENGINE_BOTH))     
+{
+      string alertMsg = "";
+      bool   trigger  = false;
+
+      if(InpAlertA_Plus && rsTrend1 == rsTrend2 &&
+         (bsFlip1 == 0 || bsFlip2 == 0) &&
+         bsFlip1 <= InpAlignBars && bsFlip2 <= InpAlignBars)
+        {
+         alertMsg   = (rsTrend1 > 0) ? "🟢 A+ BUY" : "🔴 A+ SELL";
+         trigger    = true;
+         if(g_lastPullbackDir != 0) { g_lastPullbackDir = 0; g_lastPullbackTime = 0; g_lastPullbackBar = -1; }
+        }
+      else if(InpAlertBPlusPlus && rsTrend1 == rsTrend2 &&
+              bsFlip1 == 0 &&
+              g_lastPullbackDir == ((rsTrend1 > 0) ? 1 : -1) &&
+              g_lastPullbackTime > 0 &&
+              (InpBPPMaxBars == 0 || g_lastPullbackBar < 0 ||
+               (ltfLast - g_lastPullbackBar) <= InpBPPMaxBars))
+        {
+         alertMsg   = (rsTrend1 > 0) ? "🔥🟢 B++ BUY" : "🔥🔴 B++ SELL";
+         trigger    = true;
+         if(InpPrintLog) Print("[B++] Fired | dir=", (rsTrend1>0?1:-1),
+               " pullback at ", TimeToString(g_lastPullbackTime), " | ", Symbol());
+         g_lastPullbackDir = 0; g_lastPullbackTime = 0; g_lastPullbackBar = -1;
+        }
+      else if(InpAlertB_Plus && rsTrend1 == rsTrend2 &&
+              bsFlip2 == 0 && bsFlip1 > InpAlignBars)
+        {
+         alertMsg   = (rsTrend1 > 0) ? "🟢 B+ BUY" : "🔴 B+ SELL";
+         trigger    = true;
+         if(g_lastPullbackDir != 0)
+           {
+            if(InpPrintLog) Print("[B+] Clearing pullback | was dir=", g_lastPullbackDir, " | ", Symbol());
+            g_lastPullbackDir = 0; g_lastPullbackTime = 0; g_lastPullbackBar = -1;
+           }
+        }
+      else if(rsTrend1 != rsTrend2 && bsFlip2 == 0)
+        {
+         // Pullback state tracking
+         if(g_lastPullbackDir != 0 && InpBPPMaxBars > 0 &&
+            g_lastPullbackBar >= 0 && (ltfLast - g_lastPullbackBar) > InpBPPMaxBars)
+           {
+            if(InpPrintLog) Print("[PULLBACK] Expired | was dir=", g_lastPullbackDir,
+                  " | age=", (ltfLast - g_lastPullbackBar), " bars | ", Symbol());
+            g_lastPullbackDir = 0; g_lastPullbackTime = 0; g_lastPullbackBar = -1;
+           }
+         if(g_lastPullbackDir == 0)
+           {
+            g_lastPullbackDir  = (rsTrend2 > 0) ? 1 : -1;
+            g_lastPullbackTime = ltfLastTime;
+            g_lastPullbackBar  = ltfLast;
+            if(InpPrintLog) Print("[PULLBACK] Stored | dir=", g_lastPullbackDir,
+                  " | ", Symbol(), " | ", TimeToString(ltfLastTime));
+           }
+         else
+           { if(InpPrintLog) Print("[PULLBACK] Protected | existing dir=", g_lastPullbackDir,
+                 " | fast tried=", (rsTrend2>0?1:-1), " | ", Symbol()); }
+        }
+
+      if(trigger && alertMsg != "")
+        {
+         int  sigDir    = (StringFind(alertMsg, "BUY") >= 0) ? 1 : -1;
+         bool htfBothOk = (htfSlowDir == sigDir && htfFastDir == sigDir);
+
+         // While ranging — A+/B+/B++ fire normally
+         // Range engine owns boundary touches (RANGE BUY/SELL)
+         // RS momentum signals always fire — they are the core engine
+
+         string entrySuffix = BuildEntryStr(sigDir, ltfClose, atrCur);
+         string zt          = ZoneTag(sigDir, ltfClose, atrCur, ltfLastTime);
+
+         // PO3 gate — suppress same direction as fake break during WATCH/RETEST
+         bool po3Suppressed = ((g_po3State == PO3_WATCH || g_po3State == PO3_RETEST) && sigDir == g_po3BreakDir);
+         if(po3Suppressed)
+            if(InpPrintLog) Print("[PO3] Signal SUPPRESSED — same dir as fake break (",
+                  (sigDir==1?"BUY":"SELL"), ") | ", Symbol());
+
+         // Cooldown gate — suppress opposite signal within InpAlignBars bars
+         // Uses g_lastRSDir (RS-only) — never contaminated by PO3 direction updates
+         // Require barsSinceLast > 0 — same-bar = two engines firing same bar = allowed
+         int barsSinceLast = (g_lastSignalBar >= 0) ? (ltfLast - g_lastSignalBar) : 999;
+         bool cooldownBlock = (sigDir != g_lastRSDir &&
+                               barsSinceLast > 0 &&
+                               barsSinceLast < InpAlignBars);
+         if(cooldownBlock)
+            if(InpPrintLog) Print("[COOLDOWN] Signal suppressed — opposite fired only ",
+                  barsSinceLast, " bars ago | ", Symbol());
+
+         if(!po3Suppressed && !cooldownBlock)
+           {
+            // PO3 tag — opposite direction during watch = early warning
+            string po3Tag  = ((g_po3State == PO3_WATCH || g_po3State == PO3_RETEST) && sigDir != g_po3BreakDir) ? " PO3" : "";
+            string fibTag  = FibTag(ltfClose, sigDir);
+            string fvgTag  = FVGZoneTag(sigDir, ltfRates[ltfLast].time);
+            string histTag = HistTag(ltfClose, sigDir, atrCur);
+            int    fibClass    = FibZoneClass(ltfClose);
+            bool   fvgConfirmed = (StringFind(fvgTag, "✅") >= 0);
+            bool   fibBlock    = (InpFibFilter && fibClass == 0 && !fvgConfirmed);
+            // fibBlock = EQ zone no FVG/OB — block RS signals (EQ = chop/ranging zone)
+            // RBS/SBR have their own fib gate; this only applies to A+/B+/B++
+            // FIB EQ BLOCK REMOVED — RS signals always fire
+            fibBlock = false;
+
+            if(fibBlock)
+              {
+               if(InpPrintLog) Print("[FIB EQ BLOCK] RS signal suppressed — EQ zone no FVG/OB | ",
+                     alertMsg, fibTag, " | ", Symbol());
+              }
+            else
+              {
+               if(htfBothOk)
+                 {
+                  string fullMsg = alertMsg + po3Tag + zt + fibTag + fvgTag + histTag + " | " + Symbol() + " " + tfLabel + entrySuffix;
+                  string fullPfx = ConfidencePrefix(fullMsg) + fullMsg;
+                  if(sigDir != g_lastSignalDir)
+                    { if(InpSendPush) SendNotification(fullPfx); if(InpSendAlert) Alert(fullPfx); }
+                  else if(InpPrintLog) Print("[RS COOLDIR] Same dir blocked | ", fullMsg);
+                  if(InpPrintLog) Print(fullPfx);
+                 }
+               else
+                 {
+                  string scalpMsg = alertMsg + po3Tag + " SCALP" + zt + fibTag + fvgTag + histTag + " | " + Symbol() + " " + tfLabel + entrySuffix;
+                  string scalpPfx = ConfidencePrefix(scalpMsg) + scalpMsg;
+                  if(sigDir != g_lastSignalDir)
+                    { if(InpSendPush) SendNotification(scalpPfx); if(InpSendAlert) Alert(scalpPfx); }
+                  else if(InpPrintLog) Print("[RS COOLDIR] Same dir blocked | ", scalpMsg);
+                  if(InpPrintLog) Print(scalpPfx);
+                 }
+
+               // --- ARM SNIPER WATCH --- only on non-silenced signals
+               if(InpSniperMode)
+                 {
+                  if(sigDir == g_lastSignalDir)
+                     if(InpPrintLog) Print("[SNIPER] SKIPPED — same dir as last signal (",
+                           (sigDir==1?"BUY":"SELL"), ") | ", Symbol());
+                  else
+                    {
+                     if(g_sniperDir != 0 && g_sniperDir != sigDir)
+                        if(InpPrintLog) Print("[SNIPER] Watch CANCELLED — opposite signal | ", Symbol());
+                     g_sniperState    = WATCH_PULLBACK;
+                     g_sniperDir      = sigDir;
+                     g_sniperRSSlow   = rollSeg1;
+                     g_sniperRSFast   = rollSeg2;
+                     g_sniperLabel    = alertMsg + po3Tag;
+                     g_sniperConsHigh = 0; g_sniperConsLow = 0; g_sniperConsTime = 0;
+                     if(InpPrintLog) Print("[SNIPER] Watch ARMED | dir=", sigDir,
+                           " SlowRS=", DoubleToString(rollSeg1, _Digits),
+                           " FastRS=", DoubleToString(rollSeg2, _Digits), " | ", Symbol());
+                    }
+                 }
+
+               // Update direction lock — only on non-silenced signals
+               g_lastSignalDir = sigDir;
+               g_lastSignalBar = ltfLast;
+               g_lastRSDir     = sigDir;  // RS-only cooldown — isolated from PO3
+              }
+
+           }
+        }
+     } // end RS engine loop
+
+   // ================================================================
+   // SNIPER ENGINE — runs each LTF bar while watch is active
+   // ================================================================
+   if(InpSniperMode && !g_isRanging && g_sniperState != WATCH_NONE && ltfLast >= 1)
+     {
+      double barHigh  = ltfRates[ltfLast].high;
+      double barLow   = ltfRates[ltfLast].low;
+      double barClose = ltfRates[ltfLast].close;
+      double barOpen  = ltfRates[ltfLast].open;
+      double slowLine = rollSeg1;
+      double fastLine = rollSeg2;
+
+      static bool s_closePrinted = false;  // reset when state changes
+      static bool s_setupPrinted = false;
+
+      if(g_sniperState == WATCH_PULLBACK)
+        {
+         s_setupPrinted = false; // reset for next setup phase
+         bool touchedSlow = (g_sniperDir == 1) ? (barLow  <= slowLine) : (barHigh >= slowLine);
+         bool touchedFast = (g_sniperDir == 1) ? (barLow  <= fastLine) : (barHigh >= fastLine);
+
+         // Print CLOSE once when nearest line within 1×ATR
+         if(InpPrintLog && !s_closePrinted)
+           {
+            double distSlow = (g_sniperDir == 1) ? barLow - slowLine : slowLine - barHigh;
+            double distFast = (g_sniperDir == 1) ? barLow - fastLine : fastLine - barHigh;
+            double nearest  = MathMin(MathAbs(distSlow), MathAbs(distFast));
+            if(nearest <= atrLTF[ltfLast] * 1.0)
+              {
+               Print("[SNIPER] CLOSE | dir=", (g_sniperDir==1?"BUY":"SELL"),
+                     " | NearestDist=", DoubleToString(nearest, _Digits),
+                     " | Slow=", DoubleToString(slowLine, _Digits),
+                     " Fast=", DoubleToString(fastLine, _Digits),
+                     " | Bar=", TimeToString(ltfRates[ltfLast].time), " | ", Symbol());
+               s_closePrinted = true;
+              }
+           }
+
+         if(touchedSlow || touchedFast)
+           {
+            g_sniperState    = WATCH_SETUP;
+            g_sniperConsHigh = barHigh;
+            g_sniperConsLow  = barLow;
+            g_sniperConsTime = ltfRates[ltfLast].time;
+            s_closePrinted   = false; // reset for next pullback
+            if(InpPrintLog) Print("[SNIPER] TOUCHED ", (touchedSlow?"SLOW":"FAST"), " RS line | dir=", (g_sniperDir==1?"BUY":"SELL"),
+                  " | Bar=", TimeToString(g_sniperConsTime),
+                  " | ConsH=", DoubleToString(barHigh, _Digits),
+                  " ConsL=", DoubleToString(barLow, _Digits), " | ", Symbol());
+           }
+        }
+      else if(g_sniperState == WATCH_SETUP)
+        {
+         if(g_sniperDir == 1 && barLow  < g_sniperConsLow)  g_sniperConsLow  = barLow;
+         if(g_sniperDir == -1 && barHigh > g_sniperConsHigh) g_sniperConsHigh = barHigh;
+
+         bool breakOut = (g_sniperDir == 1)  ? (barClose > g_sniperConsHigh && barOpen <= g_sniperConsHigh)
+                                              : (barClose < g_sniperConsLow  && barOpen >= g_sniperConsLow);
+         bool overshot = (g_sniperDir == 1)
+                         ? (barClose < MathMin(slowLine, fastLine) - atrLTF[ltfLast] * 2.0)
+                         : (barClose > MathMax(slowLine, fastLine) + atrLTF[ltfLast] * 2.0);
+
+         // Print SETUP once on entry to setup state
+         if(InpPrintLog && !s_setupPrinted)
+           {
+            Print("[SNIPER] SETUP | dir=", (g_sniperDir==1?"BUY":"SELL"),
+                  " | ConsH=", DoubleToString(g_sniperConsHigh, _Digits),
+                  " ConsL=", DoubleToString(g_sniperConsLow, _Digits),
+                  " | Watching for break | ", Symbol());
+            s_setupPrinted = true;
+           }
+
+         if(overshot)
+           {
+            g_sniperState = WATCH_PULLBACK;
+            g_sniperConsHigh = 0; g_sniperConsLow = 0; g_sniperConsTime = 0;
+            s_setupPrinted = false; s_closePrinted = false;
+            if(InpPrintLog) Print("[SNIPER] OVERSHOT — reset to WATCH_PULLBACK | ", Symbol());
+           }
+         else if(breakOut)
+           {
+            string entrySuffix = BuildEntryStr(g_sniperDir, barClose, atrCur);
+            string zt          = ZoneTag(g_sniperDir, barClose, atrCur, ltfRates[ltfLast].time);
+            string tfLbl       = EnumToString(InpSignalTF);
+            StringReplace(tfLbl, "PERIOD_", "");
+            string sniperMsg = "🎯 " + g_sniperLabel + zt + " | " + Symbol() + " " + tfLbl + entrySuffix;
+            if(InpSendPush)  SendNotification(sniperMsg);
+            if(InpSendAlert) Alert(sniperMsg);
+            if(InpPrintLog)  Print(sniperMsg);
+            g_sniperState = WATCH_NONE; g_sniperDir = 0;
+            g_sniperConsHigh = 0; g_sniperConsLow = 0;
+            g_sniperConsTime = 0; g_sniperLabel = "";
+            s_setupPrinted = false; s_closePrinted = false;
+           }
+        }
+     }
+
+   // Increment range break bar counter — expires after 20 bars
+   if(g_po3RangeBreakDir != 0)
+     {
+      g_po3RangeBreakBars++;
+      if(g_po3RangeBreakBars > 20)
+        { g_po3RangeBreakDir = 0; g_po3RangeBreakBars = 0; }
+     }
+
+   // ================================================================
+   // RANGE TRADE ENGINE — buy low / sell high while ranging
+   // Fib + hist gate always evaluated when ranging (g_isRanging=true),
+   // regardless of InpRangeTrade or g_rangeTradeActive.
+   // Alerts only fire when InpRangeTrade=true AND g_rangeTradeActive=true.
+   // Max InpRangeMaxTouches per boundary (default 2), then silent
+   // PO3_WATCH = range broke = silent regardless
+   // ================================================================
+   if(g_isRanging && g_po3State == PO3_NONE && ltfLast >= 1)
+     {
+      double rtClose  = ltfRates[ltfLast].close;
+      double rtHigh   = ltfRates[ltfLast].high;
+      double rtLow    = ltfRates[ltfLast].low;
+      double rtRange  = g_rangePH - g_rangePL;
+      double rtAtr    = atrCur;
+      double touchDist = InpRangeTouchATR * rtAtr;
+      double slAtr    = InpSLATRMult * rtAtr;
+
+      // ── BUY TOUCH — price near range floor ──────────────────────
+      // HTF gate: both slow AND fast must agree BUY — no counter-trend range buys
+      bool htfAllowBuy = (g_htfRsTrend1 > 0 && g_htfRsTrend2 > 0);
+      bool nearFloor = (rtLow <= g_rangePL + touchDist &&
+                        rtClose > g_rangePL - touchDist);
+      if(nearFloor && !g_rangeBuyArmed)
+        {
+         g_rangeBuyArmed = true;
+         // Always compute fib/hist tags so silence gate works regardless of InpRangeTrade
+         string fibRBTag = FibTag(rtClose, 1);
+         string fvgRBTag = FVGZoneTag(1, ltfRates[ltfLast].time);
+         string hstRBTag = HistTag(rtClose, 1, atrCur);
+         bool rbSilenced = (StringFind(hstRBTag, "⚠️") >= 0) ||
+                           (StringFind(fibRBTag, "⚠️") >= 0);
+         if(InpRangeTrade && g_rangeTradeActive)
+           {
+            if(!htfAllowBuy)
+              {
+               if(InpPrintLog) Print("[RANGE BUY] Suppressed — HTF SELL | ",
+                     "Slow=", (g_htfRsTrend1>0?"BUY":"SELL"),
+                     " Fast=", (g_htfRsTrend2>0?"BUY":"SELL"), " | ", Symbol());
+              }
+            else if(g_rangeBuyTouches < InpRangeMaxTouches)
+              {
+               g_rangeBuyTouches++;
+               double slPrice  = NormalizeDouble(g_rangePL - slAtr, _Digits);
+               double tpPrice  = NormalizeDouble(g_rangePH, _Digits);
+               string touchStr = IntegerToString(g_rangeBuyTouches) + "/" +
+                                 IntegerToString(InpRangeMaxTouches);
+               string msg = "🟢 RANGE BUY [" + touchStr + "]" + fibRBTag + fvgRBTag + hstRBTag +
+                            " | " + Symbol() + " " + tfLabel +
+                            " | Entry:" + DoubleToString(g_rangePL, _Digits) +
+                            "-" + DoubleToString(g_rangePL + touchDist, _Digits) +
+                            " TP:" + DoubleToString(tpPrice, _Digits) +
+                            " SL:" + DoubleToString(slPrice, _Digits) +
+                            " | Box:" + DoubleToString(g_rangePL, _Digits) +
+                            "-" + DoubleToString(g_rangePH, _Digits);
+               if(!rbSilenced)
+                 {
+                  string rbPfx = ConfidencePrefix(msg) + msg;
+                  if(InpSendPush) SendNotification(rbPfx); if(InpSendAlert) Alert(rbPfx); if(InpPrintLog) Print(rbPfx);
+                 }
+               else
+                  if(InpPrintLog) Print("[RANGE BUY] Silenced — fib/hist opposing | ", Symbol());
+              }
+            else
+              {
+               if(InpPrintLog) Print("[RANGE TRADE] BUY touch ", g_rangeBuyTouches + 1,
+                     " — max reached, silent | Box:", DoubleToString(g_rangePL, _Digits),
+                     "-", DoubleToString(g_rangePH, _Digits), " | ", Symbol());
+              }
+           }
+         else
+           {
+            // Range trade off — still log fib/hist opposition for awareness
+            if(rbSilenced && InpPrintLog)
+               Print("[RANGE BUY] Fib/hist opposing (range trade off) | ", fibRBTag, hstRBTag, " | ", Symbol());
+           }
+        }
+      if(!nearFloor) g_rangeBuyArmed = false;  // reset arm when price leaves floor zone
+
+      // ── SELL TOUCH — price near range ceiling ───────────────────
+      // HTF gate: both slow AND fast must agree SELL — no counter-trend range sells
+      bool htfAllowSell = (g_htfRsTrend1 < 0 && g_htfRsTrend2 < 0);
+      bool nearCeiling = (rtHigh >= g_rangePH - touchDist &&
+                          rtClose < g_rangePH + touchDist);
+      if(nearCeiling && !g_rangeSellArmed)
+        {
+         g_rangeSellArmed = true;
+         // Always compute fib/hist tags so silence gate works regardless of InpRangeTrade
+         string fibRSTag = FibTag(rtClose, -1);
+         string fvgRSTag = FVGZoneTag(-1, ltfRates[ltfLast].time);
+         string hstRSTag = HistTag(rtClose, -1, atrCur);
+         bool rsSilenced2 = (StringFind(hstRSTag, "⚠️") >= 0) ||
+                            (StringFind(fibRSTag, "⚠️") >= 0);
+         if(InpRangeTrade && g_rangeTradeActive)
+           {
+            if(!htfAllowSell)
+              {
+               if(InpPrintLog) Print("[RANGE SELL] Suppressed — HTF BUY | ",
+                     "Slow=", (g_htfRsTrend1>0?"BUY":"SELL"),
+                     " Fast=", (g_htfRsTrend2>0?"BUY":"SELL"), " | ", Symbol());
+              }
+            else if(g_rangeSellTouches < InpRangeMaxTouches)
+              {
+               g_rangeSellTouches++;
+               double slPrice  = NormalizeDouble(g_rangePH + slAtr, _Digits);
+               double tpPrice  = NormalizeDouble(g_rangePL, _Digits);
+               string touchStr = IntegerToString(g_rangeSellTouches) + "/" +
+                                 IntegerToString(InpRangeMaxTouches);
+               string msg = "🔴 RANGE SELL [" + touchStr + "]" + fibRSTag + fvgRSTag + hstRSTag +
+                            " | " + Symbol() + " " + tfLabel +
+                            " | Entry:" + DoubleToString(g_rangePH - touchDist, _Digits) +
+                            "-" + DoubleToString(g_rangePH, _Digits) +
+                            " TP:" + DoubleToString(tpPrice, _Digits) +
+                            " SL:" + DoubleToString(slPrice, _Digits) +
+                            " | Box:" + DoubleToString(g_rangePL, _Digits) +
+                            "-" + DoubleToString(g_rangePH, _Digits);
+               if(!rsSilenced2)
+                 {
+                  string rsPfx = ConfidencePrefix(msg) + msg;
+                  if(InpSendPush) SendNotification(rsPfx); if(InpSendAlert) Alert(rsPfx); if(InpPrintLog) Print(rsPfx);
+                 }
+               else
+                  if(InpPrintLog) Print("[RANGE SELL] Silenced — fib/hist opposing | ", Symbol());
+              }
+            else
+              {
+               if(InpPrintLog) Print("[RANGE TRADE] SELL touch ", g_rangeSellTouches + 1,
+                     " — max reached, silent | Box:", DoubleToString(g_rangePL, _Digits),
+                     "-", DoubleToString(g_rangePH, _Digits), " | ", Symbol());
+              }
+           }
+         else
+           {
+            // Range trade off — still log fib/hist opposition for awareness
+            if(rsSilenced2 && InpPrintLog)
+               Print("[RANGE SELL] Fib/hist opposing (range trade off) | ", fibRSTag, hstRSTag, " | ", Symbol());
+           }
+        }
+      if(!nearCeiling) g_rangeSellArmed = false;  // reset arm when price leaves ceiling zone
+     }
+
+   // ================================================================
+   // SD EARLY ENTRY ENGINE — fires at SD-1/SD-2 after range break
+   // Requires: InpSDEarlyEntry=true + FVG/OB GV active + range broke
+   // NO RS confirmation — risky early counter-trend entry
+   // Toggle: InpSDEarlyEntry (default false)
+   // ================================================================
+   if(InpSDEarlyEntry && g_fibValid && ltfLast >= 1 &&
+      (g_fibRangeBreakUp || g_fibRangeBreakDown))
+     {
+      static datetime s_sdLastFireTime = 0;
+      datetime curSDTime = ltfRates[ltfLast].time;
+      double   sdClose   = ltfRates[ltfLast].close;
+
+      // Only fire once per bar
+      if(curSDTime != s_sdLastFireTime)
+        {
+         // Reuse cached SD levels from FibCalcLevels() — identical values
+         double sd1L = g_fibSD1L;  // SD-1 discount
+         double sd2L = g_fibSD2L;  // SD-2 extreme discount
+         double sd1H = g_fibSD1H;  // SD+1 premium
+         double sd2H = g_fibSD2H;  // SD+2 extreme premium
+         double zone = atrCur * InpRangeTouchATR;
+
+         // BUY — price at SD discount after SELL break
+         bool atSD1Buy = g_fibRangeBreakDown && MathAbs(sdClose - sd1L) <= zone;
+         bool atSD2Buy = g_fibRangeBreakDown && MathAbs(sdClose - sd2L) <= zone;
+         // SELL — price at SD premium after BUY break
+         bool atSD1Sell = g_fibRangeBreakUp && MathAbs(sdClose - sd1H) <= zone;
+         bool atSD2Sell = g_fibRangeBreakUp && MathAbs(sdClose - sd2H) <= zone;
+
+         int    sdDir     = 0;
+         string sdLabel   = "";
+         double sdLevel   = 0;
+         if(atSD2Buy)       { sdDir =  1; sdLabel = "SD-2 EXTREME DISCOUNT" + (g_fibSD2LConfirmed?" 📦HIST":""); sdLevel = sd2L; }
+         else if(atSD1Buy)  { sdDir =  1; sdLabel = "SD-1 DISCOUNT"         + (g_fibSD1LConfirmed?" 📦HIST":""); sdLevel = sd1L; }
+         else if(atSD2Sell) { sdDir = -1; sdLabel = "SD+2 EXTREME PREMIUM"  + (g_fibSD2HConfirmed?" 📦HIST":""); sdLevel = sd2H; }
+         else if(atSD1Sell) { sdDir = -1; sdLabel = "SD+1 PREMIUM"          + (g_fibSD1HConfirmed?" 📦HIST":""); sdLevel = sd1H; }
+
+         if(sdDir != 0)
+           {
+            // Check FVG/OB GV active in same direction
+            string fvgSD  = FVGZoneTag(sdDir, curSDTime);
+            bool   hasFVG = (fvgSD != "" && StringFind(fvgSD, "⚠️") < 0);
+
+            if(hasFVG)
+              {
+               double slSD  = NormalizeDouble(sdDir == 1 ?
+                              sdLevel - InpSLATRMult * atrCur :
+                              sdLevel + InpSLATRMult * atrCur, _Digits);
+               double tpSD  = NormalizeDouble(sdDir == 1 ? g_fibLow : g_fibHigh, _Digits);
+               string esSuffix = " | Entry:" + DoubleToString(sdClose, _Digits) +
+                                 " TP:" + DoubleToString(tpSD, _Digits) +
+                                 " SL:" + DoubleToString(slSD, _Digits);
+               string hstSDTag = HistTag(sdClose, sdDir, atrCur);
+               string sdMsg = "🎯 " + sdLabel + (sdDir==1?" EARLY BUY":" EARLY SELL") +
+                              fvgSD + hstSDTag + " | " + Symbol() + " " + tfLabel + esSuffix +
+                              " ⚠️ COUNTER-TREND";
+               if(InpSendPush)  SendNotification(sdMsg);
+               if(InpSendAlert) Alert(sdMsg);
+               if(InpPrintLog)  Print(sdMsg);
+               s_sdLastFireTime = curSDTime;
+              }
+            else if(InpPrintLog)
+               Print("[SD ENGINE] ", sdLabel, " reached but no FVG/OB GV active — silent | ", Symbol());
+           }
+        }
+     }
+
+   // ================================================================
+   // PO3 ENGINE — Break / Retest / Confirm
+   // Phase 1: Break detected — silent, watch for retest
+   // Phase 2: Retest — price returns to broken level
+   //   2A: Retest fails (closes back inside range) → 🎯 PO3 opposite
+   //   2B: Retest holds (closes outside) → ▶ GENUINE BREAK
+   // Phase 3: No retest in 30 bars → ▶ GENUINE BREAK
+   // Phase 4: Back inside range → watch for double break → ▶ STRONG BREAK
+   // ================================================================
+   if(g_po3State != PO3_NONE)
+     {
+      g_po3BarCount++;
+      double curClose = ltfRates[ltfLast].close;
+      double retestZone = atrCur * 0.5;  // within 0.5×ATR of broken level = retest zone
+
+      // ── PHASE 1: WATCHING FOR RETEST ────────────────────────────
+      if(g_po3State == PO3_WATCH)
+        {
+         // Must be at least 2 bars outside range before retest qualifies
+         if(g_po3BarCount < 2) return rates_total;
+
+         // Check if price has returned to retest the broken level
+         bool inRetestZone = false;
+         if(g_po3BreakDir == 1)  // broke high — retest = price near g_po3BreakHigh
+            inRetestZone = (curClose <= g_po3BreakHigh + retestZone &&
+                            curClose >= g_po3BreakHigh - retestZone);
+         else                    // broke low — retest = price near g_po3BreakLow
+            inRetestZone = (curClose >= g_po3BreakLow - retestZone &&
+                            curClose <= g_po3BreakLow + retestZone);
+
+         if(inRetestZone && !g_po3InRetest)
+           {
+            g_po3InRetest = true;
+            g_po3BarCount = 0; // reset bar count from retest
+            g_po3State    = PO3_RETEST;
+            if(InpPrintLog) Print("[PO3] RETEST DETECTED | BreakDir=",
+                  (g_po3BreakDir==1?"BUY":"SELL"),
+                  " | Price=", DoubleToString(curClose,_Digits), " | ", Symbol());
+           }
+         // No retest in 30 bars — genuine momentum break
+         else if(g_po3BarCount >= 30)
+           {
+            string dir = (g_po3BreakDir == 1) ? "BUY" : "SELL";
+            string msg  = "▶ RANGE BROKEN — BIAS " + dir + " | " + Symbol() +
+                          " | " + DoubleToString(curClose, _Digits);
+            if(InpSendPush)  SendNotification(msg);
+            if(InpSendAlert) Alert(msg);
+            if(InpPrintLog)  Print(msg + " [no retest — momentum confirmed]");
+            // Save momentum break to history (NFP/news spikes — most important ranges)
+            HistSaveRange(g_po3BreakHigh, g_po3BreakLow, ltfRates[ltfLast].time, g_po3BreakDir,
+                          g_po3TouchesAtBreak);
+            if(g_fibValid) FibCalcLevels(atrCur);  // immediate SD confirmation update
+            g_lastSignalDir     = g_po3BreakDir;  // suppress immediate opposite RS signals
+            g_po3RangeBreakDir  = g_po3BreakDir;
+            g_po3RangeBreakBars = 0;
+            g_po3State = PO3_NONE; g_po3BreakDir = 0;
+            g_po3BreakHigh = 0; g_po3BreakLow = 0;
+            g_po3BarCount = 0; g_po3Notified = false; g_po3InRetest = false;
+           }
+        }
+
+      // ── PHASE 2: RETEST IN PROGRESS ─────────────────────────────
+      else if(g_po3State == PO3_RETEST)
+        {
+         // 2A: Retest FAILS — price closes back INSIDE range
+         bool closedInsideRange = (curClose < g_po3BreakHigh && curClose > g_po3BreakLow);
+         if(closedInsideRange)
+           {
+            // Fake break confirmed — fire PO3 opposite
+            int oppDir = -g_po3BreakDir;
+            string entrySuffix = BuildEntryStr(oppDir, curClose, atrCur);
+            // Fib gate — suppress push if price in opposing fib zone after range break
+            // SELL break → discount flips to SBR SELL → PO3 BUY push suppressed
+            // BUY break  → premium flips to RBS BUY  → PO3 SELL push suppressed
+            bool po3FibBlock = (oppDir ==  1 && g_fibRangeBreakDown) ||
+                               (oppDir == -1 && g_fibRangeBreakUp);
+            string fibWarn   = po3FibBlock ? " ⚠️ FIB ZONE OPPOSING" : FibTag(curClose, oppDir);
+            string hstPO3Tag = HistTag(curClose, oppDir, atrCur);
+            string msg = "🎯 PO3 " + (oppDir==1?"BUY":"SELL") + fibWarn + hstPO3Tag + " | " +
+                         Symbol() + " " + tfLabel + entrySuffix;
+            if(!po3FibBlock)
+              {
+               if(InpSendPush)  SendNotification(msg);
+               if(InpSendAlert) Alert(msg);
+               if(InpPrintLog)  Print(msg);
+              }
+            // po3FibBlock = fib zone opposes counter-signal — silenced completely
+            g_lastSignalDir = oppDir;
+            // Move to INSIDE state — watch for double break
+            g_po3State    = PO3_INSIDE;
+            g_po3BarCount = 0;
+            g_po3Notified = true;
+            if(InpPrintLog) Print("[PO3] RETEST FAILED — inside range | watching for double break | ", Symbol());
+           }
+         // 2B: Retest HOLDS — closes back OUTSIDE in break direction
+         else
+           {
+            bool confirmedBuy  = (g_po3BreakDir == 1  && curClose > g_po3BreakHigh);
+            bool confirmedSell = (g_po3BreakDir == -1 && curClose < g_po3BreakLow);
+            if(confirmedBuy || confirmedSell)
+              {
+               string dir = (g_po3BreakDir == 1) ? "BUY" : "SELL";
+               string msg = "▶ RANGE BROKEN — BIAS " + dir + " | " + Symbol() +
+                            " | " + DoubleToString(curClose, _Digits);
+               if(InpSendPush)  SendNotification(msg);
+               if(InpSendAlert) Alert(msg);
+               if(InpPrintLog)  Print(msg + " [retest held — confirmed]");
+               // Save confirmed range to history
+               HistSaveRange(g_po3BreakHigh, g_po3BreakLow, ltfRates[ltfLast].time, g_po3BreakDir,
+                             g_po3TouchesAtBreak);
+               g_lastSignalDir     = g_po3BreakDir;  // suppress immediate opposite RS signals
+               g_po3RangeBreakDir  = g_po3BreakDir;
+               g_po3RangeBreakBars = 0;
+               g_po3State = PO3_NONE; g_po3BreakDir = 0;
+               g_po3BreakHigh = 0; g_po3BreakLow = 0;
+               g_po3BarCount = 0; g_po3Notified = false; g_po3InRetest = false;
+              }
+            // Still in retest zone — wait
+            else if(g_po3BarCount >= 10)
+              {
+               // Retest zone timed out — treat as still in watch
+               g_po3State    = PO3_WATCH;
+               g_po3InRetest = false;
+               g_po3BarCount = 0;
+               if(InpPrintLog) Print("[PO3] RETEST INCONCLUSIVE — back to watch | ", Symbol());
+              }
+           }
+        }
+
+      // ── PHASE 3: INSIDE RANGE — WATCH FOR DOUBLE BREAK ──────────
+      else if(g_po3State == PO3_INSIDE)
+        {
+         // Price breaks SAME side again = double break = strong confirmed move
+         bool doubleBuy  = (g_po3BreakDir == 1  && curClose > g_po3BreakHigh);
+         bool doubleSell = (g_po3BreakDir == -1 && curClose < g_po3BreakLow);
+
+         if(doubleBuy || doubleSell)
+           {
+            string dir = (g_po3BreakDir == 1) ? "BUY" : "SELL";
+            string msg = "▶ RANGE BROKEN — BIAS " + dir + " STRONG | " + Symbol() +
+                         " | " + DoubleToString(curClose, _Digits);
+            if(InpSendPush)  SendNotification(msg);
+            if(InpSendAlert) Alert(msg);
+            if(InpPrintLog)  Print(msg + " [double break confirmed]");
+            // Save confirmed range to history
+            HistSaveRange(g_po3BreakHigh, g_po3BreakLow, ltfRates[ltfLast].time, g_po3BreakDir,
+                          g_po3TouchesAtBreak);
+            g_lastSignalDir     = g_po3BreakDir;  // suppress immediate opposite RS signals
+            g_po3RangeBreakDir  = g_po3BreakDir;
+            g_po3RangeBreakBars = 0;
+            g_po3State = PO3_NONE; g_po3BreakDir = 0;
+            g_po3BreakHigh = 0; g_po3BreakLow = 0;
+            g_po3BarCount = 0; g_po3Notified = false; g_po3InRetest = false;
+           }
+         // Price breaks OPPOSITE side = new manipulation in other direction
+         else if((g_po3BreakDir == 1 && curClose < g_po3BreakLow) ||
+                 (g_po3BreakDir == -1 && curClose > g_po3BreakHigh))
+           {
+            // Already fired PO3 opposite — this is genuine opposite move
+            if(InpPrintLog) Print("[PO3] Opposite break while inside — resetting | ", Symbol());
+            g_po3State = PO3_NONE; g_po3BreakDir = 0;
+            g_po3BreakHigh = 0; g_po3BreakLow = 0;
+            g_po3BarCount = 0; g_po3Notified = false; g_po3InRetest = false;
+           }
+         // Expire inside after 30 bars — market moved on
+         else if(g_po3BarCount >= 30)
+           {
+            if(InpPrintLog) Print("[PO3] INSIDE expired — resetting | ", Symbol());
+            g_po3State = PO3_NONE; g_po3BreakDir = 0;
+            g_po3BreakHigh = 0; g_po3BreakLow = 0;
+            g_po3BarCount = 0; g_po3Notified = false; g_po3InRetest = false;
+           }
+        }
+     }
+
+   // ── RBS/SBR — M1 LTF structure, LTF RS + HTF trend gate ──────────
+   if(InpAlertRBSSBR && !g_isRanging && (InpEngineMode == ENGINE_RBS_ONLY || InpEngineMode == ENGINE_BOTH))
+     {
+      datetime curBarTime = ltfRates[ltfLast].time;
+      if(curBarTime != g_lastRBSSBRTime)
+        {
+         g_lastRBSSBRTime = curBarTime;
+         double prevClose = ltfRates[ltfLast - 1].close;
+         double curClose  = ltfRates[ltfLast].close;
+
+         int    bestJ = -1; double bestDist = DBL_MAX; int bestDir = 0;
+
+         for(int j = 0; j < g_nLv; j++)
+           {
+            if(!g_lv[j].broken || g_lv[j].flipAlerted) continue;
+
+            if(g_lv[j].isHigh && prevClose <= g_lv[j].top && curClose > g_lv[j].top)
+              {
+               if(InpTrendOnlyMode && g_curRSTrend != 1) continue;
+               if(htfSlowDir != 1) continue;
+               if(htfFastDir != 1) continue;
+               if(g_lastRBSSBRDir == 1) continue;
+               // PO3 gate — suppress same direction as fake break during watch/retest
+               if((g_po3State == PO3_WATCH || g_po3State == PO3_RETEST) && g_po3BreakDir == 1) continue;
+               double dist = MathAbs(curClose - g_lv[j].price);
+               if(dist < bestDist) { bestDist = dist; bestJ = j; bestDir = 1; }
+              }
+            else if(!g_lv[j].isHigh && prevClose >= g_lv[j].bot && curClose < g_lv[j].bot)
+              {
+               if(InpTrendOnlyMode && g_curRSTrend != -1) continue;
+               if(htfSlowDir != -1) continue;
+               if(htfFastDir != -1) continue;
+               if(g_lastRBSSBRDir == -1) continue;
+               // PO3 gate — suppress same direction as fake break during watch/retest
+               if((g_po3State == PO3_WATCH || g_po3State == PO3_RETEST) && g_po3BreakDir == -1) continue;
+               double dist = MathAbs(curClose - g_lv[j].price);
+               if(dist < bestDist) { bestDist = dist; bestJ = j; bestDir = -1; }
+              }
+           }
+
+         if(bestJ >= 0)
+           {
+            g_lv[bestJ].flipAlerted = true;
+            g_lastRBSSBRDir = bestDir;
+            string tfLabel2 = EnumToString(InpSignalTF);
+            StringReplace(tfLabel2, "PERIOD_", "");
+            if(bestDir == 1)
+              {
+               double sl  = NormalizeDouble(g_lv[bestJ].bot - InpSLATRMult * atrCur, _Digits);
+               string zt  = ZoneTag(1, curClose, atrCur, curBarTime);
+               string po3RBSTag = (g_po3RangeBreakDir == 1) ? " PO3" : "";
+               string fibRBSTag = FibTag(curClose, 1);
+               string fvgRBSTag = FVGZoneTag(1, curBarTime);
+               string hstRBSTag = HistTag(curClose, 1, atrCur);
+               string msg = "🟢 RBS BUY" + po3RBSTag + zt + fibRBSTag + fvgRBSTag + hstRBSTag + " | " + Symbol() + " " + tfLabel2 +
+                            " | Entry:" + DoubleToString(g_lv[bestJ].bot, _Digits) +
+                            "-" + DoubleToString(g_lv[bestJ].top, _Digits) +
+                            " SL:" + DoubleToString(sl, _Digits);
+               bool rbsSilenced = (StringFind(hstRBSTag, "⚠️") >= 0) ||
+                                  (StringFind(fibRBSTag, "⚠️") >= 0);
+               if(!rbsSilenced)
+                 {
+                  string rbsPfx = ConfidencePrefix(msg) + msg;
+                  if(InpSendPush)  SendNotification(rbsPfx);
+                  if(InpSendAlert) Alert(rbsPfx);
+                  if(InpPrintLog)  Print(rbsPfx);
+                 }
+              }
+            else
+              {
+               double sl  = NormalizeDouble(g_lv[bestJ].top + InpSLATRMult * atrCur, _Digits);
+               string zt  = ZoneTag(-1, curClose, atrCur, curBarTime);
+               string po3SBRTag = (g_po3RangeBreakDir == -1) ? " PO3" : "";
+               string fibSBRTag = FibTag(curClose, -1);
+               string fvgSBRTag = FVGZoneTag(-1, curBarTime);
+               string hstSBRTag = HistTag(curClose, -1, atrCur);
+               string msg = "🔴 SBR SELL" + po3SBRTag + zt + fibSBRTag + fvgSBRTag + hstSBRTag + " | " + Symbol() + " " + tfLabel2 +
+                            " | Entry:" + DoubleToString(g_lv[bestJ].bot, _Digits) +
+                            "-" + DoubleToString(g_lv[bestJ].top, _Digits) +
+                            " SL:" + DoubleToString(sl, _Digits);
+               bool sbrSilenced = (StringFind(hstSBRTag, "⚠️") >= 0) ||
+                                  (StringFind(fibSBRTag, "⚠️") >= 0);
+               if(!sbrSilenced)
+                 {
+                  string sbrPfx = ConfidencePrefix(msg) + msg;
+                  if(InpSendPush)  SendNotification(sbrPfx);
+                  if(InpSendAlert) Alert(sbrPfx);
+                  if(InpPrintLog)  Print(sbrPfx);
+                 }
+              }
+           }
+        }
+     }
+
+   return rates_total;
+  }
+
+//+------------------------------------------------------------------+
+//| RANGE CHECK — M1 LTF based                                      |
+//| Uses LTF pivot array, LTF ATR, LTF RS flip count for chop       |
+//| Box locked on ranging start — not updated until range ends       |
+//+------------------------------------------------------------------+
+bool i_RangeCheck(const MqlRates &ltfRates[], const double &atrLTF[], int ltfTotal, int ltfLast, int rsFlip1)
+  {
+   if(!InpEnableRange) { g_isRanging = false; return false; }
+
+   // Don't detect new ranging while PO3 is active — wait for full resolution
+   // PO3_WATCH = range broke, watching retest
+   // PO3_RETEST = retest detected, confirming
+   // Either state = old range context still active
+   if(g_po3State == PO3_WATCH || g_po3State == PO3_RETEST) return false;
+
+   // Use LTF ATR at last confirmed bar
+   double atr = atrLTF[ltfLast];
+   if(atr <= 0.0 || atr >= EMPTY_VALUE) return false;
+
+   // Current LTF close
+   double c = ltfRates[ltfLast].close;
+
+   bool wasRanging = g_isRanging;
+   double oldPH    = g_rangePH;
+   double oldPL    = g_rangePL;
+
+   // If already ranging — only check if price broke the locked box
+   if(wasRanging)
+     {
+      bool brokeHigh = (c > oldPH);
+      bool brokeLow  = (c < oldPL);
+
+      if(brokeHigh || brokeLow)
+        {
+         g_isRanging           = false;
+         g_rangingNotified     = false;
+         g_rangingLastReminder = 0;
+         g_rangingBreakTime    = ltfRates[ltfLast].time;
+         // Set fib role-flip flags — premium/discount zones flip on break direction
+         g_fibRangeBreakUp   = brokeHigh;
+         g_fibRangeBreakDown = brokeLow;
+         // Snapshot touches before reset — used by HistSaveRange for strength field
+         g_po3TouchesAtBreak = g_rangeBuyTouches + g_rangeSellTouches;
+         // Deactivate range trade mode — silent until next confirmed range
+         if(g_rangeTradeActive)
+           {
+            g_rangeTradeActive = false;
+            g_rangeBuyTouches  = 0;
+            g_rangeSellTouches = 0;
+            if(InpPrintLog) Print("[RANGE TRADE] Deactivated — range broken | ", Symbol());
+           }
+
+         // Arm PO3 watch — only if not already in PO3 watch
+         if(g_po3State == PO3_NONE)
+           {
+            g_po3State     = PO3_WATCH;
+            g_po3BreakDir  = brokeHigh ? 1 : -1;
+            g_po3BreakHigh = oldPH;
+            g_po3BreakLow  = oldPL;
+            g_po3BarCount  = 0;
+            g_po3Notified  = false;
+            if(InpPrintLog) Print("[PO3] ARMED | BreakDir=", (brokeHigh?"BUY":"SELL"),
+                  " | Box=", DoubleToString(oldPL,_Digits), "-", DoubleToString(oldPH,_Digits),
+                  " | Break@", DoubleToString(c,_Digits), " | ", Symbol());
+           }
+         else
+            if(InpPrintLog) Print("[PO3] Already watching — ignoring new break | ", Symbol());
+        }
+      // Else still inside box — stay ranging, return
+      else return false;
+     }
+
+   // --- Not ranging — scan LTF pivots to find fresh box ---
+   // Only use pivots within 3×ATR of current price — prevents distant stale pivots
+   // from anchoring one side of the box after a directional move
+   double recentPH = 0.0, recentPL = DBL_MAX;
+   datetime recentPHTime = 0, recentPLTime = 0;
+   double proximityLimit = atr * 5.0;
+
+   for(int k = 0; k < g_nLv; k++)
+     {
+      if(g_lv[k].broken) continue;
+      // Skip pivots too far from current price
+      if(MathAbs(g_lv[k].price - c) > proximityLimit) continue;
+      if( g_lv[k].isHigh && g_lv[k].t1 > recentPHTime) { recentPH = g_lv[k].price; recentPHTime = g_lv[k].t1; }
+      if(!g_lv[k].isHigh && g_lv[k].t1 > recentPLTime) { recentPL = g_lv[k].price; recentPLTime = g_lv[k].t1; }
+     }
+
+   bool hasBothPivots = (recentPHTime > 0 && recentPLTime > 0 && recentPL < DBL_MAX);
+   if(!hasBothPivots) return false;
+
+   // Cooldown after range break — 10 signal TF bars before new range can be declared
+   if(g_rangingBreakTime > 0 && ltfRates[ltfLast].time - g_rangingBreakTime < (datetime)(10 * PeriodSeconds(InpSignalTF)))
+      return false;
+
+   double rw = recentPH - recentPL;
+   bool inBox      = (c <= recentPH && c >= recentPL);
+   bool wideEnough = (rw > 1.0 * atr);
+   bool tight      = (rw < InpRangeMinATR * atr);
+
+   bool isChoppy = (rsFlip1 > 20);
+
+   bool newRanging = (inBox && wideEnough && tight) || (inBox && wideEnough && isChoppy);
+
+   if(newRanging)
+     {
+      bool isNewBox = (!g_isRanging ||
+                       MathAbs(recentPH - g_rangePH) > _Point ||
+                       MathAbs(recentPL - g_rangePL) > _Point);
+      g_isRanging = true;
+      g_rangePH   = recentPH;
+      g_rangePL   = recentPL;
+      // Reset fib role-flip flags on any new box — independent of InpRangeTrade
+      if(isNewBox) { g_fibRangeBreakUp = false; g_fibRangeBreakDown = false; }
+      // Anchor fib to range box — range IS the fib framework
+      // SD levels computed from range boundaries = reversal targets
+      if(isNewBox && InpFibFilter)
+        {
+         g_fibLow  = g_rangePL;
+         g_fibHigh = g_rangePH;
+         FibCalcLevels(atrLTF[ltfLast]);
+         if(InpPrintLog) Print("[FIB] Range-anchored Low=", DoubleToString(g_fibLow, _Digits),
+               " High=", DoubleToString(g_fibHigh, _Digits),
+               " Range=", DoubleToString(g_fibHigh - g_fibLow, 2),
+               " SD-1=", DoubleToString(g_fibSD1L, _Digits),
+               " SD+1=", DoubleToString(g_fibSD1H, _Digits));
+        }
+      // Activate range trade mode and reset touch counters on fresh box
+      if(isNewBox && InpRangeTrade)
+        {
+         g_rangeTradeActive   = true;
+         g_rangeBuyTouches    = 0;
+         g_rangeSellTouches   = 0;
+         g_rangeBuyArmed      = false;
+         g_rangeSellArmed     = false;
+         if(InpPrintLog) Print("[RANGE TRADE] Armed | Box:",
+               DoubleToString(g_rangePL, _Digits), "-", DoubleToString(g_rangePH, _Digits),
+               " MaxTouches:", InpRangeMaxTouches, " | ", Symbol());
+        }
+      if(!g_rangingNotified)
+        {
+         string msg = "⏸ RANGING — WAIT BREAK OUT | " + Symbol() + " | Box:" +
+                      DoubleToString(g_rangePL, _Digits) + "-" + DoubleToString(g_rangePH, _Digits);
+         if(InpSendPush)  SendNotification(msg);
+         if(InpSendAlert) Alert(msg);
+         if(InpPrintLog)  Print(msg);
+         g_rangingNotified     = true;
+         g_rangingLastReminder = ltfRates[ltfLast].time;
+        }
+      else
+        {
+         // 30-min reminder while still ranging
+         datetime barTime = ltfRates[ltfLast].time;
+         if(barTime - g_rangingLastReminder >= 1800)
+           {
+            string msg = "⏸ STILL RANGING — WAIT BREAK OUT | " + Symbol() + " | Box:" +
+                         DoubleToString(g_rangePL, _Digits) + "-" + DoubleToString(g_rangePH, _Digits);
+            if(InpSendPush)  SendNotification(msg);
+            if(InpSendAlert) Alert(msg);
+            if(InpPrintLog)  Print(msg);
+            g_rangingLastReminder = barTime;
+           }
+        }
+      return true;
+     }
+
+   return false;
+  }
+//+------------------------------------------------------------------+
