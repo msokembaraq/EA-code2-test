@@ -7,7 +7,7 @@
 //|          + Push Notifications with SL / TP1 / TP2 / TP3         |
 //+------------------------------------------------------------------+
 #property copyright "bidiisStrategy"
-#property version   "1.83"
+#property version   "1.84"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 10
@@ -52,9 +52,9 @@
 // INPUTS
 // ================================================================
 input group "=== Swing Detection ==="
-input int    InpSwingRight        = 15;          // Bars Right (confirmed signal + drawing)
-input int    InpSwingLeft         = 15;          // Bars Left
-input int    InpSwingRightSignal  = 5;           // Bars Right for early RISKY signal (0=off)
+input int    InpSwingRight        = 10;           // Bars Right (confirmed signal + drawing)
+input int    InpSwingLeft         = 7;           // Bars Left
+input int    InpSwingRightSignal  = 0;           // Bars Right for early RISKY signal (0=off)
 
 input group "=== Display ==="
 input bool   InpShowBoxes    = true;             // Show Liquidity Boxes
@@ -79,18 +79,23 @@ input color  InpFVGColor     = C'0,100,180';     // FVG zone colour
 input color  InpOBColor      = C'140,60,0';      // OB zone colour
 
 input group "=== Alerts & Push ==="
-input bool   InpAlerts       = true;             // Pop-up Alerts
-input bool   InpPush         = true;             // Push Notifications (mobile)
+input bool   InpAlerts       = false;            // Pop-up Alerts
+input bool   InpPush         = false;             // Master push switch (mobile)
+input bool   InpPushChoCH    = false;             // Push CHoCH BUY/SELL
+input bool   InpPushSignals  = false;            // Push BUY/SELL/MSS signals
+input bool   InpPushLvlOnly  = false;            // Push level/approach alerts only
 input double InpMinRR        = 1.0;              // Min R:R to nearest opposing level (0=off)
+input bool   InpWriteGV      = true;             // Write SRZONES global variables
 
 input group "=== Level Approach Alerts ==="
-input bool   InpLvlAlerts    = true;             // Push when price nears a swing level
+input bool   InpLvlAlerts    = false;            // Push when price nears a swing level
 input bool   InpTrendFilter  = true;             // Suppress contra-trend approach alerts
 input bool   InpTrackFlips   = true;             // Alert SBR / RBS on retests
+input int    InpMaxFlipTouches = 2;              // Max SBR/RBS alerts per level (0=unlimited)
 input int    InpApproachMode = 0;                // 0=Swing range  1=ATR  2=Fixed pips
-input double InpApproachMult = 0.5;             // Multiplier for swing / ATR modes
-input double InpApproachPips = 10.0;            // Pip distance for approach zone (mode 2)
-input int    InpRetestWindow = 200;             // Bars to watch broken zone for retest (0=unlimited)
+input double InpApproachMult = 0.5;              // Multiplier for swing / ATR modes
+input double InpApproachPips = 10.0;             // Pip distance for approach zone (mode 2)
+input int    InpRetestWindow = 200;              // Bars to watch broken zone for retest (0=unlimited)
 
 // ================================================================
 // BUFFERS  (6 plotted + 2 internal)
@@ -328,8 +333,16 @@ void FireSignal(const string &dir, const string &label,
                 int confirmBar, bool isLive, int &dedupBar)
   {
    if(!isLive)              return;
+  if(dedupBar == confirmBar) return;
+   double srDirSig = (StringFind(dir, "BUY") >= 0) ? 1.0 : -1.0;
+   if(InpWriteGV)
+     {
+      GlobalVariableSet("SRZONES_DIR",   srDirSig);
+      GlobalVariableSet("SRZONES_PRICE", sigPrice);
+      GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+     }
    if(!InpAlerts && !InpPush) return;
-   if(dedupBar == confirmBar) return;   // already fired this direction this bar
+   if(!InpPushSignals && !InpAlerts) return;  // signals push disabled
    dedupBar = confirmBar;
 
    string msg = dir + " " + _Symbol + " " + DoubleToString(sigPrice, _Digits) +
@@ -339,7 +352,7 @@ void FireSignal(const string &dir, const string &label,
                 " | TP2: " + PriceStr(tp2) +
                 " | TP3: " + PriceStr(tp3);
 
-   if(InpAlerts) Alert(msg);
+if(InpAlerts) Alert(msg);
    if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
   }
 
@@ -364,9 +377,16 @@ double GetApproachThreshold(double swingRange)
 
 void FireLvlAlert(const string &tag, const string &rdy, double price, int touches)
   {
+ double srDirLvl = (StringFind(tag, "BUY") >= 0 || StringFind(rdy, "BUY") >= 0) ? 1.0 : -1.0;
+   if(InpWriteGV)
+     {
+      GlobalVariableSet("SRZONES_DIR",   srDirLvl);
+      GlobalVariableSet("SRZONES_PRICE", price);
+      GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+     }
    if(!InpAlerts && !InpPush) return;
-   string msg = tag + " " + _Symbol + " " + DoubleToString(price, _Digits) +
-                " | " + rdy + " | " + IntegerToString(touches) + "x";
+   string msg = tag + " " + rdy + " | " + _Symbol + " " + EnumToString((ENUM_TIMEFRAMES)_Period) + " " + DoubleToString(price, _Digits) +
+                " | " + IntegerToString(touches) + "x";
    if(InpAlerts) Alert(msg);
    if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
   }
@@ -801,7 +821,7 @@ int OnCalculate(const int rates_total,
             // ─── CHoCH: bear → bull ────────────────────────────
             g_chochSeq++;
             string chochLnB = PFX + "CHoCH_" + IntegerToString(pBar);
-            string chochTxB = "CHoCH";
+            string chochTxB = "CHoCH SELL";
             DrawChochLabel(chochLnB, chochTxB, time[pBar], ph, InpMSSBullCol, false);
             int legStart = (g_lastPHBar >= 0) ? g_lastPHBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, true,
@@ -811,6 +831,23 @@ int OnCalculate(const int rates_total,
             g_mssBull  = true;
             g_trend    = 1;
             g_chochBar = i;
+            // Write CHoCH GV for AME to read
+            if(InpWriteGV)
+              {
+               GlobalVariableSet("SPL_CHOCH_DIR",  1.0);
+               GlobalVariableSet("SPL_CHOCH_TIME", (double)TimeCurrent());
+              }
+            // CHoCH BUY push
+            if(isLive && i == rates_total - 1 && InpPush && InpPushChoCH)
+              {
+               string chochBuyMsg = "🔴 CHoCH SELL | " + _Symbol + " " +
+                                    EnumToString((ENUM_TIMEFRAMES)_Period) +
+                                    " | Price:" + DoubleToString(ph, _Digits) +
+                                    " | Trend: Bear→Bull";
+               if(InpAlerts) Alert(chochBuyMsg);
+               if(InpPush && !SendNotification(chochBuyMsg))
+                  Print("Push failed: ", chochBuyMsg);
+              }
            }
          else if(isHH)
            {
@@ -840,7 +877,7 @@ int OnCalculate(const int rates_total,
               {
                BufSellCT[pBar] = ph;
                if(BufPivHEarly[pBar] == 0.0 && CheckMinRR(false, ph, sl))
-                  FireSignal("RISKY SELL", "C-T BULL", ph, sl,
+                  FireSignal("SELL C-T", "Bull", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastSellAlertBar);
@@ -891,7 +928,7 @@ int OnCalculate(const int rates_total,
             // ─── CHoCH: bull → bear ────────────────────────────
             g_chochSeq++;
             string chochLnS = PFX + "CHoCH_" + IntegerToString(pBar);
-            string chochTxS = "CHoCH";
+            string chochTxS = "CHoCH BUY";
             DrawChochLabel(chochLnS, chochTxS, time[pBar], pl, InpMSSBearCol, true);
             int legStart = (g_lastPLBar >= 0) ? g_lastPLBar : MathMax(0, pBar - 30);
             FindMSSZones(legStart, pBar, false,
@@ -901,6 +938,23 @@ int OnCalculate(const int rates_total,
             g_mssBull  = false;
             g_trend    = -1;
             g_chochBar = i;
+            // Write CHoCH GV for AME to read
+            if(InpWriteGV)
+              {
+               GlobalVariableSet("SPL_CHOCH_DIR",  -1.0);
+               GlobalVariableSet("SPL_CHOCH_TIME", (double)TimeCurrent());
+              }
+            // CHoCH SELL push
+            if(isLive && i == rates_total - 1 && InpPush && InpPushChoCH)
+              {
+               string chochSellMsg = "🔵 CHoCH BUY | " + _Symbol + " " +
+                                     EnumToString((ENUM_TIMEFRAMES)_Period) +
+                                     " | Price:" + DoubleToString(pl, _Digits) +
+                                     " | Trend: Bull→Bear";
+               if(InpAlerts) Alert(chochSellMsg);
+               if(InpPush && !SendNotification(chochSellMsg))
+                  Print("Push failed: ", chochSellMsg);
+              }
            }
          else if(isLL)
            {
@@ -930,7 +984,7 @@ int OnCalculate(const int rates_total,
               {
                BufBuyCT[pBar] = pl;
                if(BufPivLEarly[pBar] == 0.0 && CheckMinRR(true, pl, sl))
-                  FireSignal("RISKY BUY", "C-T BEAR", pl, sl,
+                  FireSignal("BUY C-T", "Bear", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
                              g_lastBuyAlertBar);
@@ -959,10 +1013,10 @@ int OnCalculate(const int rates_total,
            }
         }
 
-      // ── LEVEL APPROACH ALERTS (live bar, every tick) ─────────────
-      // Runs on every tick so the alert fires as soon as price enters
-      // the zone — not deferred to bar close.
-      if(InpLvlAlerts && i == rates_total - 1)
+      // ── LEVEL APPROACH + SBR/RBS ALERTS (confirmed closed bar only) ─
+      // InpLvlAlerts  → price approaching active level
+      // InpTrackFlips → SBR/RBS retest after break (independent)
+      if((InpLvlAlerts || InpTrackFlips) && i == rates_total - 2 && prev_calculated > 0)
         {
          for(int j = 0; j < g_nLv; j++)
            {
@@ -1000,13 +1054,13 @@ int OnCalculate(const int rates_total,
 
             if(!g_lv[j].broken)
               {
-               if(inZone && !g_lv[j].approached)
+               if(InpLvlAlerts && inZone && !g_lv[j].approached)
                  {
                   g_lv[j].approached = true;
                   // Trend filter: RESISTANCE→SELL suppressed in bull; SUPPORT→BUY suppressed in bear
                   bool trendOK = !InpTrendFilter ||
                                  (g_lv[j].isHigh ? g_trend <= 0 : g_trend >= 0);
-                  if(trendOK && (InpAlerts || InpPush))
+                  if(trendOK)
                     {
                      g_lv[j].touches++;
                      string lvTag = g_lv[j].isHigh ? "RESISTANCE" : "SUPPORT";
@@ -1029,16 +1083,19 @@ int OnCalculate(const int rates_total,
                      g_lv[j].flipApproached = true;
                      // Trend filter: RBS→BUY suppressed in bear; SBR→SELL suppressed in bull
                      bool flipTrendOK = !InpTrendFilter ||
-                                        (g_lv[j].isHigh ? g_trend >= 0 : g_trend <= 0);
-                     if(flipTrendOK && (InpAlerts || InpPush))
+                                        (g_lv[j].isHigh ? g_trend == 1 : g_trend == -1);
+                     bool touchOK = (InpMaxFlipTouches == 0 || g_lv[j].touches < InpMaxFlipTouches);
+                     if(flipTrendOK && touchOK)
                        {
                         g_lv[j].touches++;
-                        string flipTag = g_lv[j].isHigh ? "RBS" : "SBR";
-                        string flipRdy = g_lv[j].isHigh ? "BUY READY" : "SELL READY";
+                        string flipTag = g_lv[j].isHigh ? "🟢 RBS" : "🔴 SBR";
+                        string flipRdy = g_lv[j].isHigh ? "BUY NOW!" : "SELL NOW!";
                         FireLvlAlert(flipTag, flipRdy, lp, g_lv[j].touches);
                        }
                     }
-                  // flipApproached stays true — one alert per flip level
+                  // Reset flipApproached when price leaves zone — allows next touch to count
+                  if(!inFlipZone && g_lv[j].flipApproached)
+                     g_lv[j].flipApproached = false;
                  }
               }
            }
@@ -1084,6 +1141,18 @@ int OnCalculate(const int rates_total,
                   if(g_trend >= 0 && g_chochSeq != g_lastMSSBuySeq)
                     {
                      g_lastMSSBuySeq = g_chochSeq;
+                     if(InpWriteGV)
+                       {
+                        GlobalVariableSet("SPL_MSS_DIR",          1.0);
+                        GlobalVariableSet("SPL_MSS_TIME",         (double)TimeCurrent());
+                        GlobalVariableSet("SPL_MSS_TYPE",         g_mssZones[z].isFVG ? 1.0 : 0.0);
+                        GlobalVariableSet("SPL_MSS_TOP",          g_mssZones[z].top);
+                        GlobalVariableSet("SPL_MSS_BOT",          g_mssZones[z].bot);
+                        GlobalVariableSet("SPL_FVG_TOUCH_DIR",    1.0);
+                        GlobalVariableSet("SPL_FVG_TOUCH_PRICE",  entryPx);
+                        GlobalVariableSet("SPL_FVG_TOUCH_TIME",   (double)TimeCurrent());
+                        GlobalVariableSet("SPL_FVG_TOUCH_TYPE",   g_mssZones[z].isFVG ? 1.0 : 0.0);
+                       }
                      FireSignal("BUY", zType, entryPx, g_mssSL,
                                 tp1, tp2, tp3, i,
                                 isLive && i == rates_total - 1,
@@ -1099,6 +1168,18 @@ int OnCalculate(const int rates_total,
                   if(g_trend <= 0 && g_chochSeq != g_lastMSSSellSeq)
                     {
                      g_lastMSSSellSeq = g_chochSeq;
+                     if(InpWriteGV)
+                       {
+                        GlobalVariableSet("SPL_MSS_DIR",          -1.0);
+                        GlobalVariableSet("SPL_MSS_TIME",         (double)TimeCurrent());
+                        GlobalVariableSet("SPL_MSS_TYPE",         g_mssZones[z].isFVG ? 1.0 : 0.0);
+                        GlobalVariableSet("SPL_MSS_TOP",          g_mssZones[z].top);
+                        GlobalVariableSet("SPL_MSS_BOT",          g_mssZones[z].bot);
+                        GlobalVariableSet("SPL_FVG_TOUCH_DIR",    -1.0);
+                        GlobalVariableSet("SPL_FVG_TOUCH_PRICE",  entryPx);
+                        GlobalVariableSet("SPL_FVG_TOUCH_TIME",   (double)TimeCurrent());
+                        GlobalVariableSet("SPL_FVG_TOUCH_TYPE",   g_mssZones[z].isFVG ? 1.0 : 0.0);
+                       }
                      FireSignal("SELL", zType, entryPx, g_mssSL,
                                 tp1, tp2, tp3, i,
                                 isLive && i == rates_total - 1,
