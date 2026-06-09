@@ -80,16 +80,19 @@ input color  InpOBColor      = C'140,60,0';      // OB zone colour
 
 input group "=== Alerts & Push ==="
 input bool   InpAlerts       = false;            // Pop-up Alerts
-input bool   InpPush         = false;             // Master push switch (mobile)
+input bool   InpPush         = true;              // Master push switch (mobile)
 input bool   InpPushChoCH    = false;             // Push CHoCH BUY/SELL
-input bool   InpPushSignals  = false;            // Push BUY/SELL/MSS signals
-input bool   InpPushLvlOnly  = false;            // Push level/approach alerts only
+input bool   InpPushSignals  = false;             // Push BUY/SELL/MSS signals (legacy)
+input bool   InpPushSwings   = true;              // Push confirmed BUY/SELL swing signals
+input bool   InpPushFlips    = true;              // Push SBR/RBS flip signals
+input bool   InpPushLvlOnly  = false;             // Push level/approach alerts only
+input bool   InpShowCT       = false;             // Show counter-trend signals (C-T)
 input double InpMinRR        = 1.0;              // Min R:R to nearest opposing level (0=off)
 input bool   InpWriteGV      = true;             // Write SRZONES global variables
 
 input group "=== Level Approach Alerts ==="
 input bool   InpLvlAlerts    = false;            // Push when price nears a swing level
-input bool   InpTrendFilter  = true;             // Suppress contra-trend approach alerts
+input bool   InpTrendFilter  = true;             // Suppress contra-trend signals
 input bool   InpTrackFlips   = true;             // Alert SBR / RBS on retests
 input int    InpMaxFlipTouches = 2;              // Max SBR/RBS alerts per level (0=unlimited)
 input int    InpApproachMode = 0;                // 0=Swing range  1=ATR  2=Fixed pips
@@ -334,7 +337,7 @@ void FireSignal(const string &dir, const string &label,
                 int confirmBar, bool isLive, int &dedupBar)
   {
    if(!isLive)              return;
-  if(dedupBar == confirmBar) return;
+   if(dedupBar == confirmBar) return;
    double srDirSig = (StringFind(dir, "BUY") >= 0) ? 1.0 : -1.0;
    if(InpWriteGV)
      {
@@ -342,8 +345,10 @@ void FireSignal(const string &dir, const string &label,
       GlobalVariableSet("SRZONES_PRICE", sigPrice);
       GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
      }
-   if(!InpAlerts && !InpPush) return;
-   if(!InpPushSignals && !InpAlerts) return;  // signals push disabled
+   // InpPushSwings controls BUY/SELL/MSS push — independent of InpPushSignals legacy toggle
+   bool doAlert = InpAlerts;
+   bool doPush  = InpPush && InpPushSwings;
+   if(!doAlert && !doPush) return;
    dedupBar = confirmBar;
 
    string msg = dir + " " + _Symbol + " " + DoubleToString(sigPrice, _Digits) +
@@ -353,8 +358,8 @@ void FireSignal(const string &dir, const string &label,
                 " | TP2: " + PriceStr(tp2) +
                 " | TP3: " + PriceStr(tp3);
 
-if(InpAlerts) Alert(msg);
-   if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
+   if(doAlert) Alert(msg);
+   if(doPush && !SendNotification(msg)) Print("Push failed: ", msg);
   }
 
 // ================================================================
@@ -878,7 +883,7 @@ int OnCalculate(const int rates_total,
             else
               {
                BufSellCT[pBar] = ph;
-               if(BufPivHEarly[pBar] == 0.0 && CheckMinRR(false, ph, sl))
+               if(InpShowCT && BufPivHEarly[pBar] == 0.0 && CheckMinRR(false, ph, sl))
                   FireSignal("SELL C-T", "Bull", ph, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
@@ -985,7 +990,7 @@ int OnCalculate(const int rates_total,
             else
               {
                BufBuyCT[pBar] = pl;
-               if(BufPivLEarly[pBar] == 0.0 && CheckMinRR(true, pl, sl))
+               if(InpShowCT && BufPivLEarly[pBar] == 0.0 && CheckMinRR(true, pl, sl))
                   FireSignal("BUY C-T", "Bear", pl, sl,
                              tp1, tp2, tp3, i,
                              isLive && i == rates_total - 1,
@@ -1114,8 +1119,8 @@ int OnCalculate(const int rates_total,
                                             EnumToString((ENUM_TIMEFRAMES)_Period) + " " +
                                             DoubleToString(lp, _Digits) +
                                             " | " + IntegerToString(g_lv[j].flipTouches) + "x";
-                           if(InpAlerts) Alert(flipMsg);
-                           if(InpPush)   SendNotification(flipMsg);
+                           if(InpAlerts)              Alert(flipMsg);
+                           if(InpPush && InpPushFlips) SendNotification(flipMsg);
                           }
                        }
                     }
