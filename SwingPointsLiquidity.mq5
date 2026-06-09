@@ -131,6 +131,7 @@ struct SLevel
    double   swingRange;      // pivot candle range (high-low) used for approach threshold
    long     pivotVolume;     // tick_volume at pivot candle (overlap tiebreaker)
    int      touches;         // number of approach episodes (shown in push notification)
+   int      flipTouches;     // SBR/RBS retest count — separate from approach touches
    int      brokenBar;       // bar index when level was broken (-1 = still active)
    bool     approached;      // approach alert active for current episode
    bool     broken;          // price closed through (level flipped)
@@ -506,6 +507,7 @@ void AddLevel(double price, double top, double bot,
    g_lv[g_nLv].swingRange     = swingRange;
    g_lv[g_nLv].pivotVolume    = pivotVolume;
    g_lv[g_nLv].touches        = 0;
+   g_lv[g_nLv].flipTouches    = 0;
    g_lv[g_nLv].brokenBar      = -1;
    g_lv[g_nLv].approached     = false;
    g_lv[g_nLv].broken         = false;
@@ -1080,17 +1082,41 @@ int OnCalculate(const int rates_total,
                  {
                   if(inFlipZone && !g_lv[j].flipApproached)
                     {
-                     g_lv[j].flipApproached = true;
-                     // Trend filter: RBS→BUY suppressed in bear; SBR→SELL suppressed in bull
-                     bool flipTrendOK = !InpTrendFilter ||
-                                        (g_lv[j].isHigh ? g_trend == 1 : g_trend == -1);
-                     bool touchOK = (InpMaxFlipTouches == 0 || g_lv[j].touches < InpMaxFlipTouches);
-                     if(flipTrendOK && touchOK)
+                     // Close confirmation — wick into zone not enough
+                     // RBS (isHigh): close must be ABOVE zone bot (respected as support)
+                     // SBR (!isHigh): close must be BELOW zone top (respected as resistance)
+                     bool closeConfirm = g_lv[j].isHigh
+                                        ? (close[i] > g_lv[j].boxBot)
+                                        : (close[i] < g_lv[j].boxTop);
+                     if(closeConfirm)
                        {
-                        g_lv[j].touches++;
-                        string flipTag = g_lv[j].isHigh ? "🟢 RBS" : "🔴 SBR";
-                        string flipRdy = g_lv[j].isHigh ? "BUY NOW!" : "SELL NOW!";
-                        FireLvlAlert(flipTag, flipRdy, lp, g_lv[j].touches);
+                        g_lv[j].flipApproached = true;
+                        // Trend filter: RBS→BUY suppressed in bear; SBR→SELL suppressed in bull
+                        bool flipTrendOK = !InpTrendFilter ||
+                                           (g_lv[j].isHigh ? g_trend == 1 : g_trend == -1);
+                        // Use flipTouches — independent from approach touches
+                        bool touchOK = (InpMaxFlipTouches == 0 || g_lv[j].flipTouches < InpMaxFlipTouches);
+                        if(flipTrendOK && touchOK)
+                          {
+                           g_lv[j].flipTouches++;
+                           string flipTag = g_lv[j].isHigh ? "🟢 RBS" : "🔴 SBR";
+                           string flipRdy = g_lv[j].isHigh ? "BUY NOW!" : "SELL NOW!";
+                           // Fix GV direction: RBS=BUY(1.0), SBR=SELL(-1.0)
+                           double flipDir = g_lv[j].isHigh ? 1.0 : -1.0;
+                           if(InpWriteGV)
+                             {
+                              GlobalVariableSet("SRZONES_DIR",   flipDir);
+                              GlobalVariableSet("SRZONES_PRICE", lp);
+                              GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+                             }
+                           // Build and send push message
+                           string flipMsg = flipTag + " " + flipRdy + " | " + _Symbol + " " +
+                                            EnumToString((ENUM_TIMEFRAMES)_Period) + " " +
+                                            DoubleToString(lp, _Digits) +
+                                            " | " + IntegerToString(g_lv[j].flipTouches) + "x";
+                           if(InpAlerts) Alert(flipMsg);
+                           if(InpPush)   SendNotification(flipMsg);
+                          }
                        }
                     }
                   // Reset flipApproached when price leaves zone — allows next touch to count
@@ -1115,15 +1141,17 @@ int OnCalculate(const int rates_total,
 
             if(g_mssBull)
               {
-               // BUY: price pulls back down into a bullish zone
-               // Condition: low touches or enters zone top, high confirms bar is near zone
-               if(low[i] <= g_mssZones[z].top && low[i] >= g_mssZones[z].bot)
+               // BUY: price pulls back into bullish zone AND closes above zone bot
+               // (close check prevents false trigger when wick breaks through zone)
+               if(low[i]  <= g_mssZones[z].top && low[i]  >= g_mssZones[z].bot
+                  && close[i] > g_mssZones[z].bot)
                  { entered = true; entryPx = g_mssZones[z].top; }
               }
             else
               {
-               // SELL: price retraces up into a bearish zone
-               if(high[i] >= g_mssZones[z].bot && high[i] <= g_mssZones[z].top)
+               // SELL: price retraces into bearish zone AND closes below zone top
+               if(high[i] >= g_mssZones[z].bot && high[i] <= g_mssZones[z].top
+                  && close[i] < g_mssZones[z].top)
                  { entered = true; entryPx = g_mssZones[z].bot; }
               }
 
@@ -1136,9 +1164,8 @@ int OnCalculate(const int rates_total,
                  {
                   BufBuyMSS[i] = entryPx;
                   FindBuyTPs(entryPx, tp1, tp2, tp3);
-                  // Trend gate: suppress if trend has since flipped bear
-                  // Dedup: only first zone entry per CHoCH fires push
-                  if(g_trend >= 0 && g_chochSeq != g_lastMSSBuySeq)
+                  // Trend gate: suppress if trend undefined or flipped bear
+                  if(g_trend > 0 && g_chochSeq != g_lastMSSBuySeq)
                     {
                      g_lastMSSBuySeq = g_chochSeq;
                      if(InpWriteGV)
@@ -1163,9 +1190,8 @@ int OnCalculate(const int rates_total,
                  {
                   BufSellMSS[i] = entryPx;
                   FindSellTPs(entryPx, tp1, tp2, tp3);
-                  // Trend gate: suppress if trend has since flipped bull
-                  // Dedup: only first zone entry per CHoCH fires push
-                  if(g_trend <= 0 && g_chochSeq != g_lastMSSSellSeq)
+                  // Trend gate: suppress if trend undefined or flipped bull
+                  if(g_trend < 0 && g_chochSeq != g_lastMSSSellSeq)
                     {
                      g_lastMSSSellSeq = g_chochSeq;
                      if(InpWriteGV)
