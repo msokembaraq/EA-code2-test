@@ -1,0 +1,334 @@
+//+------------------------------------------------------------------+
+//|                                                 SuperTrendST.mq5 |
+//|                                                 LinerX Snflow    |
+//|                                                                  |
+//|  EXTRACTED FROM: LinerX_Snflow_EA_v5.1.mq5                       |
+//|                                                                  |
+//|  SuperTrend logic — exact copy of the EA's SuperTrend engine:    |
+//|    - Wilder's ATR smoothing (default)                            |
+//|    - Median price source ((high+low)/2)                          |
+//|    - Standard SuperTrend band calculation                        |
+//|    - Trend flip detection                                        |
+//|                                                                  |
+//|  UPDATED: Firm Signals Only (No Repaint), State Buffers Added    |
+//+------------------------------------------------------------------+
+#property copyright "LinerX Snflow"
+#property version   "1.04"
+#property indicator_chart_window
+#property indicator_buffers 7
+#property indicator_plots   4
+
+//--- plot UP band
+#property indicator_label1  "ST Up"
+#property indicator_type1   DRAW_LINE
+#property indicator_color1  clrLimeGreen
+#property indicator_style1  STYLE_SOLID
+#property indicator_width1  2
+
+//--- plot DOWN band
+#property indicator_label2  "ST Down"
+#property indicator_type2   DRAW_LINE
+#property indicator_color2  clrRed
+#property indicator_style2  STYLE_SOLID
+#property indicator_width2  2
+
+//--- plot BUY arrow
+#property indicator_label3  "Buy Arrow"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  clrLimeGreen
+#property indicator_style3  STYLE_SOLID
+#property indicator_width3  2
+
+//--- plot SELL arrow
+#property indicator_label4  "Sell Arrow"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  clrRed
+#property indicator_style4  STYLE_SOLID
+#property indicator_width4  2
+
+//--- trend buffer (internal, not plotted)
+#property indicator_label5  "Trend"
+#property indicator_type5   DRAW_NONE
+
+//+------------------------------------------------------------------+
+//| INPUTS                                                           |
+//+------------------------------------------------------------------+
+input group "═══════════════ SUPERTREND SETTINGS ═══════════════"
+input int      ST_ATR_Periods   = 14;        // ATR Period
+input double   ST_Multiplier    = 2.0;       // ATR Multiplier
+input bool     ST_UseWilderATR  = true;      // Use Wilder's smoothing for ATR
+
+input group "═══════════════ VISUALS ═══════════════"
+input bool     ShowSTLines      = true;      // Show SuperTrend Lines
+input bool     ShowTextLabels   = true;      // Show BUY/SELL Text Words
+
+input group "═══════════════ ALERTS ═══════════════"
+input bool     AlertOnFlip      = true;      // Alert on trend change
+input bool     UsePushNotify    = false;     // Send push notifications
+
+//+------------------------------------------------------------------+
+//| INDICATOR BUFFERS & GLOBALS                                      |
+//+------------------------------------------------------------------+
+double g_stUpBuffer[];
+double g_stDnBuffer[];
+double g_stBuyBuffer[];
+double g_stSellBuffer[];
+double g_stTrendBuffer[];
+double g_stUpFull[]; // Hidden state buffer for UP line
+double g_stDnFull[]; // Hidden state buffer for DOWN line
+
+int      g_stATRHandle       = INVALID_HANDLE;
+datetime g_lastAlertBarTime  = 0;
+datetime g_lastAlert         = 0;
+
+string OBJ_PREFIX = "ST_Txt_"; // Prefix for text objects
+
+//+------------------------------------------------------------------+
+//| INIT                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- set indicator buffers
+   SetIndexBuffer(0, g_stUpBuffer,    INDICATOR_DATA);
+   SetIndexBuffer(1, g_stDnBuffer,    INDICATOR_DATA);
+   SetIndexBuffer(2, g_stBuyBuffer,   INDICATOR_DATA);
+   SetIndexBuffer(3, g_stSellBuffer,  INDICATOR_DATA);
+   SetIndexBuffer(4, g_stTrendBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(5, g_stUpFull,      INDICATOR_CALCULATIONS);
+   SetIndexBuffer(6, g_stDnFull,      INDICATOR_CALCULATIONS);
+
+   //--- configure UP line
+   PlotIndexSetString(0,  PLOT_LABEL, "ST Up");
+   PlotIndexSetInteger(0, PLOT_DRAW_BEGIN, ST_ATR_Periods + 1);
+   PlotIndexSetDouble(0,  PLOT_EMPTY_VALUE, 0);
+   if(!ShowSTLines) PlotIndexSetInteger(0, PLOT_DRAW_TYPE, DRAW_NONE);
+   
+   //--- configure DOWN line
+   PlotIndexSetString(1,  PLOT_LABEL, "ST Down");
+   PlotIndexSetInteger(1, PLOT_DRAW_BEGIN, ST_ATR_Periods + 1);
+   PlotIndexSetDouble(1,  PLOT_EMPTY_VALUE, 0);
+   if(!ShowSTLines) PlotIndexSetInteger(1, PLOT_DRAW_TYPE, DRAW_NONE);
+
+   //--- configure BUY arrow (Wingdings 233 = Up Arrow)
+   PlotIndexSetString(2,  PLOT_LABEL, "Buy Arrow");
+   PlotIndexSetInteger(2, PLOT_ARROW, 233);
+   PlotIndexSetDouble(2,  PLOT_EMPTY_VALUE, 0);
+
+   //--- configure SELL arrow (Wingdings 234 = Down Arrow)
+   PlotIndexSetString(3,  PLOT_LABEL, "Sell Arrow");
+   PlotIndexSetInteger(3, PLOT_ARROW, 234);
+   PlotIndexSetDouble(3,  PLOT_EMPTY_VALUE, 0);
+   
+   //--- indicator short name
+   string short_name = StringFormat("SuperTrend(%d,%.1f,%s)", 
+                                    ST_ATR_Periods, ST_Multiplier, 
+                                    ST_UseWilderATR ? "Wilder" : "Classic");
+   IndicatorSetString(INDICATOR_SHORTNAME, short_name);
+   
+   //--- create ATR handle
+   if(ST_UseWilderATR)
+   {
+      g_stATRHandle = iATR(_Symbol, PERIOD_CURRENT, ST_ATR_Periods);
+      if(g_stATRHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Failed to create ATR handle");
+         return INIT_FAILED;
+      }
+   }
+   
+   Print("══════════════════════════════════════════");
+   Print("SuperTrend ST Indicator loaded (Firm Signals)");
+   Print("  Period: ", ST_ATR_Periods);
+   Print("  Multiplier: ", ST_Multiplier);
+   Print("  ATR Mode: ", ST_UseWilderATR ? "Wilder" : "Classic");
+   Print("  Show Lines: ", ShowSTLines ? "Yes" : "No");
+   Print("  Show Text: ", ShowTextLabels ? "Yes" : "No");
+   Print("══════════════════════════════════════════");
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| DEINIT                                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_stATRHandle != INVALID_HANDLE)
+      IndicatorRelease(g_stATRHandle);
+
+   // Cleanup all text objects created by this indicator
+   ObjectsDeleteAll(0, OBJ_PREFIX);
+   Print("SuperTrend ST removed. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| GET ATR VALUE                                                    |
+//+------------------------------------------------------------------+
+double GetSTATR(int shift=1)
+{
+   if(ST_UseWilderATR)
+   {
+      if(g_stATRHandle == INVALID_HANDLE) return 0;
+      double buf[1];
+      if(CopyBuffer(g_stATRHandle, 0, shift, 1, buf) <= 0) return 0;
+      return buf[0];
+   }
+   
+   // Classic ATR — simple average of true ranges
+   double sum = 0;
+   for(int i = shift; i < shift + ST_ATR_Periods; i++)
+   {
+      double hi = iHigh(_Symbol, PERIOD_CURRENT, i);
+      double lo = iLow(_Symbol, PERIOD_CURRENT, i);
+      double pc = iClose(_Symbol, PERIOD_CURRENT, i + 1);
+      sum += MathMax(hi - lo, MathMax(MathAbs(hi - pc), MathAbs(lo - pc)));
+   }
+   
+   return sum / ST_ATR_Periods;
+}
+
+//+------------------------------------------------------------------+
+//| NOTIFICATION                                                     |
+//+------------------------------------------------------------------+
+void DoAlert(string msg, bool isFlip)
+{
+   if(!AlertOnFlip && isFlip) return;
+   if(TimeCurrent() - g_lastAlert < 3) return;
+   
+   g_lastAlert = TimeCurrent();
+   Alert(msg);
+   
+   if(UsePushNotify) SendNotification(msg);
+}
+
+//+------------------------------------------------------------------+
+//| CALCULATE                                                        |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   if(rates_total < ST_ATR_Periods + 2) return 0;
+
+   int start = (prev_calculated > 0) ? prev_calculated - 1 : 1;
+   if(start < ST_ATR_Periods + 2) start = ST_ATR_Periods + 2;
+
+   for(int i = start; i < rates_total && !IsStopped(); i++)
+   {
+      int shift = rates_total - i - 1;
+      if(shift < 0) continue;
+      
+      double atr = GetSTATR(shift);
+      if(atr <= 0) continue;
+      
+      double src = (high[i] + low[i]) / 2.0;
+      double raw_up = src - ST_Multiplier * atr;
+      double raw_dn = src + ST_Multiplier * atr;
+      
+      double prev_up    = g_stUpFull[i-1];
+      double prev_dn    = g_stDnFull[i-1];
+      int    prev_trend = (int)g_stTrendBuffer[i-1];
+      
+      // Initialize first iteration
+      if(prev_up == 0 || prev_dn == 0)
+      {
+          prev_up    = raw_up;
+          prev_dn    = raw_dn;
+          prev_trend = 1;
+      }
+      
+      // Calculate standard Supertrend bands
+      double new_up = (close[i] > prev_up) ? MathMax(raw_up, prev_up) : raw_up;
+      double new_dn = (close[i] < prev_dn) ? MathMin(raw_dn, prev_dn) : raw_dn;
+      
+      int new_trend = prev_trend;
+      if(new_trend == 1 && close[i] < prev_up) new_trend = -1;
+      else if(new_trend == -1 && close[i] > prev_dn) new_trend = 1;
+      
+      // Store accurate historical state 
+      g_stUpFull[i]      = new_up;
+      g_stDnFull[i]      = new_dn;
+      g_stTrendBuffer[i] = new_trend;
+      
+      // Plot actual visual lines
+      g_stUpBuffer[i] = (new_trend == 1) ? new_up : 0;
+      g_stDnBuffer[i] = (new_trend == -1) ? new_dn : 0;
+      
+      // Wipe signal buffers by default to prevent artifacts
+      g_stBuyBuffer[i]  = 0;
+      g_stSellBuffer[i] = 0;
+
+      // ════════════════════════════════════════════════════════════
+      // 1. FIRM VISUAL SIGNALS (NO REPAINT)
+      // Only draw arrows and text objects if the candle has fully closed
+      // ════════════════════════════════════════════════════════════
+      if(shift > 0)
+      {
+         double offset = atr * 0.5;
+         
+         if(new_trend == 1 && prev_trend == -1)
+         {
+            g_stBuyBuffer[i] = new_up;
+            if(ShowTextLabels)
+            {
+               string objName = OBJ_PREFIX + "BUY_" + TimeToString(time[i]);
+               if(ObjectFind(0, objName) < 0)
+               {
+                  ObjectCreate(0, objName, OBJ_TEXT, 0, time[i], new_up - offset);
+                  ObjectSetString(0, objName, OBJPROP_TEXT, "BUY");
+                  ObjectSetInteger(0, objName, OBJPROP_COLOR, clrLimeGreen);
+                  ObjectSetInteger(0, objName, OBJPROP_ANCHOR, ANCHOR_UPPER);
+                  ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, 9);
+               }
+            }
+         }
+         else if(new_trend == -1 && prev_trend == 1)
+         {
+            g_stSellBuffer[i] = new_dn;
+            if(ShowTextLabels)
+            {
+               string objName = OBJ_PREFIX + "SELL_" + TimeToString(time[i]);
+               if(ObjectFind(0, objName) < 0)
+               {
+                  ObjectCreate(0, objName, OBJ_TEXT, 0, time[i], new_dn + offset);
+                  ObjectSetString(0, objName, OBJPROP_TEXT, "SELL");
+                  ObjectSetInteger(0, objName, OBJPROP_COLOR, clrRed);
+                  ObjectSetInteger(0, objName, OBJPROP_ANCHOR, ANCHOR_LOWER);
+                  ObjectSetInteger(0, objName, OBJPROP_FONTSIZE, 9);
+               }
+            }
+         }
+      }
+      
+      // ════════════════════════════════════════════════════════════
+      // 2. FIRM ALERTS
+      // Only fire an alert on the opening tick of a new bar if the 
+      // previous locked bar triggered a flip.
+      // ════════════════════════════════════════════════════════════
+      if(shift == 0)
+      {
+         if(prev_trend != g_stTrendBuffer[i-2]) 
+         {
+            if(time[i] != g_lastAlertBarTime)
+            {
+               string dir = (prev_trend == 1) ? "BULLISH ▲" : "BEARISH ▼";
+               string msg = StringFormat("SuperTrend FIRM FLIP | %s | %s @ %s",
+                                         _Symbol, dir,
+                                         DoubleToString(close[i-1], (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)));
+               DoAlert(msg, true);
+               g_lastAlertBarTime = time[i]; // Lock alert to prevent duplicates
+            }
+         }
+      }
+   }
+   
+   return rates_total;
+}
+//+------------------------------------------------------------------+

@@ -1,0 +1,1000 @@
+//+------------------------------------------------------------------+
+//|                                              S_R_Zones_b1dii.mq5 |
+//|                                    Mirror of Pine v6 (Audit Fix) |
+//+------------------------------------------------------------------+
+#property copyright "bidiisStrategy"
+#property version   "1.02"
+#property indicator_chart_window
+#property indicator_plots   0
+
+//+------------------------------------------------------------------+
+//| ENUMS                                                             |
+//+------------------------------------------------------------------+
+enum ENUM_STRENGTH_PRESET
+  {
+   SCALP = 0,
+   LOCAL = 1,
+   SWING = 2,
+   MAJOR = 3,
+   CUSTOM = 4
+  };
+
+enum ENUM_VOLUME_FORMAT
+  {
+   ABSOLUTE = 0,
+   PERCENTAGE = 1
+  };
+
+//+------------------------------------------------------------------+
+//| STRUCTURES                                                        |
+//+------------------------------------------------------------------+
+struct Pivot
+  {
+   double            price;
+   int               bar;
+   double            vol;
+   double            wick;
+  };
+
+struct Zone
+  {
+   double            top;
+   double            bot;
+   double            center;
+   double            strength;
+   double            volSum;
+   int               touches;
+   int               firstBar;
+   int               lastTouch;
+   int               diedBar;
+   bool              isResistance;
+   bool              wasBroken;
+   bool              isLiveBreak;
+  };
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                  |
+//+------------------------------------------------------------------+
+input group "Zone Strength"
+input ENUM_STRENGTH_PRESET InpPreset = SWING;
+
+input group "Custom Parameters"
+input int      InpPivLeft    = 50;
+input int      InpPivRight   = 15;
+input double   InpClusterTol = 0.9;
+input int      InpMinSpacing = 20;
+input int      InpPivBuffer  = 80;
+
+input group "Zones"
+input int      InpZoneCount  = 6;
+input int      InpMinTouches = 3;
+input int      InpFadeAge    = 120;
+input double   InpHideFar    = 60.0;
+
+input group "Broken Zones"
+input bool     InpShowBroken   = true;
+input bool     InpShowDropped  = true;
+input color    InpBrokenBull   = clrDarkSeaGreen;
+input color    InpBrokenBear   = clrLightPink;
+input int      InpBrokenOp     = 100;
+
+input group "Signals"
+input bool     InpShowTest     = true;   // Show test markers
+input bool     InpShowRetest   = true;   // Show retest markers
+input bool     InpShowReaction = false;  // Show reaction marks
+input int      InpSigCooldown  = 20;     // Cooldown bars
+input int      InpRetestWindow = 120;    // Retest window bars
+input bool     InpPushRetest      = true;   // Push: BUY/SELL RETEST with SL/TP
+input bool     InpPushBreak       = true;   // Push: BUY/SELL BREAK on live zone break
+input bool     InpPushZoneTouch   = true;   // Push: BUY/SELL ZONE READY on touch
+input int      InpTouchCooldown   = 30;     // Zone touch push cooldown (bars)
+input double   InpSLBuffer        = 0.5;    // SL buffer (x ATR beyond zone edge)
+input bool     InpWriteGV         = false;  // Write SRZONES global variables (disable if another indicator owns GV)
+
+input group "Style"
+input color    InpResColor    = clrOrangeRed;
+input color    InpSupColor    = clrMediumSeaGreen;
+input bool     InpUseVolColor = true;
+input bool     InpShowLabels  = true;
+input bool     InpShowVolText = true;
+input ENUM_VOLUME_FORMAT InpVolFormat = ABSOLUTE;
+input bool     InpSingleLine  = true;
+input int      InpZoneOpacity = 100;
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                  |
+//+------------------------------------------------------------------+
+int      pivLeft, pivRight;
+double   clusterTol;
+int      minSpacing;
+
+int      atrHandle;
+
+Pivot    highPivots[];
+Pivot    lowPivots[];
+int      highPivotCount, lowPivotCount;
+
+Zone     resZones[];
+Zone     supZones[];
+Zone     brokenZones[];
+int      resCount, supCount, brokenCount;
+
+double   sigZoneCenters[];
+int      sigZoneBars[];
+int      sigCount;
+
+// Retest push dedup — per-zone cooldown (InpRetestWindow bars)
+double   retestNotifyCenters[];
+int      retestNotifyBars[];
+int      retestNotifyCount = 0;
+
+// Break push dedup — one fire per zone per break event
+double   breakNotifyCenters[];
+int      breakNotifyBars[];
+int      breakNotifyCount = 0;
+
+// Zone touch push dedup (independent cooldown from signal arrays)
+double   touchNotifyCenters[];
+int      touchNotifyBars[];
+int      touchNotifyCount = 0;
+
+string   prefix = "FEELS_SR_";
+
+//+------------------------------------------------------------------+
+double SafeVolume(long vol)        { return (vol <= 0) ? 1.0 : (double)vol; }
+double UpperWick(double h,double o,double c) { return h - MathMax(o,c); }
+double LowerWick(double l,double o,double c) { return MathMin(o,c) - l; }
+
+//+------------------------------------------------------------------+
+bool IsPivotHigh(int b,const double &high[],int total)
+  {
+   if(b<pivLeft||b+pivRight>=total) return false;
+   double h=high[b]; if(h<=0) return false;
+   for(int i=1;i<=pivLeft;i++)  if(high[b-i]>=h) return false;
+   for(int i=1;i<=pivRight;i++) if(high[b+i]>h)  return false;
+   return true;
+  }
+
+bool IsPivotLow(int b,const double &low[],int total)
+  {
+   if(b<pivLeft||b+pivRight>=total) return false;
+   double l=low[b]; if(l<=0) return false;
+   for(int i=1;i<=pivLeft;i++)  if(low[b-i]<=l) return false;
+   for(int i=1;i<=pivRight;i++) if(low[b+i]<l)  return false;
+   return true;
+  }
+
+bool IsDuplicatePivot(const Pivot &arr[],int count,int bar)
+  {
+   for(int i=count-1;i>=0&&i>=count-10;i--)
+      if(arr[i].bar==bar) return true;
+   return false;
+  }
+
+void AddPivot(Pivot &arr[],int &count,const Pivot &p,int maxCount)
+  {
+   if(count<maxCount)
+     { if(count>=ArraySize(arr)) ArrayResize(arr,count+10); arr[count++]=p; }
+   else
+     { for(int i=0;i<count-1;i++) arr[i]=arr[i+1]; arr[count-1]=p; }
+  }
+
+void RollingVolumeSMA(const long &tv[],int total,int period,double &out[])
+  {
+   ArrayResize(out,total); ArrayInitialize(out,0);
+   if(total<period) return;
+   double sum=0;
+   for(int i=0;i<period;i++) sum+=(double)tv[i];
+   out[period-1]=sum/period;
+   for(int i=period;i<total;i++) { sum+=(double)tv[i]-(double)tv[i-period]; out[i]=sum/period; }
+   double fv=out[period-1];
+   for(int i=0;i<period-1;i++) out[i]=fv;
+  }
+
+double PivotWeight(Pivot &p,double atr,double vAvg,int currentBar)
+  {
+   double sv=(p.vol<=0)?0.0:p.vol;
+   double sw=(p.wick<0)?0.0:p.wick;
+   int age=MathMax(1,currentBar-p.bar);
+   double decay=1.0/(1.0+age/200.0);
+   double vn=(vAvg>0)?sv/vAvg:1.0;
+   double wn=(atr>0)?sw/atr:0.0;
+   return (1.0+vn*0.5+wn*0.5)*decay;
+  }
+
+void BuildZones(Pivot &src[],int srcCount,bool isRes,double atr,
+                double vAvg,int curBar,Zone &out[],int &outCount)
+  {
+   outCount=0; ArrayResize(out,0);
+   if(srcCount<InpMinTouches||atr<=0) return;
+   bool used[]; ArrayResize(used,srcCount); ArrayInitialize(used,false);
+   double tol=atr*clusterTol;
+   Zone tmp[]; int tc=0; ArrayResize(tmp,srcCount);
+   for(int i=0;i<srcCount;i++)
+     {
+      if(used[i]) continue;
+      Pivot seed=src[i];
+      int mi[]; int mc=0; ArrayResize(mi,srcCount); mi[mc++]=i; used[i]=true;
+      for(int j=i+1;j<srcCount;j++)
+        {
+         if(used[j]) continue;
+         if(MathAbs(src[j].price-seed.price)<=tol)
+           {
+            bool fe=true;
+            if(minSpacing>0)
+               for(int k=0;k<mc&&fe;k++)
+                  if(MathAbs(src[j].bar-src[mi[k]].bar)<minSpacing) fe=false;
+            if(fe){mi[mc++]=j;used[j]=true;}
+           }
+        }
+      if(mc>=InpMinTouches)
+        {
+         double ps=0,ws=0,vs=0;
+         int earliest=src[mi[0]].bar,latest=src[mi[0]].bar;
+         for(int k=0;k<mc;k++)
+           {
+            Pivot m=src[mi[k]];
+            double w=PivotWeight(m,atr,vAvg,curBar);
+            ps+=m.price*w; ws+=w; vs+=(m.vol>0)?m.vol:0;
+            earliest=MathMin(earliest,m.bar); latest=MathMax(latest,m.bar);
+           }
+         if(ws>0)
+           {
+            double ctr=ps/ws, pad=atr*0.25;
+            tmp[tc].top=ctr+pad; tmp[tc].bot=ctr-pad; tmp[tc].center=ctr;
+            tmp[tc].strength=ws; tmp[tc].volSum=vs; tmp[tc].touches=mc;
+            tmp[tc].firstBar=earliest; tmp[tc].lastTouch=latest;
+            tmp[tc].diedBar=-1; tmp[tc].isResistance=isRes;
+            tmp[tc].wasBroken=false; tmp[tc].isLiveBreak=false; tc++;
+           }
+        }
+     }
+   if(tc>0)
+     {
+      int keep=MathMin(InpZoneCount,tc);
+      for(int i=0;i<keep&&i<tc;i++)
+        {
+         int bi=i;
+         for(int j=i+1;j<tc;j++) if(tmp[j].strength>tmp[bi].strength) bi=j;
+         if(bi!=i){Zone t=tmp[i];tmp[i]=tmp[bi];tmp[bi]=t;}
+        }
+      outCount=keep; ArrayResize(out,keep);
+      for(int i=0;i<keep;i++) out[i]=tmp[i];
+     }
+  }
+
+bool ZoneSurvives(Zone &old,Zone &nz[],int nc,double atr)
+  {
+   double tol=atr*clusterTol;
+   for(int i=0;i<nc;i++) if(MathAbs(nz[i].center-old.center)<=tol) return true;
+   return false;
+  }
+
+bool IsAlreadyBroken(Zone &z,double atr)
+  {
+   double tol=atr*clusterTol*0.7;
+   for(int i=0;i<brokenCount;i++)
+      if(brokenZones[i].isResistance==z.isResistance&&brokenZones[i].wasBroken&&
+         MathAbs(brokenZones[i].center-z.center)<=tol) return true;
+   return false;
+  }
+
+void ArchiveZone(Zone &z,double atr)
+  {
+   double tol=atr*clusterTol*0.7;
+   for(int i=0;i<brokenCount;i++)
+     {
+      if(brokenZones[i].isResistance==z.isResistance&&MathAbs(brokenZones[i].center-z.center)<=tol)
+        {
+         if(z.wasBroken&&!brokenZones[i].wasBroken)
+           {brokenZones[i].wasBroken=true;brokenZones[i].diedBar=z.diedBar;brokenZones[i].isLiveBreak=z.isLiveBreak;}
+         return;
+        }
+     }
+   if(brokenCount>=ArraySize(brokenZones)) ArrayResize(brokenZones,brokenCount+10);
+   brokenZones[brokenCount++]=z;
+   if(brokenCount>100){for(int i=0;i<brokenCount-1;i++) brokenZones[i]=brokenZones[i+1]; brokenCount--;}
+  }
+
+void InheritState(Zone &nz,Zone &old[],int oc,double atr)
+  {
+   double tol=atr*clusterTol;
+   for(int i=0;i<oc;i++) if(MathAbs(old[i].center-nz.center)<=tol){nz.lastTouch=old[i].lastTouch;break;}
+  }
+
+bool CooldownOk(double center,double atr,int curBar)
+  {
+   for(int i=0;i<sigCount;i++)
+      if(MathAbs(sigZoneCenters[i]-center)<=atr*clusterTol)
+         if(curBar-sigZoneBars[i]<InpSigCooldown) return false;
+   return true;
+  }
+
+void RecordSignal(double center,int curBar)
+  {
+   if(sigCount>=ArraySize(sigZoneCenters)){ArrayResize(sigZoneCenters,sigCount+10);ArrayResize(sigZoneBars,sigCount+10);}
+   sigZoneCenters[sigCount]=center; sigZoneBars[sigCount]=curBar; sigCount++;
+   if(sigCount>50){for(int i=0;i<sigCount-1;i++){sigZoneCenters[i]=sigZoneCenters[i+1];sigZoneBars[i]=sigZoneBars[i+1];}sigCount--;}
+  }
+
+bool ZoneRenderable(Zone &z)
+  { return(z.diedBar<0&&z.touches>=InpMinTouches&&z.top>0&&z.bot>0&&z.bot<z.top); }
+
+bool CheckSupBounce(int bar,const double &open[],const double &high[],const double &low[],const double &close[],double atr)
+  {
+   for(int i=0;i<supCount;i++)
+     {
+      if(!ZoneRenderable(supZones[i])) continue;
+      if(low[bar]<=supZones[i].top&&close[bar]>=supZones[i].bot&&close[bar]>=open[bar]&&CooldownOk(supZones[i].center,atr,bar))
+        {RecordSignal(supZones[i].center,bar);return true;}
+     }
+   return false;
+  }
+
+bool CheckResReject(int bar,const double &open[],const double &high[],const double &low[],const double &close[],double atr)
+  {
+   for(int i=0;i<resCount;i++)
+     {
+      if(!ZoneRenderable(resZones[i])) continue;
+      if(high[bar]>=resZones[i].bot&&close[bar]<=resZones[i].top&&close[bar]<=open[bar]&&CooldownOk(resZones[i].center,atr,bar))
+        {RecordSignal(resZones[i].center,bar);return true;}
+     }
+   return false;
+  }
+
+bool CheckRetestBull(int bar,const double &open[],const double &high[],const double &low[],const double &close[])
+  {
+   for(int i=0;i<brokenCount;i++)
+     {
+      if(!brokenZones[i].isResistance||!brokenZones[i].wasBroken||brokenZones[i].diedBar<0) continue;
+      int age=bar-brokenZones[i].diedBar;
+      if(age>0&&age<=InpRetestWindow&&low[bar]<=brokenZones[i].top&&close[bar]>=brokenZones[i].bot&&close[bar]>=open[bar])
+         return true;
+     }
+   return false;
+  }
+
+bool CheckRetestBear(int bar,const double &open[],const double &high[],const double &low[],const double &close[])
+  {
+   for(int i=0;i<brokenCount;i++)
+     {
+      if(brokenZones[i].isResistance||!brokenZones[i].wasBroken||brokenZones[i].diedBar<0) continue;
+      int age=bar-brokenZones[i].diedBar;
+      if(age>0&&age<=InpRetestWindow&&high[bar]>=brokenZones[i].bot&&close[bar]<=brokenZones[i].top&&close[bar]<=open[bar])
+         return true;
+     }
+   return false;
+  }
+
+string StrengthStars(double s,double maxS)
+  {double r=(maxS>0)?s/maxS:0.0;return r>=0.85?"★★★":r>=0.55?"★★":"★";}
+
+int AgeFade(int lastTouch,int curBar)
+  {
+   if(InpFadeAge<=0) return 0;
+   int age=curBar-lastTouch;
+   return age<=0?0:MathMin(15,(int)(age*15.0/InpFadeAge));
+  }
+
+bool IsFar(double zc,double cc)
+  {return(InpHideFar>0&&cc>0&&MathAbs(zc-cc)/cc*100.0>InpHideFar);}
+
+string FormatVolume(double v)
+  {
+   if(v>=1e9) return DoubleToString(v/1e9,2)+"B";
+   if(v>=1e6) return DoubleToString(v/1e6,2)+"M";
+   if(v>=1e3) return DoubleToString(v/1e3,2)+"K";
+   return DoubleToString(v,2);
+  }
+
+int SafeStartIdx(int b,int total)
+  {int ms=MathMax(0,total-4900);return(b<ms)?ms:b;}
+
+//+------------------------------------------------------------------+
+void DrawAlive(Zone &z,color bc,double mxS,double mxV,int curBar,int total,const datetime &time[],double cc)
+  {
+   if(z.top<=0||z.bot<=0||z.center<=0||z.bot>=z.top||IsFar(z.center,cc)) return;
+   datetime rt=time[curBar]+25*PeriodSeconds(_Period);
+   int si=SafeStartIdx(z.firstBar,total);
+   datetime st=time[si];
+   int extra=AgeFade(z.lastTouch,curBar),vb=0;
+   if(InpUseVolColor&&mxV>0){double vr=MathMin(1.0,z.volSum/mxV);vb=(int)(vr*35);}
+   int fo=MathMax(40,MathMin(100,InpZoneOpacity+extra-vb));
+   int eo=MathMin(100,35+extra-vb/2);
+   string uid=IntegerToString(curBar)+"_"+IntegerToString(MathRand());
+   string bn=prefix+"B_"+(z.isResistance?"R_":"S_")+uid;
+   ObjectCreate(0,bn,OBJ_RECTANGLE,0,st,z.top,rt,z.bot);
+   ObjectSetInteger(0,bn,OBJPROP_COLOR,clrNONE);
+   ObjectSetInteger(0,bn,OBJPROP_BGCOLOR,ColorToARGB(bc,(uchar)MathRound(fo*2.55)));
+   ObjectSetInteger(0,bn,OBJPROP_FILL,true); ObjectSetInteger(0,bn,OBJPROP_BACK,true);
+   ObjectSetInteger(0,bn,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,bn,OBJPROP_HIDDEN,true);
+   string ln=prefix+"L_"+(z.isResistance?"R_":"S_")+uid;
+   ObjectCreate(0,ln,OBJ_TREND,0,st,z.center,rt,z.center);
+   ObjectSetInteger(0,ln,OBJPROP_COLOR,ColorToARGB(bc,(uchar)MathRound(eo*2.55)));
+   ObjectSetInteger(0,ln,OBJPROP_STYLE,STYLE_DASH); ObjectSetInteger(0,ln,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,ln,OBJPROP_BACK,true); ObjectSetInteger(0,ln,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,ln,OBJPROP_HIDDEN,true);
+   if(InpShowLabels)
+     {
+      string lbn=prefix+"LB_"+(z.isResistance?"R_":"S_")+uid;
+      string txt="",stars=StrengthStars(z.strength,mxS);
+      if(InpShowVolText&&mxV>0)
+        {
+         string vv=(InpVolFormat==PERCENTAGE)?IntegerToString((int)((z.volSum/mxV)*100))+"%":FormatVolume(z.volSum);
+         txt=InpSingleLine?stars+"  "+IntegerToString(z.touches)+"x  -  Vol: "+vv:"Vol: "+vv+"\n"+stars+"  "+IntegerToString(z.touches)+"x";
+        }
+      else txt=stars+"  "+IntegerToString(z.touches)+"x";
+      ObjectCreate(0,lbn,OBJ_TEXT,0,rt,z.center);
+      ObjectSetString(0,lbn,OBJPROP_TEXT,txt);
+      ObjectSetInteger(0,lbn,OBJPROP_COLOR,ChartGetInteger(0,CHART_COLOR_FOREGROUND));
+      ObjectSetInteger(0,lbn,OBJPROP_FONTSIZE,8); ObjectSetInteger(0,lbn,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,lbn,OBJPROP_HIDDEN,true); ObjectSetInteger(0,lbn,OBJPROP_BACK,false);
+     }
+  }
+
+void DrawBroken(Zone &z,int total,const datetime &time[],double cc)
+  {
+   if(z.top<=0||z.bot<=0||z.bot>=z.top||IsFar(z.center,cc)) return;
+   color uc=z.isResistance?InpBrokenBear:InpBrokenBull;
+   int si=SafeStartIdx(z.firstBar,total);
+   int ei=(z.diedBar<0)?0:SafeStartIdx(z.diedBar,total);
+   string uid=IntegerToString(MathRand());
+   string bn=prefix+"BROKEN_B_"+uid;
+   ObjectCreate(0,bn,OBJ_RECTANGLE,0,time[si],z.top,time[ei],z.bot);
+   ObjectSetInteger(0,bn,OBJPROP_COLOR,clrNONE);
+   ObjectSetInteger(0,bn,OBJPROP_BGCOLOR,ColorToARGB(uc,(uchar)MathRound(InpBrokenOp*2.55)));
+   ObjectSetInteger(0,bn,OBJPROP_FILL,true); ObjectSetInteger(0,bn,OBJPROP_BACK,true);
+   ObjectSetInteger(0,bn,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,bn,OBJPROP_HIDDEN,true);
+   string ln=prefix+"BROKEN_L_"+uid;
+   ObjectCreate(0,ln,OBJ_TREND,0,time[si],z.center,time[ei],z.center);
+   ObjectSetInteger(0,ln,OBJPROP_COLOR,ColorToARGB(uc,(uchar)MathRound(MathMin(100,InpBrokenOp+10)*2.55)));
+   ObjectSetInteger(0,ln,OBJPROP_STYLE,STYLE_DASH); ObjectSetInteger(0,ln,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,ln,OBJPROP_BACK,true); ObjectSetInteger(0,ln,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,ln,OBJPROP_HIDDEN,true);
+   if(InpShowReaction&&z.wasBroken&&z.diedBar>=0&&z.isLiveBreak)
+     {
+      string lbn=prefix+"BREAK_LB_"+uid;
+      double ly=z.isResistance?z.top:z.bot;
+      string tx=z.isResistance?"Break R":"Break S";
+      color lc=z.isResistance?clrOrangeRed:clrMediumSeaGreen;
+      ObjectCreate(0,lbn,OBJ_TEXT,0,time[ei],ly);
+      ObjectSetString(0,lbn,OBJPROP_TEXT,tx);
+      ObjectSetInteger(0,lbn,OBJPROP_COLOR,lc);
+      ObjectSetInteger(0,lbn,OBJPROP_FONTSIZE,8);
+      ObjectSetInteger(0,lbn,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,lbn,OBJPROP_HIDDEN,true);
+     }
+  }
+
+void ClearDrawings()
+  {
+   int total=ObjectsTotal(0,0,-1);
+   for(int i=total-1;i>=0;i--)
+     {string n=ObjectName(0,i);if(StringFind(n,prefix)==0) ObjectDelete(0,n);}
+  }
+
+double MaxStrengthAcross()
+  {
+   double m=0;
+   for(int i=0;i<resCount;i++) if(resZones[i].diedBar<0) m=MathMax(m,resZones[i].strength);
+   for(int i=0;i<supCount;i++) if(supZones[i].diedBar<0) m=MathMax(m,supZones[i].strength);
+   return m;
+  }
+
+double MaxVolAcross()
+  {
+   double m=0;
+   for(int i=0;i<resCount;i++) if(resZones[i].diedBar<0) m=MathMax(m,resZones[i].volSum);
+   for(int i=0;i<supCount;i++) if(supZones[i].diedBar<0) m=MathMax(m,supZones[i].volSum);
+   return m;
+  }
+
+//+------------------------------------------------------------------+
+//| Push wrapper: Print in Strategy Tester, SendNotification live   |
+//+------------------------------------------------------------------+
+void PushOrPrint(const string &msg)
+  {
+   if(MQLInfoInteger(MQL_TESTER))
+      Print("PUSH >> ",msg);
+   else
+      SendNotification(msg);
+  }
+
+//+------------------------------------------------------------------+
+//| Period short string (strips "PERIOD_" prefix)                    |
+//+------------------------------------------------------------------+
+string PeriodShort()
+  {
+   string s=EnumToString(_Period);
+   StringReplace(s,"PERIOD_","");
+   return s;
+  }
+
+//+------------------------------------------------------------------+
+//| Touch notify cooldown (separate from signal cooldown)            |
+//+------------------------------------------------------------------+
+bool TouchCooldownOk(double center,double atr,int curBar)
+  {
+   for(int i=0;i<touchNotifyCount;i++)
+      if(MathAbs(touchNotifyCenters[i]-center)<=atr*clusterTol)
+         if(curBar-touchNotifyBars[i]<InpTouchCooldown) return false;
+   return true;
+  }
+
+void RecordTouchNotify(double center,int curBar)
+  {
+   if(touchNotifyCount>=ArraySize(touchNotifyCenters))
+     {ArrayResize(touchNotifyCenters,touchNotifyCount+10);ArrayResize(touchNotifyBars,touchNotifyCount+10);}
+   touchNotifyCenters[touchNotifyCount]=center;
+   touchNotifyBars[touchNotifyCount]=curBar;
+   touchNotifyCount++;
+   if(touchNotifyCount>50)
+     {
+      for(int i=0;i<touchNotifyCount-1;i++)
+        {touchNotifyCenters[i]=touchNotifyCenters[i+1];touchNotifyBars[i]=touchNotifyBars[i+1];}
+      touchNotifyCount--;
+     }
+  }
+
+// Break notify dedup: one push per zone per break (cooldown = InpRetestWindow bars)
+bool BreakCooldownOk(double center,double atr,int curBar)
+  {
+   for(int i=0;i<breakNotifyCount;i++)
+      if(MathAbs(breakNotifyCenters[i]-center)<=atr*clusterTol)
+         if(curBar-breakNotifyBars[i]<InpRetestWindow) return false;
+   return true;
+  }
+
+void RecordBreakNotify(double center,int curBar)
+  {
+   if(breakNotifyCount>=ArraySize(breakNotifyCenters))
+     {ArrayResize(breakNotifyCenters,breakNotifyCount+10);ArrayResize(breakNotifyBars,breakNotifyCount+10);}
+   breakNotifyCenters[breakNotifyCount]=center;
+   breakNotifyBars[breakNotifyCount]=curBar;
+   breakNotifyCount++;
+   if(breakNotifyCount>50)
+     {
+      for(int i=0;i<breakNotifyCount-1;i++)
+        {breakNotifyCenters[i]=breakNotifyCenters[i+1];breakNotifyBars[i]=breakNotifyBars[i+1];}
+      breakNotifyCount--;
+     }
+  }
+
+// Retest notify cooldown: one push per zone per InpRetestWindow bars
+bool RetestCooldownOk(double center,double atr,int curBar)
+  {
+   for(int i=0;i<retestNotifyCount;i++)
+      if(MathAbs(retestNotifyCenters[i]-center)<=atr*clusterTol)
+         if(curBar-retestNotifyBars[i]<InpRetestWindow) return false;
+   return true;
+  }
+
+void RecordRetestNotify(double center,int curBar)
+  {
+   if(retestNotifyCount>=ArraySize(retestNotifyCenters))
+     {ArrayResize(retestNotifyCenters,retestNotifyCount+10);ArrayResize(retestNotifyBars,retestNotifyCount+10);}
+   retestNotifyCenters[retestNotifyCount]=center;
+   retestNotifyBars[retestNotifyCount]=curBar;
+   retestNotifyCount++;
+   if(retestNotifyCount>50)
+     {
+      for(int i=0;i<retestNotifyCount-1;i++)
+        {retestNotifyCenters[i]=retestNotifyCenters[i+1];retestNotifyBars[i]=retestNotifyBars[i+1];}
+      retestNotifyCount--;
+     }
+  }
+
+// Break message: fires at the moment a zone is cleanly broken
+// BUY BREAK = resistance broken (bullish), SELL BREAK = support broken (bearish)
+// SL sits on opposite side of the broken zone; TPs from alive zones beyond entry
+string BuildBreakMsg(bool isBull,Zone &z,double entry,double atr)
+  {
+   double sl = isBull ? z.bot-atr*InpSLBuffer : z.top+atr*InpSLBuffer;
+   double R  = MathAbs(entry-sl);
+double tp[]; int tpCount=0;
+   if(isBull) CollectBullTPs(entry,tp,tpCount);
+   else       CollectBearTPs(entry,tp,tpCount);
+   ArrayResize(tp,3);
+   for(int i=tpCount;i<3;i++) tp[i]=isBull?entry+(i+1)*R:entry-(i+1)*R;
+   // Sort: bull ascending (nearest above first), bear descending (nearest below first)
+   for(int a=0;a<2;a++)
+      for(int b=a+1;b<3;b++)
+        { bool sw=isBull?(tp[b]<tp[a]):(tp[b]>tp[a]);
+          if(sw){double t=tp[a];tp[a]=tp[b];tp[b]=t;} }
+   string dir=isBull?"BUY BREAK":"SELL BREAK";
+   return dir+" | "+_Symbol+" "+PeriodShort()+" | E:"+DoubleToString(entry,_Digits)+
+          " SL:"+DoubleToString(sl,_Digits)+
+          " TP1:"+DoubleToString(tp[0],_Digits)+
+          " TP2:"+DoubleToString(tp[1],_Digits)+
+          " TP3:"+DoubleToString(tp[2],_Digits);
+  }
+
+//+------------------------------------------------------------------+
+//| Find the broken zone that triggered bull/bear retest             |
+//+------------------------------------------------------------------+
+bool FindRetestZoneBull(int bar,const double &open[],const double &low[],
+                        const double &close[],Zone &outZ)
+  {
+   for(int i=0;i<brokenCount;i++)
+     {
+      if(!brokenZones[i].isResistance||!brokenZones[i].wasBroken||brokenZones[i].diedBar<0) continue;
+      int age=bar-brokenZones[i].diedBar;
+      if(age>0&&age<=InpRetestWindow&&
+         low[bar]<=brokenZones[i].top&&
+         close[bar]>=brokenZones[i].bot&&
+         close[bar]>=open[bar])
+        {outZ=brokenZones[i];return true;}
+     }
+   return false;
+  }
+
+bool FindRetestZoneBear(int bar,const double &open[],const double &high[],
+                        const double &close[],Zone &outZ)
+  {
+   for(int i=0;i<brokenCount;i++)
+     {
+      if(brokenZones[i].isResistance||!brokenZones[i].wasBroken||brokenZones[i].diedBar<0) continue;
+      int age=bar-brokenZones[i].diedBar;
+      if(age>0&&age<=InpRetestWindow&&
+         high[bar]>=brokenZones[i].bot&&
+         close[bar]<=brokenZones[i].top&&
+         close[bar]<=open[bar])
+        {outZ=brokenZones[i];return true;}
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Collect TP levels from alive zones                               |
+//| Bull: nearest alive resistance zones ABOVE entry (ascending)     |
+//| Bear: nearest alive support zones BELOW entry (descending)       |
+//+------------------------------------------------------------------+
+void CollectBullTPs(double entry,double &tp[],int &tpCount)
+  {
+   tpCount=0;
+   double cands[]; int cc=0; ArrayResize(cands,resCount);
+   for(int i=0;i<resCount;i++)
+      if(resZones[i].diedBar<0&&resZones[i].center>entry)
+         cands[cc++]=resZones[i].center;
+   // sort ascending
+   for(int i=0;i<cc-1;i++)
+      for(int j=i+1;j<cc;j++)
+         if(cands[j]<cands[i]){double t=cands[i];cands[i]=cands[j];cands[j]=t;}
+   tpCount=MathMin(cc,3);
+   ArrayResize(tp,3);
+   for(int i=0;i<tpCount;i++) tp[i]=cands[i];
+  }
+
+void CollectBearTPs(double entry,double &tp[],int &tpCount)
+  {
+   tpCount=0;
+   double cands[]; int cc=0; ArrayResize(cands,supCount);
+   for(int i=0;i<supCount;i++)
+      if(supZones[i].diedBar<0&&supZones[i].center<entry)
+         cands[cc++]=supZones[i].center;
+   // sort descending (nearest below first)
+   for(int i=0;i<cc-1;i++)
+      for(int j=i+1;j<cc;j++)
+         if(cands[j]>cands[i]){double t=cands[i];cands[i]=cands[j];cands[j]=t;}
+   tpCount=MathMin(cc,3);
+   ArrayResize(tp,3);
+   for(int i=0;i<tpCount;i++) tp[i]=cands[i];
+  }
+
+//+------------------------------------------------------------------+
+//| Build retest push message                                        |
+//+------------------------------------------------------------------+
+string BuildRetestMsg(bool isBull,Zone &z,double entry,double atr)
+  {
+   double sl  = isBull ? z.bot - atr*InpSLBuffer : z.top + atr*InpSLBuffer;
+   double R   = MathAbs(entry-sl);
+   double tp[];int tpCount=0;
+   if(isBull) CollectBullTPs(entry,tp,tpCount);
+   else       CollectBearTPs(entry,tp,tpCount);
+// Fill missing TPs with R-multiples
+   ArrayResize(tp,3);
+   for(int i=tpCount;i<3;i++)
+      tp[i]=isBull ? entry+(i+1)*R : entry-(i+1)*R;
+   // Sort: bull ascending (nearest above first), bear descending (nearest below first)
+   for(int a=0;a<2;a++)
+      for(int b=a+1;b<3;b++)
+        { bool sw=isBull?(tp[b]<tp[a]):(tp[b]>tp[a]);
+          if(sw){double t=tp[a];tp[a]=tp[b];tp[b]=t;} }
+   string dir=isBull?"BUY RETEST":"SELL RETEST";
+   string sym=_Symbol+" "+PeriodShort();
+   return dir+" | "+sym+" | E:"+DoubleToString(entry,_Digits)+
+          " SL:"+DoubleToString(sl,_Digits)+
+          " TP1:"+DoubleToString(tp[0],_Digits)+
+          " TP2:"+DoubleToString(tp[1],_Digits)+
+          " TP3:"+DoubleToString(tp[2],_Digits);
+  }
+
+//+------------------------------------------------------------------+
+//| Guard: true if price is inside or within 1 ATR of any alive zone |
+//| Used to suppress retest signals blocked by an unbroken zone      |
+//+------------------------------------------------------------------+
+bool IsBlockedByAliveZone(double price,double atr)
+  {
+   double buf=atr*1.0; // 1 ATR proximity buffer — tighten/loosen as needed
+   for(int i=0;i<resCount;i++)
+      if(resZones[i].diedBar<0&&
+         price>=resZones[i].bot-buf&&price<=resZones[i].top+buf)
+         return true;
+   for(int i=0;i<supCount;i++)
+      if(supZones[i].diedBar<0&&
+         price>=supZones[i].bot-buf&&price<=supZones[i].top+buf)
+         return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Zone touch push: scan all alive zones, fire on strongest touch   |
+//+------------------------------------------------------------------+
+// ZoneTouchPush fires only on a REACTION touch — price enters zone and
+// closes back with a directional close (mirrors CheckSupBounce / CheckResReject).
+// Bare pass-through candles (no close-back) are ignored.
+void ZoneTouchPush(int bar,const double &open[],const double &high[],
+                   const double &low[],const double &close[],double atr)
+  {
+   Zone  bestZone={}; bool found=false; double bestStr=0;
+
+   // Resistance reaction: high pierces zone from below, close holds inside or below, bearish close
+   for(int i=0;i<resCount;i++)
+     {
+      if(!ZoneRenderable(resZones[i])) continue;
+      bool pierced  = high[bar]>=resZones[i].bot;
+      bool heldDown = close[bar]<=resZones[i].top&&close[bar]<=open[bar];
+      if(pierced&&heldDown&&
+         TouchCooldownOk(resZones[i].center,atr,bar)&&
+         resZones[i].strength>bestStr)
+        {bestStr=resZones[i].strength;bestZone=resZones[i];found=true;}
+     }
+
+   // Support reaction: low pierces zone from above, close holds inside or above, bullish close
+   for(int i=0;i<supCount;i++)
+     {
+      if(!ZoneRenderable(supZones[i])) continue;
+      bool pierced = low[bar]<=supZones[i].top;
+      bool heldUp  = close[bar]>=supZones[i].bot&&close[bar]>=open[bar];
+      if(pierced&&heldUp&&
+         TouchCooldownOk(supZones[i].center,atr,bar)&&
+         supZones[i].strength>bestStr)
+        {bestStr=supZones[i].strength;bestZone=supZones[i];found=true;}
+     }
+
+   if(!found) return;
+string dir = bestZone.isResistance ? "SELL ZONE READY" : "BUY ZONE READY";
+   string msg = dir+" | "+_Symbol+" "+PeriodShort()+" | "+DoubleToString(bestZone.center,_Digits);
+   PushOrPrint(msg);
+   if(InpWriteGV)
+     {
+      GlobalVariableSet("SRZONES_DIR",   bestZone.isResistance ? -1.0 : 1.0);
+      GlobalVariableSet("SRZONES_PRICE", bestZone.center);
+      GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+     }
+   RecordTouchNotify(bestZone.center,bar);
+  }
+
+//+------------------------------------------------------------------+
+//| OnInit                                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   switch(InpPreset)
+     {
+      case SCALP:  pivLeft=4;  pivRight=2;  clusterTol=0.4; minSpacing=4;  break;
+      case LOCAL:  pivLeft=6;  pivRight=4;  clusterTol=0.5; minSpacing=8;  break;
+      case SWING:  pivLeft=15; pivRight=8;  clusterTol=0.9; minSpacing=20; break;
+      case MAJOR:  pivLeft=35; pivRight=15; clusterTol=1.4; minSpacing=50; break;
+      case CUSTOM: pivLeft=InpPivLeft; pivRight=InpPivRight;
+                   clusterTol=InpClusterTol; minSpacing=InpMinSpacing; break;
+     }
+   ArrayResize(highPivots,InpPivBuffer+10); ArrayResize(lowPivots,InpPivBuffer+10);
+   highPivotCount=0; lowPivotCount=0;
+   ArrayResize(resZones,InpZoneCount+10); ArrayResize(supZones,InpZoneCount+10);
+   ArrayResize(brokenZones,100);
+   resCount=0; supCount=0; brokenCount=0;
+   ArrayResize(sigZoneCenters,50); ArrayResize(sigZoneBars,50); sigCount=0;
+   ArrayResize(touchNotifyCenters,50); ArrayResize(touchNotifyBars,50); touchNotifyCount=0;
+   ArrayResize(retestNotifyCenters,50); ArrayResize(retestNotifyBars,50); retestNotifyCount=0;
+   ArrayResize(breakNotifyCenters,50);  ArrayResize(breakNotifyBars,50);  breakNotifyCount=0;
+   atrHandle=iATR(_Symbol,_Period,50);
+   if(atrHandle==INVALID_HANDLE){Print("Failed to create ATR handle");return INIT_FAILED;}
+   IndicatorSetInteger(INDICATOR_DIGITS,_Digits);
+   IndicatorSetString(INDICATOR_SHORTNAME,"S&R Zones [B1dii]");
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {ClearDrawings();IndicatorRelease(atrHandle);}
+
+//+------------------------------------------------------------------+
+//| OnCalculate                                                       |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,const int prev_calculated,
+                const datetime &time[],const double &open[],
+                const double &high[],const double &low[],const double &close[],
+                const long &tick_volume[],const long &volume[],const int &spread[])
+  {
+   if(rates_total<pivLeft+pivRight+50) return 0;
+   double atrArr[]; ArrayResize(atrArr,rates_total);
+   if(CopyBuffer(atrHandle,0,0,rates_total,atrArr)<=0) return prev_calculated;
+   double volMaArr[]; RollingVolumeSMA(tick_volume,rates_total,50,volMaArr);
+   int start=prev_calculated>0?MathMax(pivLeft+pivRight,prev_calculated-1):pivLeft+pivRight;
+
+   for(int bar=start;bar<rates_total;bar++)
+     {
+      double atr=atrArr[bar],volMa=volMaArr[bar];
+      if(atr<=0||volMa<=0) continue;
+      int cb=bar-pivRight;
+      if(cb<pivLeft) continue;
+      bool nhp=false,nlp=false;
+      if(!IsDuplicatePivot(highPivots,highPivotCount,cb)&&IsPivotHigh(cb,high,rates_total))
+        {
+         Pivot p; p.price=high[cb]; p.bar=cb; p.vol=SafeVolume(tick_volume[cb]);
+         p.wick=UpperWick(high[cb],open[cb],close[cb]);
+         AddPivot(highPivots,highPivotCount,p,InpPivBuffer); nhp=true;
+        }
+      if(!IsDuplicatePivot(lowPivots,lowPivotCount,cb)&&IsPivotLow(cb,low,rates_total))
+        {
+         Pivot p; p.price=low[cb]; p.bar=cb; p.vol=SafeVolume(tick_volume[cb]);
+         p.wick=LowerWick(low[cb],open[cb],close[cb]);
+         AddPivot(lowPivots,lowPivotCount,p,InpPivBuffer); nlp=true;
+        }
+
+      for(int i=0;i<resCount;i++)
+         if(resZones[i].diedBar<0&&close[bar]>resZones[i].top)
+           {resZones[i].diedBar=bar;resZones[i].wasBroken=true;
+            resZones[i].isLiveBreak=(close[bar-1]<=resZones[i].top);ArchiveZone(resZones[i],atr);}
+      for(int i=0;i<supCount;i++)
+         if(supZones[i].diedBar<0&&close[bar]<supZones[i].bot)
+           {supZones[i].diedBar=bar;supZones[i].wasBroken=true;
+            supZones[i].isLiveBreak=(close[bar-1]>=supZones[i].bot);ArchiveZone(supZones[i],atr);}
+
+      for(int i=0;i<resCount;i++)
+         if(resZones[i].diedBar<0&&high[bar]>=resZones[i].bot&&low[bar]<=resZones[i].top)
+            resZones[i].lastTouch=bar;
+      for(int i=0;i<supCount;i++)
+         if(supZones[i].diedBar<0&&high[bar]>=supZones[i].bot&&low[bar]<=supZones[i].top)
+            supZones[i].lastTouch=bar;
+
+      if(nhp||nlp)
+        {
+         Zone nr[],ns[]; int nrc=0,nsc=0;
+         BuildZones(highPivots,highPivotCount,true,atr,volMa,bar,nr,nrc);
+         BuildZones(lowPivots,lowPivotCount,false,atr,volMa,bar,ns,nsc);
+         Zone or2[],os[]; int orc=resCount,osc=supCount;
+         ArrayResize(or2,resCount); ArrayResize(os,supCount);
+         for(int i=0;i<resCount;i++) or2[i]=resZones[i];
+         for(int i=0;i<supCount;i++) os[i]=supZones[i];
+         for(int i=0;i<orc;i++)
+            if(or2[i].diedBar<0&&or2[i].touches>=InpMinTouches&&!ZoneSurvives(or2[i],nr,nrc,atr))
+              {or2[i].diedBar=bar;or2[i].wasBroken=false;ArchiveZone(or2[i],atr);}
+         for(int i=0;i<osc;i++)
+            if(os[i].diedBar<0&&os[i].touches>=InpMinTouches&&!ZoneSurvives(os[i],ns,nsc,atr))
+              {os[i].diedBar=bar;os[i].wasBroken=false;ArchiveZone(os[i],atr);}
+         resCount=0; ArrayResize(resZones,InpZoneCount);
+         for(int i=0;i<nrc;i++)
+            if(!IsAlreadyBroken(nr[i],atr))
+              {InheritState(nr[i],or2,orc,atr);
+               if(resCount>=ArraySize(resZones)) ArrayResize(resZones,resCount+10);
+               resZones[resCount++]=nr[i];}
+         supCount=0; ArrayResize(supZones,InpZoneCount);
+         for(int i=0;i<nsc;i++)
+            if(!IsAlreadyBroken(ns[i],atr))
+              {InheritState(ns[i],os,osc,atr);
+               if(supCount>=ArraySize(supZones)) ArrayResize(supZones,supCount+10);
+               supZones[supCount++]=ns[i];}
+        }
+
+      if(bar==rates_total-1)
+        {
+         bool bounceUp  =CheckSupBounce(bar,open,high,low,close,atr);
+         bool bounceDown=CheckResReject(bar,open,high,low,close,atr);
+         bool retestUp  =CheckRetestBull(bar,open,high,low,close);
+         bool retestDown=CheckRetestBear(bar,open,high,low,close);
+
+         if(InpShowTest&&bounceUp)
+           {string n=prefix+"ARROW_UP_"+IntegerToString(bar);
+            ObjectCreate(0,n,OBJ_ARROW_THUMB_UP,0,time[bar],low[bar]-5*_Point);
+            ObjectSetInteger(0,n,OBJPROP_COLOR,InpSupColor);ObjectSetInteger(0,n,OBJPROP_WIDTH,1);}
+         if(InpShowTest&&bounceDown)
+           {string n=prefix+"ARROW_DN_"+IntegerToString(bar);
+            ObjectCreate(0,n,OBJ_ARROW_THUMB_DOWN,0,time[bar],high[bar]+5*_Point);
+            ObjectSetInteger(0,n,OBJPROP_COLOR,InpResColor);ObjectSetInteger(0,n,OBJPROP_WIDTH,1);}
+         if(InpShowRetest&&retestUp)
+           {string n=prefix+"RETEST_UP_"+IntegerToString(bar);
+            ObjectCreate(0,n,OBJ_ARROW_UP,0,time[bar],low[bar]-10*_Point);
+            ObjectSetInteger(0,n,OBJPROP_COLOR,InpSupColor);ObjectSetInteger(0,n,OBJPROP_WIDTH,2);}
+         if(InpShowRetest&&retestDown)
+           {string n=prefix+"RETEST_DN_"+IntegerToString(bar);
+            ObjectCreate(0,n,OBJ_ARROW_DOWN,0,time[bar],high[bar]+10*_Point);
+            ObjectSetInteger(0,n,OBJPROP_COLOR,InpResColor);ObjectSetInteger(0,n,OBJPROP_WIDTH,2);}
+
+         // --- Push notifications ---
+         if(InpPushZoneTouch)
+            ZoneTouchPush(bar,open,high,low,close,atr);
+
+         // Break push: fires once per zone on the bar it is cleanly broken
+if(InpPushBreak)
+            for(int i=0;i<brokenCount;i++)
+               if(brokenZones[i].diedBar==bar-1&&brokenZones[i].wasBroken&&brokenZones[i].isLiveBreak)
+                  if(BreakCooldownOk(brokenZones[i].center,atr,bar))
+                    {
+                     bool isBull=brokenZones[i].isResistance;
+string msg=BuildBreakMsg(isBull,brokenZones[i],close[bar],atr);
+                     PushOrPrint(msg);
+                     if(InpWriteGV)
+                       {
+                        GlobalVariableSet("SRZONES_DIR",   isBull ? 1.0 : -1.0);
+                        GlobalVariableSet("SRZONES_PRICE", brokenZones[i].center);
+                        GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+                       }
+                     RecordBreakNotify(brokenZones[i].center,bar);
+                    }
+
+if(InpPushRetest&&!IsBlockedByAliveZone(close[bar-1],atr))
+           {
+            if(retestUp)
+              {
+               Zone rz; bool found=FindRetestZoneBull(bar,open,low,close,rz);
+               Zone dummy; if(!found){dummy.bot=close[bar-1]-atr;dummy.top=close[bar-1];rz=dummy;}
+if(RetestCooldownOk(rz.center,atr,bar))
+                 {
+                  string msg=BuildRetestMsg(true,rz,close[bar-1],atr);
+                  PushOrPrint(msg);
+                  if(InpWriteGV)
+                    {
+                     GlobalVariableSet("SRZONES_DIR",   1.0);
+                     GlobalVariableSet("SRZONES_PRICE", rz.center);
+                     GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+                    }
+                  RecordRetestNotify(rz.center,bar);
+                 }
+              }
+            if(retestDown)
+              {
+               Zone rz; bool found=FindRetestZoneBear(bar,open,high,close,rz);
+               Zone dummy; if(!found){dummy.top=close[bar-1]+atr;dummy.bot=close[bar-1];rz=dummy;}
+               if(RetestCooldownOk(rz.center,atr,bar))
+                 {
+                  string msg=BuildRetestMsg(false,rz,close[bar-1],atr);
+                  PushOrPrint(msg);
+                  if(InpWriteGV)
+                    {
+                     GlobalVariableSet("SRZONES_DIR",   -1.0);
+                     GlobalVariableSet("SRZONES_PRICE", rz.center);
+                     GlobalVariableSet("SRZONES_TIME",  (double)TimeCurrent());
+                    }
+                  RecordRetestNotify(rz.center,bar);
+                 }
+              }
+           }
+
+         if(InpShowReaction)
+           {
+            for(int i=0;i<supCount;i++)
+               if(ZoneRenderable(supZones[i])&&low[bar]<=supZones[i].top&&close[bar]>supZones[i].bot)
+                 {string n=prefix+"HOLD_UP_"+IntegerToString(bar)+"_"+IntegerToString(i);
+                  ObjectCreate(0,n,OBJ_ARROW_UP,0,time[bar],low[bar]-15*_Point);
+                  ObjectSetInteger(0,n,OBJPROP_COLOR,InpSupColor);ObjectSetInteger(0,n,OBJPROP_WIDTH,2);}
+            for(int i=0;i<resCount;i++)
+               if(ZoneRenderable(resZones[i])&&high[bar]>=resZones[i].bot&&close[bar]<resZones[i].top)
+                 {string n=prefix+"HOLD_DN_"+IntegerToString(bar)+"_"+IntegerToString(i);
+                  ObjectCreate(0,n,OBJ_ARROW_DOWN,0,time[bar],high[bar]+15*_Point);
+                  ObjectSetInteger(0,n,OBJPROP_COLOR,InpResColor);ObjectSetInteger(0,n,OBJPROP_WIDTH,2);}
+           }
+
+         ClearDrawings();
+         double mxS=MaxStrengthAcross(),mxV=MaxVolAcross(),cc=close[bar];
+         for(int i=0;i<resCount;i++) if(resZones[i].diedBar<0) DrawAlive(resZones[i],InpResColor,mxS,mxV,bar,rates_total,time,cc);
+         for(int i=0;i<supCount;i++) if(supZones[i].diedBar<0) DrawAlive(supZones[i],InpSupColor,mxS,mxV,bar,rates_total,time,cc);
+         if(InpShowBroken||InpShowDropped)
+            for(int i=0;i<brokenCount;i++)
+              {bool show=(brokenZones[i].wasBroken&&InpShowBroken)||(!brokenZones[i].wasBroken&&InpShowDropped);
+               if(show) DrawBroken(brokenZones[i],rates_total,time,cc);}
+        }
+     }
+   return rates_total;
+  }
+//+------------------------------------------------------------------+

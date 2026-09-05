@@ -1,0 +1,1576 @@
+//+------------------------------------------------------------------+
+//|                                        TriFusion_Signal_v1.mq5  |
+//|                                                                  |
+//|  ╔═══════════════════════════════════════════════════════════╗  |
+//|  ║  TRIO SIGNAL INDICATOR  v2.0                        ║  |
+//|  ║                                                           ║  |
+//|  ║  ENGINE 1 — Triple Confluence (all 3 agree, N candles)   ║  |
+//|  ║    • Confirmed Swing Point (HL/LH)                       ║  |
+//|  ║    • Rolling Segment color flip                          ║  |
+//|  ║    • HalfTrend flip                                      ║  |
+//|  ║    Any engine flipping opposite → cancel + reset         ║  |
+//|  ║                                                           ║  |
+//|  ║  ENGINE 2 — SBR/RBS Structure Retest (independent)      ║  |
+//|  ║    • Resistance Becomes Support  → BUY                   ║  |
+//|  ║    • Support Becomes Resistance  → SELL                  ║  |
+//|  ║                                                           ║  |
+//|  ║  DUAL TIMEFRAME                                          ║  |
+//|  ║    Chart TF = visuals (FVG / OB / CHoCH / RS line)       ║  |
+//|  ║    Signal TF = all engine logic (stable, persists)       ║  |
+//|  ║                                                           ║  |
+//|  ║  GLOBAL VARIABLES persist RS/HT/Swing state on TF switch ║  |
+//|  ╚═══════════════════════════════════════════════════════════╝  |
+//+------------------------------------------------------------------+
+#property copyright "TRIO Signal v1.0"
+#property version   "1.00"
+#property indicator_chart_window
+#property indicator_buffers 12
+#property indicator_plots   8
+
+//--- Plot 0 : BUY  With-Trend  swing dot (SPL)
+#property indicator_label1  "SPL BUY Bull"
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrLimeGreen
+#property indicator_width1  1
+
+//--- Plot 1 : SELL With-Trend  swing dot (SPL)
+#property indicator_label2  "SPL SELL Bear"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrCrimson
+#property indicator_width2  1
+
+//--- Plot 2 : BUY  Counter-Trend swing dot (SPL)
+#property indicator_label3  "SPL BUY C-T"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  C'0,130,60'
+#property indicator_width3  1
+
+//--- Plot 3 : SELL Counter-Trend swing dot (SPL)
+#property indicator_label4  "SPL SELL C-T"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  C'140,40,50'
+#property indicator_width4  1
+
+//--- Plot 4 : ENGINE 1 BUY  (Triple Confluence confirmed)
+#property indicator_label5  "ENGINE1 BUY"
+#property indicator_type5   DRAW_ARROW
+#property indicator_color5  clrAqua
+#property indicator_width5  3
+
+//--- Plot 5 : ENGINE 1 SELL (Triple Confluence confirmed)
+#property indicator_label6  "ENGINE1 SELL"
+#property indicator_type6   DRAW_ARROW
+#property indicator_color6  clrOrange
+#property indicator_width6  3
+
+//--- Plot 6 : ENGINE 2 BUY  (SBR/RBS Retest)
+#property indicator_label7  "SBR/RBS BUY"
+#property indicator_type7   DRAW_ARROW
+#property indicator_color7  clrSpringGreen
+#property indicator_width7  2
+
+//--- Plot 7 : ENGINE 2 SELL (SBR/RBS Retest)
+#property indicator_label8  "SBR/RBS SELL"
+#property indicator_type8   DRAW_ARROW
+#property indicator_color8  clrOrangeRed
+#property indicator_width8  2
+
+// ================================================================
+// INPUTS
+// ================================================================
+input group "=== Dual Timeframe ==="
+input ENUM_TIMEFRAMES InpSignalTF      = PERIOD_CURRENT;  // Signal TF (engines compute here)
+// Note: visuals always draw on the chart's current TF
+
+input group "=== Swing Detection (Signal TF) ==="
+input int    InpSwingLeft             = 10;    // Bars Left for pivot
+input int    InpSwingRight            = 7;    // Bars Right for pivot (confirmed)
+
+input group "=== Rolling Segment (Signal TF) ==="
+input int    InpRSFastLen             = 3;
+input int    InpRSSlowLen             = 7;
+input double InpRSFastThresh          = 1.0;
+input double InpRSRevThresh           = 2.0;
+input int    InpRSATRLen              = 200;
+input bool   InpShowRSLine            = true;  // Draw RS line on chart
+
+input group "=== HalfTrend (Signal TF) ==="
+input int    InpHTAmplitude           = 2;
+input int    InpHTChanDev             = 2;
+
+input group "=== Engine 1 - Triple Confluence ==="
+input int    InpEngineWindow          = 15;    // Max candles between first and last flip (0=unlimited)
+input bool   InpE1CancelOnOpposite    = false; // Cancel sequence if any engine flips opposite
+
+input group "=== Display ==="
+input bool   InpShowBoxes             = true;
+input bool   InpShowLines             = true;
+input bool   InpExtendFill            = true;
+input bool   InpHideFilled            = false;
+input bool   InpVolFilter             = true;
+input bool   InpShowMSSZones          = true;
+input bool   InpShowMSSLabel          = true;
+
+input group "=== Appearance ==="
+input color  InpHighColor             = C'170,36,48';
+input color  InpLowColor              = C'102,187,106';
+input ENUM_LINE_STYLE InpLineStyle    = STYLE_DOT;
+input int    InpLineWidth             = 1;
+input double InpBoxWidth              = 0.7;
+input color  InpMSSBullCol            = clrDeepSkyBlue;
+input color  InpMSSBearCol            = clrOrangeRed;
+input color  InpFVGColor              = C'0,100,180';
+input color  InpOBColor               = C'140,60,0';
+input color  InpRSBullColor           = clrLimeGreen;
+input color  InpRSBearColor           = clrRed;
+
+input group "=== Market Structure ==="
+input bool   InpShowCHoCH             = true;
+input group "=== CHoCH + RS Confluence ==="
+input int    InpChochRSWindow = 10;   // Max bars between CHoCH and RS flip
+
+input group "=== SBR/RBS Engine 2 ==="
+input bool   InpTrackFlips            = true;   // Enable SBR/RBS Engine 2
+input int    InpMaxFlipTouches        = 2;       // Max alerts per flipped level (0=unlimited)
+input int    InpRetestWindow          = 200;     // Bars to watch for retest (0=unlimited)
+input int    InpApproachMode          = 0;       // 0=SwingRange  1=ATR  2=FixedPips
+input double InpApproachMult          = 0.5;
+input double InpApproachPips          = 10.0;
+
+input group "=== Alerts & Push ==="
+input bool   InpAlerts                = false;
+input bool   InpPush                  = true;    // Master push (mobile)
+input bool   InpPushEngine1           = true;    // Push Engine 1 triple confluence
+input bool   InpPushSBRRBS            = false;    // Push SBR/RBS signals
+input bool   InpPushCHoCH             = false;    // Push CHoCH flip
+input double InpMinRR                 = 1.0;     // Min R:R (0=off)
+
+input group "=== Global Variables ==="
+input bool   InpWriteGV               = true;    // Write state GVs (persist on TF switch)
+
+// ================================================================
+// BUFFERS
+// ================================================================
+double BufBuyBull[];      // plot 0 — SPL swing buy
+double BufSellBear[];     // plot 1 — SPL swing sell
+double BufBuyCT[];        // plot 2 — SPL CT buy
+double BufSellCT[];       // plot 3 — SPL CT sell
+double BufE1Buy[];        // plot 4 — Engine1 BUY confirmed
+double BufE1Sell[];       // plot 5 — Engine1 SELL confirmed
+double BufE2Buy[];        // plot 6 — SBR/RBS BUY
+double BufE2Sell[];       // plot 7 — SBR/RBS SELL
+// Internal
+double BufPivHProc[];     // calc — pivot high processed flag
+double BufPivLProc[];     // calc — pivot low processed flag
+double BufRSVal[];        // calc — Rolling Segment value (for line drawing)
+double BufRSColor[];      // calc — Rolling Segment color index
+
+// ================================================================
+// CONSTANTS
+// ================================================================
+const string PFX         = "TF_";
+const int    MAX_OBJECTS = 500;
+const int    MAX_HISTORY = 60;
+
+// ================================================================
+// ENGINE 1 STATE — Triple Confluence Sequencer
+// ================================================================
+struct EngineState
+{
+   // Pending engine flips waiting for confluence
+   int    swingDir;    // 1=BUY, -1=SELL, 0=none
+   int    rsDir;       // 1=BUY, -1=SELL, 0=none
+   int    htDir;       // 1=BUY, -1=SELL, 0=none
+   int    swingBar;    // signal-TF bar index when swing confirmed
+   int    rsBar;       // signal-TF bar index when RS flipped
+   int    htBar;       // signal-TF bar index when HT flipped
+};
+
+EngineState g_eng;
+
+// ================================================================
+// SPL (Swing / Liquidity) GLOBALS
+// ================================================================
+struct SLevel
+{
+   double   price;
+   double   boxTop;
+   double   boxBot;
+   datetime t1;
+   bool     isHigh;
+   string   lineName;
+   string   boxName;
+   double   swingRange;
+   long     pivotVolume;
+   int      touches;
+   int      brokenBar;
+   bool     approached;
+   bool     broken;
+   bool     flipApproached;
+};
+
+SLevel   g_lv[];
+int      g_nLv = 0;
+
+double   g_swHi[]; int g_nSH = 0;
+double   g_swLo[]; int g_nSL = 0;
+
+double   g_lastPH    = 0;
+double   g_lastPL    = 0;
+int      g_lastPHBar = -1;
+int      g_lastPLBar = -1;
+int      g_trend     = 0;
+
+// MSS zones
+struct MSSZone
+{
+   double   top;
+   double   bot;
+   datetime t1;
+   bool     isFVG;
+   bool     isBull;
+   bool     active;
+   string   boxName;
+};
+MSSZone  g_mssZones[8];
+int      g_nMSSZones = 0;
+double   g_mssSL     = 0;
+bool     g_mssBull   = false;
+
+int      g_lastBuyAlertBar  = -1;
+int      g_lastSellAlertBar = -1;
+int      g_chochBar         = -1;
+int      g_chochSeq         = 0;
+datetime g_lastExtTime      = 0;
+
+// CHoCH + RS Confluence
+int      g_chochRSDir = 0;      // 1=BUY, -1=SELL, 0=none
+int      g_chochRSBar = -1;      // bar index when CHoCH occurred
+datetime g_chochRSTime = 0;      // timestamp of CHoCH event
+
+// ================================================================
+// HALFTREND GLOBALS
+// ================================================================
+int    g_ht_trend       = 0;
+int    g_ht_nextTrend   = 0;
+double g_ht_maxLowPrice = 0;
+double g_ht_minHighPrice= 0;
+double g_ht_up          = 0;
+double g_ht_down        = 0;
+bool   g_ht_initialized = false;
+
+// ================================================================
+// ROLLING SEGMENT GLOBALS
+// ================================================================
+double g_rs_value  = 0;
+double g_rs_trend  = 1.0;  // +1 = bull (green), -1 = bear (red)
+bool   g_rs_initialized = false;
+
+// ================================================================
+// ATR HANDLES
+// ================================================================
+int g_atrHandle     = INVALID_HANDLE;   // Signal-TF ATR for RS (InpRSATRLen)
+int g_atrHT_Handle  = INVALID_HANDLE;   // Signal-TF ATR for HT (100)
+int g_atrSPL_Handle = INVALID_HANDLE;   // Signal-TF ATR for SPL approach (14)
+
+// ================================================================
+// DEDUP
+// ================================================================
+int g_lastE1BuyBar  = -1;
+int g_lastE1SellBar = -1;
+int g_lastE2BuyBar  = -1;
+int g_lastE2SellBar = -1;
+
+// ================================================================
+// OnInit
+// ================================================================
+int OnInit()
+{
+   // Buffer assignments
+   SetIndexBuffer(0, BufBuyBull,  INDICATOR_DATA);
+   SetIndexBuffer(1, BufSellBear, INDICATOR_DATA);
+   SetIndexBuffer(2, BufBuyCT,    INDICATOR_DATA);
+   SetIndexBuffer(3, BufSellCT,   INDICATOR_DATA);
+   SetIndexBuffer(4, BufE1Buy,    INDICATOR_DATA);
+   SetIndexBuffer(5, BufE1Sell,   INDICATOR_DATA);
+   SetIndexBuffer(6, BufE2Buy,    INDICATOR_DATA);
+   SetIndexBuffer(7, BufE2Sell,   INDICATOR_DATA);
+   SetIndexBuffer(8, BufPivHProc, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(9, BufPivLProc, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(10, BufRSVal,   INDICATOR_CALCULATIONS);
+   SetIndexBuffer(11, BufRSColor, INDICATOR_CALCULATIONS);
+
+   // Arrow codes
+   PlotIndexSetInteger(0, PLOT_ARROW, 159);  // filled circle
+   PlotIndexSetInteger(1, PLOT_ARROW, 159);
+   PlotIndexSetInteger(2, PLOT_ARROW, 159);
+   PlotIndexSetInteger(3, PLOT_ARROW, 159);
+   PlotIndexSetInteger(4, PLOT_ARROW, 233);  // up/down bold arrows for TRIO
+   PlotIndexSetInteger(5, PLOT_ARROW, 234);
+   PlotIndexSetInteger(6, PLOT_ARROW, 167);  // star for E2
+   PlotIndexSetInteger(7, PLOT_ARROW, 167);
+
+   // Arrow offsets
+   PlotIndexSetInteger(0, PLOT_ARROW_SHIFT,  10);
+   PlotIndexSetInteger(2, PLOT_ARROW_SHIFT,  10);
+   PlotIndexSetInteger(4, PLOT_ARROW_SHIFT,  18);  // TRIO BUY below
+   PlotIndexSetInteger(6, PLOT_ARROW_SHIFT,  14);  // E2 BUY below
+   PlotIndexSetInteger(1, PLOT_ARROW_SHIFT, -10);
+   PlotIndexSetInteger(3, PLOT_ARROW_SHIFT, -10);
+   PlotIndexSetInteger(5, PLOT_ARROW_SHIFT, -18);  // TRIO SELL above
+   PlotIndexSetInteger(7, PLOT_ARROW_SHIFT, -14);  // E2 SELL above
+
+   for(int p = 0; p < 8; p++)
+      PlotIndexSetDouble(p, PLOT_EMPTY_VALUE, 0.0);
+
+   // Create ATR handles on signal TF
+   g_atrHandle    = iATR(_Symbol, InpSignalTF, InpRSATRLen);
+   g_atrHT_Handle = iATR(_Symbol, InpSignalTF, 100);
+   g_atrSPL_Handle= iATR(_Symbol, InpSignalTF, 14);
+
+   if(g_atrHandle    == INVALID_HANDLE) { Print("TRIO: RS ATR handle failed");  return INIT_FAILED; }
+   if(g_atrHT_Handle == INVALID_HANDLE) { Print("TRIO: HT ATR handle failed");  return INIT_FAILED; }
+
+   IndicatorSetString(INDICATOR_SHORTNAME,
+      StringFormat("TRIO(%s/%s)", EnumToString(InpSignalTF),
+                   EnumToString((ENUM_TIMEFRAMES)_Period)));
+
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, PFX);
+   if(g_atrHandle     != INVALID_HANDLE) IndicatorRelease(g_atrHandle);
+   if(g_atrHT_Handle  != INVALID_HANDLE) IndicatorRelease(g_atrHT_Handle);
+   if(g_atrSPL_Handle != INVALID_HANDLE) IndicatorRelease(g_atrSPL_Handle);
+}
+
+// ================================================================
+// HELPERS — pivot detection  (index 0 = oldest)
+// ================================================================
+bool IsPivotHigh(const double &h[], int pos, int L, int R, int total)
+{
+   if(pos - L < 0 || pos + R >= total) return false;
+   double v = h[pos];
+   for(int k = 1; k <= L; k++) if(h[pos - k] >= v) return false;
+   for(int k = 1; k <= R; k++) if(h[pos + k] >= v) return false;
+   return true;
+}
+
+bool IsPivotLow(const double &l[], int pos, int L, int R, int total)
+{
+   if(pos - L < 0 || pos + R >= total) return false;
+   double v = l[pos];
+   for(int k = 1; k <= L; k++) if(l[pos - k] <= v) return false;
+   for(int k = 1; k <= R; k++) if(l[pos + k] <= v) return false;
+   return true;
+}
+
+// ================================================================
+// HELPERS — swing history for TP calc
+// ================================================================
+void AddSwingHigh(double p)
+{
+   if(g_nSH >= MAX_HISTORY)
+   { for(int i = 0; i < g_nSH - 1; i++) g_swHi[i] = g_swHi[i + 1]; g_nSH--; }
+   ArrayResize(g_swHi, g_nSH + 1);
+   g_swHi[g_nSH++] = p;
+}
+
+void AddSwingLow(double p)
+{
+   if(g_nSL >= MAX_HISTORY)
+   { for(int i = 0; i < g_nSL - 1; i++) g_swLo[i] = g_swLo[i + 1]; g_nSL--; }
+   ArrayResize(g_swLo, g_nSL + 1);
+   g_swLo[g_nSL++] = p;
+}
+
+void FindBuyTPs(double entry, double &tp1, double &tp2, double &tp3)
+{
+   tp1 = tp2 = tp3 = 0.0;
+   if(g_nSH == 0) return;
+   double c[]; ArrayResize(c, g_nSH); int n = 0;
+   for(int i = 0; i < g_nSH; i++) if(g_swHi[i] > entry) c[n++] = g_swHi[i];
+   if(n == 0) return;
+   ArrayResize(c, n); ArraySort(c);
+   if(n >= 1) tp1 = c[0]; if(n >= 2) tp2 = c[1]; if(n >= 3) tp3 = c[2];
+}
+
+void FindSellTPs(double entry, double &tp1, double &tp2, double &tp3)
+{
+   tp1 = tp2 = tp3 = 0.0;
+   if(g_nSL == 0) return;
+   double c[]; ArrayResize(c, g_nSL); int n = 0;
+   for(int i = 0; i < g_nSL; i++) if(g_swLo[i] < entry) c[n++] = g_swLo[i];
+   if(n == 0) return;
+   ArrayResize(c, n); ArraySort(c);
+   for(int i = 0, j = n - 1; i < j; i++, j--) { double t = c[i]; c[i] = c[j]; c[j] = t; }
+   if(n >= 1) tp1 = c[0]; if(n >= 2) tp2 = c[1]; if(n >= 3) tp3 = c[2];
+}
+
+// ================================================================
+// HELPERS — notifications
+// ================================================================
+string PriceStr(double p) { return (p > 0.0) ? DoubleToString(p, _Digits) : "N/A"; }
+
+void FirePush(const string &msg)
+{
+   if(InpAlerts) Alert(msg);
+   if(InpPush && !SendNotification(msg)) Print("Push failed: ", msg);
+}
+
+void FireEngine1Signal(int dir, double price, double sl,
+                       double tp1, double tp2, double tp3,
+                       bool alsoSBR, int barIndex)
+{
+   if(!InpPushEngine1) return;
+   if(dir == 1  && g_lastE1BuyBar  == barIndex) return;
+   if(dir == -1 && g_lastE1SellBar == barIndex) return;
+   if(dir ==  1) g_lastE1BuyBar  = barIndex;
+   if(dir == -1) g_lastE1SellBar = barIndex;
+
+   if(InpWriteGV)
+   {
+      GlobalVariableSet(_Symbol+"_TF_E1_DIR",   (double)dir);
+      GlobalVariableSet(_Symbol+"_TF_E1_PRICE", price);
+      GlobalVariableSet(_Symbol+"_TF_E1_TIME",  (double)TimeCurrent());
+   }
+
+   string bonus = alsoSBR ? " ⚡BONUS:SBR/RBS AGREES" : "";
+   string emoji = (dir == 1) ? "🟢" : "🔴";
+   string d     = (dir == 1) ? "BUY" : "SELL";
+   string msg = emoji + " TRIO " + d + " [3-ENGINE]" + bonus +
+                " | " + _Symbol + " " + EnumToString(InpSignalTF) +
+                " | @" + DoubleToString(price, _Digits) +
+                " | SL:"  + PriceStr(sl)  +
+                " | TP1:" + PriceStr(tp1) +
+                " | TP2:" + PriceStr(tp2) +
+                " | TP3:" + PriceStr(tp3);
+   FirePush(msg);
+   Print(msg);
+}
+
+void FireEngine2Signal(int dir, double price, int barIndex, bool alsoE1)
+{
+   if(!InpPushSBRRBS) return;
+   if(dir ==  1 && g_lastE2BuyBar  == barIndex) return;
+   if(dir == -1 && g_lastE2SellBar == barIndex) return;
+   if(dir ==  1) g_lastE2BuyBar  = barIndex;
+   if(dir == -1) g_lastE2SellBar = barIndex;
+
+   if(InpWriteGV)
+   {
+      GlobalVariableSet(_Symbol+"_TF_E2_DIR",   (double)dir);
+      GlobalVariableSet(_Symbol+"_TF_E2_PRICE", price);
+      GlobalVariableSet(_Symbol+"_TF_E2_TIME",  (double)TimeCurrent());
+   }
+
+   string bonus = alsoE1 ? " ⚡BONUS:ENGINE1 AGREES" : "";
+   string d     = (dir == 1) ? "RBS BUY" : "SBR SELL";
+   string emoji = (dir == 1) ? "🟢" : "🔴";
+   string msg = emoji + " TRIO " + d + bonus +
+                " | " + _Symbol + " " + EnumToString(InpSignalTF) +
+                " | @" + DoubleToString(price, _Digits);
+   FirePush(msg);
+   Print(msg);
+}
+
+// ================================================================
+// HELPERS — approach threshold
+// ================================================================
+double GetApproachThreshold(double swingRange)
+{
+   if(InpApproachMode == 2) return InpApproachPips * _Point;
+   if(InpApproachMode == 1)
+   {
+      if(g_atrSPL_Handle != INVALID_HANDLE)
+      {
+         double atr[1];
+         if(CopyBuffer(g_atrSPL_Handle, 0, 0, 1, atr) > 0)
+            return atr[0] * InpApproachMult;
+      }
+      return InpApproachPips * _Point;
+   }
+   return swingRange * InpApproachMult;
+}
+
+// ================================================================
+// HELPERS — R:R check
+// ================================================================
+bool CheckMinRR(bool isBuy, double entry, double sl)
+{
+   if(InpMinRR <= 0.0) return true;
+   double slDist = MathAbs(entry - sl);
+   if(slDist < _Point) return true;
+   double nearestDist = DBL_MAX / 2.0;
+   for(int k = 0; k < g_nLv; k++)
+   {
+      if(g_lv[k].broken) continue;
+      if(isBuy && g_lv[k].isHigh)
+      { double d = g_lv[k].boxBot - entry; if(d > 0.0 && d < nearestDist) nearestDist = d; }
+      else if(!isBuy && !g_lv[k].isHigh)
+      { double d = entry - g_lv[k].boxTop; if(d > 0.0 && d < nearestDist) nearestDist = d; }
+   }
+   if(nearestDist >= DBL_MAX / 4.0) return true;
+   return (nearestDist >= slDist * InpMinRR);
+}
+
+// ================================================================
+// HELPERS — object drawing
+// ================================================================
+void DrawLine(const string &name, double price,
+              datetime t1, datetime t2, color col)
+{
+   if(!InpShowLines) return;
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, price, t2, price);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,      col);
+      ObjectSetInteger(0, name, OBJPROP_STYLE,      InpLineStyle);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,      InpLineWidth);
+      ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT,  false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, price);
+      ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, price);
+   }
+}
+
+void DrawBox(const string &name, double top, double bot,
+             datetime t1, datetime t2, color col)
+{
+   if(!InpShowBoxes) return;
+   color dim = (color)(((int)(((col >> 16) & 0xFF) * 0.22) << 16) |
+                       ((int)(((col >>  8) & 0xFF) * 0.22) <<  8) |
+                        (int)((col & 0xFF) * 0.22));
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, top, t2, bot);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,       dim);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     dim);
+      ObjectSetInteger(0, name, OBJPROP_FILL,        true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,        true);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
+   }
+   else
+   {
+      ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 0, top);
+      ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
+      ObjectSetDouble (0, name, OBJPROP_PRICE, 1, bot);
+   }
+}
+
+void DrawMSSZoneBox(const string &name, double top, double bot,
+                    datetime t1, datetime t2, bool isFVG, bool isBull)
+{
+   if(!InpShowMSSZones) return;
+   color base = isFVG ? InpFVGColor : InpOBColor;
+   color dim  = (color)(((int)(((base >> 16) & 0xFF) * 0.30) << 16) |
+                        ((int)(((base >>  8) & 0xFF) * 0.30) <<  8) |
+                         (int)((base & 0xFF) * 0.30));
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, top, t2, bot);
+      ObjectSetInteger(0, name, OBJPROP_COLOR,       base);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     dim);
+      ObjectSetInteger(0, name, OBJPROP_FILL,        true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,        false);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
+      string tag = isFVG ? (isBull ? "FVG-B" : "FVG-S") : (isBull ? "OB-B" : "OB-S");
+      ObjectSetString (0, name, OBJPROP_TEXT, tag);
+   }
+   else
+   { ObjectSetInteger(0, name, OBJPROP_TIME, 1, t2); }
+}
+
+void DrawChochLabel(const string &name, const string &txt,
+                    datetime t, double price, color col, bool above)
+{
+   if(!InpShowCHoCH || ObjectFind(0, name) >= 0) return;
+   ObjectCreate(0, name, OBJ_TEXT, 0, t, price);
+   ObjectSetString (0, name, OBJPROP_TEXT,       txt);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      col);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,     above ? ANCHOR_LOWER : ANCHOR_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,   8);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+}
+
+// ================================================================
+// HELPERS — level array management
+// ================================================================
+void AddLevel(double price, double top, double bot,
+              datetime t1, bool isHigh, double swingRange, long pivotVolume,
+              const string &ln, const string &bx)
+{
+   ArrayResize(g_lv, g_nLv + 1);
+   g_lv[g_nLv].price          = price;
+   g_lv[g_nLv].boxTop         = top;
+   g_lv[g_nLv].boxBot         = bot;
+   g_lv[g_nLv].t1             = t1;
+   g_lv[g_nLv].isHigh         = isHigh;
+   g_lv[g_nLv].lineName       = ln;
+   g_lv[g_nLv].boxName        = bx;
+   g_lv[g_nLv].swingRange     = swingRange;
+   g_lv[g_nLv].pivotVolume    = pivotVolume;
+   g_lv[g_nLv].touches        = 0;
+   g_lv[g_nLv].brokenBar      = -1;
+   g_lv[g_nLv].approached     = false;
+   g_lv[g_nLv].broken         = false;
+   g_lv[g_nLv].flipApproached = false;
+   g_nLv++;
+}
+
+void RemoveLevel(int i)
+{
+   if(i < 0 || i >= g_nLv) return;
+   ObjectDelete(0, g_lv[i].lineName);
+   ObjectDelete(0, g_lv[i].boxName);
+   g_lv[i] = g_lv[g_nLv - 1];
+   g_nLv--;
+   ArrayResize(g_lv, g_nLv);
+}
+
+// ================================================================
+// MSS ZONE FINDER
+// ================================================================
+void FindMSSZones(int legStart, int legEnd, bool isBullLeg,
+                  const double &h[], const double &l[],
+                  const double &o[], const double &c[],
+                  const datetime &time[], int total, int chochSeq)
+{
+   for(int z = 0; z < g_nMSSZones; z++)
+      ObjectDelete(0, g_mssZones[z].boxName);
+   g_nMSSZones = 0;
+   if(legStart < 0 || legEnd <= legStart || legEnd >= total) return;
+   string seq = IntegerToString(chochSeq);
+   int fvgCount = 0;
+   for(int i = legStart + 1; i <= legEnd - 1 && fvgCount < 4; i++)
+   {
+      if(!isBullLeg && l[i - 1] > h[i + 1])
+      {
+         double zTop = l[i - 1], zBot = h[i + 1];
+         if(zTop > zBot && g_nMSSZones < 8)
+         {
+            string bn = PFX + "MZ_FVG_" + seq + "_" + IntegerToString(i);
+            g_mssZones[g_nMSSZones].top = zTop; g_mssZones[g_nMSSZones].bot = zBot;
+            g_mssZones[g_nMSSZones].t1 = time[i]; g_mssZones[g_nMSSZones].isFVG = true;
+            g_mssZones[g_nMSSZones].isBull = false; g_mssZones[g_nMSSZones].active = true;
+            g_mssZones[g_nMSSZones].boxName = bn;
+            DrawMSSZoneBox(bn, zTop, zBot, time[i], time[legEnd], true, false);
+            g_nMSSZones++; fvgCount++;
+         }
+      }
+      else if(isBullLeg && h[i - 1] < l[i + 1])
+      {
+         double zTop = l[i + 1], zBot = h[i - 1];
+         if(zTop > zBot && g_nMSSZones < 8)
+         {
+            string bn = PFX + "MZ_FVG_" + seq + "_" + IntegerToString(i);
+            g_mssZones[g_nMSSZones].top = zTop; g_mssZones[g_nMSSZones].bot = zBot;
+            g_mssZones[g_nMSSZones].t1 = time[i]; g_mssZones[g_nMSSZones].isFVG = true;
+            g_mssZones[g_nMSSZones].isBull = true; g_mssZones[g_nMSSZones].active = true;
+            g_mssZones[g_nMSSZones].boxName = bn;
+            DrawMSSZoneBox(bn, zTop, zBot, time[i], time[legEnd], true, true);
+            g_nMSSZones++; fvgCount++;
+         }
+      }
+   }
+   for(int i = legEnd - 1; i >= legStart && g_nMSSZones < 8; i--)
+   {
+      bool isBullCandle = (c[i] > o[i]);
+      bool isBearCandle = (c[i] < o[i]);
+      bool isOB = (!isBullLeg && isBullCandle) || (isBullLeg && isBearCandle);
+      if(isOB)
+      {
+         double zTop = isBullCandle ? c[i] : o[i];
+         double zBot = isBullCandle ? o[i] : c[i];
+         if(zTop > zBot)
+         {
+            string bn = PFX + "MZ_OB_" + seq + "_" + IntegerToString(i);
+            g_mssZones[g_nMSSZones].top = zTop; g_mssZones[g_nMSSZones].bot = zBot;
+            g_mssZones[g_nMSSZones].t1 = time[i]; g_mssZones[g_nMSSZones].isFVG = false;
+            g_mssZones[g_nMSSZones].isBull = isBullLeg; g_mssZones[g_nMSSZones].active = true;
+            g_mssZones[g_nMSSZones].boxName = bn;
+            DrawMSSZoneBox(bn, zTop, zBot, time[i], time[legEnd], false, isBullLeg);
+            g_nMSSZones++;
+         }
+         break;
+      }
+   }
+}
+
+// ================================================================
+// ENGINE 1 — SEQUENCER
+// Records flips, checks confluence, cancels on conflicts
+// Returns: 1=BUY confirmed, -1=SELL confirmed, 0=pending/canceled
+// ================================================================
+// Call after a swing, RS, or HT flip is detected.
+// dir=direction of flip, source=0(swing),1(RS),2(HT), currentBar=signal-TF bar
+int E1_Update(int dir, int source, int currentBar)
+{
+   //--- Log the new flip
+   string srcName = (source == 0) ? "SWING" : (source == 1) ? "RS" : "HT";
+  // Print("⚙️ TRIO flip | ", srcName, "=", (dir==1?"BUY":"SELL"), " bar=", currentBar);
+
+   //--- Detect if any EXISTING pending engine has OPPOSITE direction → cancel all
+   if(InpE1CancelOnOpposite)
+   {
+      bool conflict = false;
+      if(source != 0 && g_eng.swingDir != 0 && g_eng.swingDir != dir) conflict = true;
+      if(source != 1 && g_eng.rsDir    != 0 && g_eng.rsDir    != dir) conflict = true;
+      if(source != 2 && g_eng.htDir    != 0 && g_eng.htDir    != dir) conflict = true;
+      if(conflict)
+      {
+         Print("⚡ TRIO CONFLICT — canceling sequence | New=",
+               (dir==1?"BUY":"SELL"), " from ", srcName);
+         ZeroMemory(g_eng);
+         if(InpWriteGV) GlobalVariableSet(_Symbol+"_TF_E1_STATE", 0.0);
+         return 0;
+      }
+   }
+
+   //--- Record this flip
+   if(source == 0) { g_eng.swingDir = dir; g_eng.swingBar = currentBar; }
+   if(source == 1) { g_eng.rsDir    = dir; g_eng.rsBar    = currentBar; }
+   if(source == 2) { g_eng.htDir    = dir; g_eng.htBar    = currentBar; }
+
+   //--- Check if all 3 agree
+   if(g_eng.swingDir != 0 && g_eng.rsDir != 0 && g_eng.htDir != 0 &&
+      g_eng.swingDir == g_eng.rsDir && g_eng.rsDir == g_eng.htDir)
+   {
+      //--- Check window constraint
+      if(InpEngineWindow > 0)
+      {
+         int earliest = MathMin(g_eng.swingBar, MathMin(g_eng.rsBar, g_eng.htBar));
+         int latest   = MathMax(g_eng.swingBar, MathMax(g_eng.rsBar, g_eng.htBar));
+         if(latest - earliest > InpEngineWindow)
+         {
+            Print("⌛ TRIO window expired (", latest - earliest, " bars > ", InpEngineWindow, ") — reset");
+            ZeroMemory(g_eng);
+            // Re-record the current flip as fresh start
+            if(source == 0) { g_eng.swingDir = dir; g_eng.swingBar = currentBar; }
+            if(source == 1) { g_eng.rsDir    = dir; g_eng.rsBar    = currentBar; }
+            if(source == 2) { g_eng.htDir    = dir; g_eng.htBar    = currentBar; }
+            return 0;
+         }
+      }
+
+      int confirmedDir = g_eng.swingDir;
+      Print("✅ TRIO CONFIRMED ", (confirmedDir==1?"BUY":"SELL"),
+            " | SW@", g_eng.swingBar, " RS@", g_eng.rsBar, " HT@", g_eng.htBar);
+      ZeroMemory(g_eng); // reset after firing
+
+      if(InpWriteGV)
+      {
+         GlobalVariableSet(_Symbol+"_TF_E1_STATE",     (double)confirmedDir);
+         GlobalVariableSet(_Symbol+"_TF_E1_CONFIRMED_TIME", (double)TimeCurrent());
+      }
+      return confirmedDir;
+   }
+
+   //--- Still pending — log wait state
+   int pending = 0;
+   if(g_eng.swingDir == 0) pending++;
+   if(g_eng.rsDir    == 0) pending++;
+   if(g_eng.htDir    == 0) pending++;
+   // Print("⏳ TRIO waiting for ", pending, " more engine(s)");
+
+   if(InpWriteGV)
+   {
+      GlobalVariableSet(_Symbol+"_TF_E1_SWING_DIR", (double)g_eng.swingDir);
+      GlobalVariableSet(_Symbol+"_TF_E1_RS_DIR",    (double)g_eng.rsDir);
+      GlobalVariableSet(_Symbol+"_TF_E1_HT_DIR",    (double)g_eng.htDir);
+   }
+   return 0;
+}
+
+// ================================================================
+// HALFTREND ENGINE (incremental, called bar-by-bar on signal TF)
+// Extracted from EA, adapted for indicator
+// Returns: 1=flipped BUY, -1=flipped SELL, 0=no flip
+// ================================================================
+int HT_UpdateBar(int signalBarShift)
+{
+   // signalBarShift: 0=current forming, 1=last closed (we use 1)
+   int totalBars = iBars(_Symbol, InpSignalTF);
+   if(totalBars < InpHTAmplitude + 3) return 0;
+
+   double atr2 = 0;
+   if(g_atrHT_Handle != INVALID_HANDLE)
+   {
+      double buf[1];
+      if(CopyBuffer(g_atrHT_Handle, 0, 1, 1, buf) > 0) atr2 = buf[0] / 2.0;
+   }
+
+   if(!g_ht_initialized)
+   {
+      if(atr2 <= 0) return 0;
+      g_ht_maxLowPrice  = iLow (_Symbol, InpSignalTF, 2);
+      g_ht_minHighPrice = iHigh(_Symbol, InpSignalTF, 2);
+      if(g_ht_maxLowPrice  <= 0) g_ht_maxLowPrice  = iLow (_Symbol, InpSignalTF, 1);
+      if(g_ht_minHighPrice <= 0) g_ht_minHighPrice = iHigh(_Symbol, InpSignalTF, 1);
+      g_ht_up = 0; g_ht_down = 0; g_ht_trend = 0; g_ht_nextTrend = 0;
+      g_ht_initialized = true;
+      if(InpWriteGV)
+      {
+         GlobalVariableSet(_Symbol+"_TF_HT_TREND",      0.0);
+         GlobalVariableSet(_Symbol+"_TF_HT_MAXLOW",     g_ht_maxLowPrice);
+         GlobalVariableSet(_Symbol+"_TF_HT_MINHIGH",    g_ht_minHighPrice);
+      }
+      return 0;
+   }
+   if(atr2 <= 0) return 0;
+
+   double cl  = iClose(_Symbol, InpSignalTF, 1);
+   double lo1 = iLow  (_Symbol, InpSignalTF, 2);
+   double hi1 = iHigh (_Symbol, InpSignalTF, 2);
+
+   double highPrice = -DBL_MAX, lowPrice = DBL_MAX;
+   for(int i = 1; i <= InpHTAmplitude; i++)
+   {
+      double h = iHigh(_Symbol, InpSignalTF, i);
+      double l = iLow (_Symbol, InpSignalTF, i);
+      if(h > highPrice) highPrice = h;
+      if(l < lowPrice)  lowPrice  = l;
+   }
+
+   double sumH = 0, sumL = 0;
+   for(int i = 1; i <= InpHTAmplitude; i++)
+   { sumH += iHigh(_Symbol, InpSignalTF, i); sumL += iLow(_Symbol, InpSignalTF, i); }
+   double highma = sumH / InpHTAmplitude, lowma = sumL / InpHTAmplitude;
+
+   int prevTrend = g_ht_trend;
+
+   if(g_ht_nextTrend == 1)
+   {
+      g_ht_maxLowPrice = MathMax(lowPrice, g_ht_maxLowPrice);
+      if(highma < g_ht_maxLowPrice && cl < lo1)
+      { g_ht_trend = 1; g_ht_nextTrend = 0; g_ht_minHighPrice = highPrice; }
+   }
+   else
+   {
+      g_ht_minHighPrice = MathMin(highPrice, g_ht_minHighPrice);
+      if(lowma > g_ht_minHighPrice && cl > hi1)
+      { g_ht_trend = 0; g_ht_nextTrend = 1; g_ht_maxLowPrice = lowPrice; }
+   }
+
+   if(g_ht_trend == 0)
+   {
+      if(prevTrend != 0) g_ht_up = (g_ht_down > 0) ? g_ht_down : iLow(_Symbol, InpSignalTF, 1);
+      else               g_ht_up = MathMax(g_ht_maxLowPrice, (g_ht_up > 0 ? g_ht_up : g_ht_maxLowPrice));
+   }
+   else
+   {
+      if(prevTrend != 1) g_ht_down = (g_ht_up > 0) ? g_ht_up : iHigh(_Symbol, InpSignalTF, 1);
+      else               g_ht_down = MathMin(g_ht_minHighPrice, (g_ht_down > 0 ? g_ht_down : g_ht_minHighPrice));
+   }
+
+   if(InpWriteGV)
+   {
+      GlobalVariableSet(_Symbol+"_TF_HT_TREND",   (double)g_ht_trend);
+      GlobalVariableSet(_Symbol+"_TF_HT_UP",      g_ht_up);
+      GlobalVariableSet(_Symbol+"_TF_HT_DOWN",    g_ht_down);
+   }
+
+   // trend==0 means UP in Pine Script (bullish), trend==1 means DOWN (bearish)
+   if(g_ht_trend == 0 && prevTrend == 1) return  1;  // flipped BUY
+   if(g_ht_trend == 1 && prevTrend == 0) return -1;  // flipped SELL
+   return 0;
+}
+
+// ================================================================
+// RESET ALL STATE
+// ================================================================
+void ResetAll()
+{
+   ObjectsDeleteAll(0, PFX);
+   ArrayResize(g_lv,   0); g_nLv = 0;
+   ArrayResize(g_swHi, 0); g_nSH = 0;
+   ArrayResize(g_swLo, 0); g_nSL = 0;
+   g_lastPH = g_lastPL = 0;
+   g_lastPHBar = g_lastPLBar = -1;
+   g_trend = 0;
+   g_nMSSZones = 0; g_mssSL = 0;
+   g_lastBuyAlertBar = g_lastSellAlertBar = -1;
+   g_chochBar = -1; g_chochSeq = 0; g_lastExtTime = 0;
+   // HT state
+   g_ht_trend = 0; g_ht_nextTrend = 0;
+   g_ht_maxLowPrice = 0; g_ht_minHighPrice = 0;
+   g_ht_up = 0; g_ht_down = 0; g_ht_initialized = false;
+   // RS state
+   g_rs_value = 0; g_rs_trend = 1.0; g_rs_initialized = false;
+   // Engine 1 sequencer
+   ZeroMemory(g_eng);
+   // Dedup
+   g_lastE1BuyBar = g_lastE1SellBar = -1;
+   g_lastE2BuyBar = g_lastE2SellBar = -1;
+}
+
+// ================================================================
+// OnCalculate
+// ================================================================
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double   &open[],
+                const double   &high[],
+                const double   &low[],
+                const double   &close[],
+                const long     &tick_volume[],
+                const long     &volume[],
+                const int      &spread[])
+{
+   int minBars = MathMax(InpSwingLeft + InpSwingRight + 1, InpRSATRLen + 2);
+   if(rates_total < minBars) return prev_calculated;
+
+   if(prev_calculated == 0)
+   {
+      ResetAll();
+      ArrayInitialize(BufBuyBull,  0);
+      ArrayInitialize(BufSellBear, 0);
+      ArrayInitialize(BufBuyCT,    0);
+      ArrayInitialize(BufSellCT,   0);
+      ArrayInitialize(BufE1Buy,    0);
+      ArrayInitialize(BufE1Sell,   0);
+      ArrayInitialize(BufE2Buy,    0);
+      ArrayInitialize(BufE2Sell,   0);
+   }
+
+   // ── Fetch ATR for RS (full history needed for stateless RS recalc)
+   double atrRaw[];
+   ArraySetAsSeries(atrRaw, true);
+   if(CopyBuffer(g_atrHandle, 0, 0, rates_total, atrRaw) < rates_total)
+      return prev_calculated;
+
+   // ── ROLLING SEGMENT — stateless full recalc for current chart TF
+   {
+      double rsVal   = close[InpRSATRLen];
+      double rsTrend = 1.0;
+      double actSlope = 0.0;
+      bool   isFastMode = false;
+
+      for(int j = 0; j < InpRSATRLen && j < rates_total; j++)
+      { BufRSVal[j] = EMPTY_VALUE; BufRSColor[j] = 0; }
+      BufRSVal[InpRSATRLen]   = rsVal;
+      BufRSColor[InpRSATRLen] = 0;
+
+      for(int i = InpRSATRLen + 1; i < rates_total; i++)
+      {
+         double atr = atrRaw[rates_total - 1 - i];
+         if(atr <= 0.0 || atr >= EMPTY_VALUE || !MathIsValidNumber(atr))
+         { BufRSVal[i] = close[i]; BufRSColor[i] = (rsTrend > 0) ? 0 : 1; continue; }
+
+         double dist    = close[i] - rsVal;
+         bool   bullRev = (rsTrend < 0) && ( dist >  InpRSRevThresh  * atr);
+         bool   bearRev = (rsTrend > 0) && (-dist >  InpRSRevThresh  * atr);
+         if(bullRev)      rsTrend =  1.0;
+         else if(bearRev) rsTrend = -1.0;
+         bool newFast = (MathAbs(dist) > InpRSFastThresh * atr);
+         if(bullRev || bearRev || (newFast != isFastMode) || actSlope == 0.0)
+         { isFastMode = newFast; actSlope = isFastMode ? atr / InpRSFastLen : atr / InpRSSlowLen; }
+         rsVal += rsTrend * actSlope;
+         BufRSVal[i]   = rsVal;
+         BufRSColor[i] = (rsTrend > 0) ? 0 : 1;
+      }
+
+      // Persist RS state via GV for TF-switch survival
+      if(InpWriteGV)
+      {
+         GlobalVariableSet(_Symbol+"_TF_RS_TREND", rsTrend);
+         GlobalVariableSet(_Symbol+"_TF_RS_VALUE", rsVal);
+      }
+   }
+
+   // ── DRAW RS LINE on chart (optional visual)
+   if(InpShowRSLine)
+   {
+      for(int i = (prev_calculated == 0 ? InpRSATRLen : MathMax(InpRSATRLen, prev_calculated - 2));
+          i < rates_total - 1; i++)
+      {
+         if(BufRSVal[i] == EMPTY_VALUE || BufRSVal[i + 1] == EMPTY_VALUE) continue;
+         color rsCol = (BufRSColor[i] == 0) ? InpRSBullColor : InpRSBearColor;
+         string rsName = PFX + "RS_" + IntegerToString(i);
+         if(ObjectFind(0, rsName) >= 0) ObjectDelete(0, rsName);
+         ObjectCreate(0, rsName, OBJ_TREND, 0, time[i], BufRSVal[i], time[i + 1], BufRSVal[i + 1]);
+         ObjectSetInteger(0, rsName, OBJPROP_COLOR,     rsCol);
+         ObjectSetInteger(0, rsName, OBJPROP_STYLE,     STYLE_SOLID);
+         ObjectSetInteger(0, rsName, OBJPROP_WIDTH,     2);
+         ObjectSetInteger(0, rsName, OBJPROP_RAY_RIGHT, false);
+         ObjectSetInteger(0, rsName, OBJPROP_SELECTABLE,false);
+         ObjectSetInteger(0, rsName, OBJPROP_HIDDEN,    true);
+      }
+   }
+
+   int startBar = (prev_calculated == 0)
+                  ? InpSwingLeft
+                  : MathMax(InpSwingLeft, prev_calculated - InpSwingRight - 1);
+
+   datetime tNow  = time[rates_total - 1];
+   double   bw1   = 0.001 * InpBoxWidth;
+   bool     isLive = (prev_calculated > 0);
+
+   // ── For signal-TF bar mapping (when signal TF != chart TF)
+   // We track HT flips by watching new signal-TF bar formation
+   static datetime s_lastSigBarTime = 0;
+   datetime curSigBarTime = 0;
+   if(rates_total > 0) curSigBarTime = iTime(_Symbol, InpSignalTF, 0);
+   bool newSigBar = (curSigBarTime != s_lastSigBarTime && curSigBarTime != 0);
+   if(newSigBar) s_lastSigBarTime = curSigBarTime;
+
+   // ── HT HISTORICAL REPLAY — runs on full recalc (prev_calculated == 0)
+   // Replays every closed signal-TF bar from oldest to current so that
+   // g_ht_trend / g_ht_maxLowPrice / g_ht_minHighPrice are correctly
+   // seeded before live ticks arrive. Without this the HT engine starts
+   // with a cold state and fires false flips on the first live bar.
+   if(prev_calculated == 0)
+   {
+      int sigTotalBars = iBars(_Symbol, InpSignalTF);
+      // Replay from oldest closed bar (shift = sigTotalBars-1) down to shift=2
+      // (shift 1 = last fully closed bar, shift 0 = forming — skip forming bar)
+      for(int s = sigTotalBars - 1; s >= 2; s--)
+      {
+         // Feed each bar through the HT engine using the same logic as HT_UpdateBar
+         // but addressed by bar shift s instead of hardcoded shift 1/2.
+         double atr2 = 0;
+         if(g_atrHT_Handle != INVALID_HANDLE)
+         {
+            double htBuf[1];
+            if(CopyBuffer(g_atrHT_Handle, 0, s, 1, htBuf) > 0) atr2 = htBuf[0] / 2.0;
+         }
+         if(atr2 <= 0) continue;
+
+         if(!g_ht_initialized)
+         {
+            g_ht_maxLowPrice  = iLow (_Symbol, InpSignalTF, s + 1);
+            g_ht_minHighPrice = iHigh(_Symbol, InpSignalTF, s + 1);
+            if(g_ht_maxLowPrice  <= 0) g_ht_maxLowPrice  = iLow (_Symbol, InpSignalTF, s);
+            if(g_ht_minHighPrice <= 0) g_ht_minHighPrice = iHigh(_Symbol, InpSignalTF, s);
+            g_ht_up = 0; g_ht_down = 0; g_ht_trend = 0; g_ht_nextTrend = 0;
+            g_ht_initialized = true;
+            continue;
+         }
+
+         double htCl  = iClose(_Symbol, InpSignalTF, s);
+         double htLo1 = iLow  (_Symbol, InpSignalTF, s + 1);
+         double htHi1 = iHigh (_Symbol, InpSignalTF, s + 1);
+
+         double htHighPrice = -DBL_MAX, htLowPrice = DBL_MAX;
+         double htSumH = 0, htSumL = 0;
+         for(int k = 0; k < InpHTAmplitude; k++)
+         {
+            double hk = iHigh(_Symbol, InpSignalTF, s + k);
+            double lk = iLow (_Symbol, InpSignalTF, s + k);
+            if(hk > htHighPrice) htHighPrice = hk;
+            if(lk < htLowPrice)  htLowPrice  = lk;
+            htSumH += hk; htSumL += lk;
+         }
+         double htHighma = htSumH / InpHTAmplitude;
+         double htLowma  = htSumL / InpHTAmplitude;
+
+         int htPrevTrend = g_ht_trend;
+         if(g_ht_nextTrend == 1)
+         {
+            g_ht_maxLowPrice = MathMax(htLowPrice, g_ht_maxLowPrice);
+            if(htHighma < g_ht_maxLowPrice && htCl < htLo1)
+            { g_ht_trend = 1; g_ht_nextTrend = 0; g_ht_minHighPrice = htHighPrice; }
+         }
+         else
+         {
+            g_ht_minHighPrice = MathMin(htHighPrice, g_ht_minHighPrice);
+            if(htLowma > g_ht_minHighPrice && htCl > htHi1)
+            { g_ht_trend = 0; g_ht_nextTrend = 1; g_ht_maxLowPrice = htLowPrice; }
+         }
+         if(g_ht_trend == 0)
+         {
+            if(htPrevTrend != 0) g_ht_up = (g_ht_down > 0) ? g_ht_down : iLow(_Symbol, InpSignalTF, s);
+            else                 g_ht_up = MathMax(g_ht_maxLowPrice, (g_ht_up > 0 ? g_ht_up : g_ht_maxLowPrice));
+         }
+         else
+         {
+            if(htPrevTrend != 1) g_ht_down = (g_ht_up > 0) ? g_ht_up : iHigh(_Symbol, InpSignalTF, s);
+            else                 g_ht_down = MathMin(g_ht_minHighPrice, (g_ht_down > 0 ? g_ht_down : g_ht_minHighPrice));
+         }
+         // Note: no flip signals fired during historical replay — state seeding only
+      }
+      Print("✅ HT historical replay complete | trend=", g_ht_trend,
+            " nextTrend=", g_ht_nextTrend,
+            " maxLow=", DoubleToString(g_ht_maxLowPrice, _Digits),
+            " minHigh=", DoubleToString(g_ht_minHighPrice, _Digits));
+   }
+
+   // ── HT update — only once per new signal-TF bar on live chart
+   static int currentHTDir = 0;
+   if(isLive && newSigBar)
+   {
+      int htFlip = HT_UpdateBar(1);
+      if(htFlip != 0 && htFlip != currentHTDir)
+      {
+         currentHTDir = htFlip;
+         Print("📡 HT flip=", (htFlip == 1 ? "BUY" : "SELL"));
+         int htSigBar = rates_total - 1;
+         int e1Result = E1_Update(htFlip, 2, htSigBar);
+         if(e1Result != 0)
+         {
+            // Engine 1 confirmed — fire push
+            double sigPrice = close[htSigBar];
+            double tp1, tp2, tp3;
+            double sl;
+            if(e1Result == 1)
+            {
+               FindBuyTPs(sigPrice, tp1, tp2, tp3);
+               sl = (g_lastPL > 0 && g_lastPL < sigPrice) ? g_lastPL : sigPrice * 0.999;
+               BufE1Buy[htSigBar] = low[htSigBar];
+               bool alsoE2 = (BufE2Buy[htSigBar] > 0);
+               if(CheckMinRR(true, sigPrice, sl))
+                  FireEngine1Signal(1, sigPrice, sl, tp1, tp2, tp3, alsoE2, htSigBar);
+            }
+            else
+            {
+               FindSellTPs(sigPrice, tp1, tp2, tp3);
+               sl = (g_lastPH > sigPrice) ? g_lastPH : sigPrice * 1.001;
+               BufE1Sell[htSigBar] = high[htSigBar];
+               bool alsoE2 = (BufE2Sell[htSigBar] > 0);
+               if(CheckMinRR(false, sigPrice, sl))
+                  FireEngine1Signal(-1, sigPrice, sl, tp1, tp2, tp3, alsoE2, htSigBar);
+            }
+         }
+      }
+   }
+
+   // ================================================================
+   // MAIN BAR LOOP  (oldest → newest, chart TF)
+   // ================================================================
+   for(int i = startBar; i < rates_total; i++)
+   {
+      // ── RS flip detection at this bar (prints only on direction change)
+static int currentRSDir = 0;
+int rsFlip = 0;
+static datetime lastRSTime = 0;
+datetime thisBarTime = iTime(_Symbol, InpSignalTF, 0);
+if(i > InpRSATRLen && thisBarTime != lastRSTime)
+{
+   lastRSTime = thisBarTime;
+   int currC = (int)BufRSColor[i];
+   int newDir = (currC == 0) ? 1 : -1;
+   if(newDir != currentRSDir)
+   {
+      currentRSDir = newDir;
+      rsFlip = newDir;
+   }
+}
+     
+
+      if(rsFlip != 0)
+      {
+         Print("📡 RS flip=", (rsFlip == 1 ? "BUY" : "SELL"), " bar=", i);
+         if(InpWriteGV)
+         {
+            GlobalVariableSet(_Symbol+"_TF_RS_TREND",    (double)(rsFlip == 1 ? 1 : -1));
+            GlobalVariableSet(_Symbol+"_TF_RS_FLIP_BAR", (double)i);
+            GlobalVariableSet(_Symbol+"_TF_RS_FLIP_TIME",(double)time[i]);
+         }
+         
+         // ============================================================
+         // CHoCH + RS CONFLUENCE (independent signal)
+         // ============================================================
+         if(g_chochRSDir != 0 && g_chochRSDir == rsFlip)
+         {
+            int barsSinceCHoCH = i - g_chochRSBar;
+            if(barsSinceCHoCH <= InpChochRSWindow && barsSinceCHoCH >= 0)
+            {
+               Print("🔥 CHoCH+RS CONFLUENCE! dir=", (rsFlip==1?"BUY":"SELL"), " bars ago=", barsSinceCHoCH);
+               
+               // Mark arrow on chart (reuse Engine 1 buffers)
+               if(rsFlip == 1)
+                  BufE1Buy[i] = low[i];
+               else
+                  BufE1Sell[i] = high[i];
+               
+               // Push notification
+               if(InpPush)
+               {
+                  string msg = (rsFlip == 1) ? "🟢 CHoCH+RS BUY" : "🔴 CHoCH+RS SELL";
+                  msg += " | " + _Symbol + " " + EnumToString(InpSignalTF) +
+                         " | @" + DoubleToString(close[i], _Digits);
+                  FirePush(msg);
+                  Print(msg);
+               }
+               
+               // Clear to prevent re-firing same CHoCH event
+               g_chochRSDir = 0;
+            }
+         }
+         
+         int e1Result = E1_Update(rsFlip, 1, i);
+         if(e1Result != 0)
+         
+         {
+            double sigPrice = close[i];
+            double tp1, tp2, tp3, sl;
+            if(e1Result == 1)
+            {
+               FindBuyTPs(sigPrice, tp1, tp2, tp3);
+               sl = (g_lastPL > 0 && g_lastPL < sigPrice) ? g_lastPL : sigPrice * 0.999;
+               BufE1Buy[i] = low[i];
+               bool alsoE2 = (BufE2Buy[i] > 0);
+               if(isLive && i == rates_total - 1 && CheckMinRR(true, sigPrice, sl))
+                  FireEngine1Signal(1, sigPrice, sl, tp1, tp2, tp3, alsoE2, i);
+            }
+            else
+            {
+               FindSellTPs(sigPrice, tp1, tp2, tp3);
+               sl = (g_lastPH > sigPrice) ? g_lastPH : sigPrice * 1.001;
+               BufE1Sell[i] = high[i];
+               bool alsoE2 = (BufE2Sell[i] > 0);
+               if(isLive && i == rates_total - 1 && CheckMinRR(false, sigPrice, sl))
+                  FireEngine1Signal(-1, sigPrice, sl, tp1, tp2, tp3, alsoE2, i);
+                  
+
+            }
+         }
+      }
+
+      // ── PIVOT detection
+      int pBar = i - InpSwingRight;
+      if(pBar < InpSwingLeft) continue;
+
+      bool newPH = IsPivotHigh(high, pBar, InpSwingLeft, InpSwingRight, rates_total);
+      bool newPL = IsPivotLow (low,  pBar, InpSwingLeft, InpSwingRight, rates_total);
+
+      // ── NEW PIVOT HIGH
+      if(newPH && BufPivHProc[pBar] == 0.0)
+      {
+         BufPivHProc[pBar] = 1.0;
+         double ph = high[pBar];
+
+         // Draw liquidity zone
+         string ln = PFX + "LH_" + IntegerToString(pBar);
+         string bx = PFX + "BH_" + IntegerToString(pBar);
+         bool addZone = true;
+         if(InpVolFilter)
+         {
+            for(int k = 0; k < g_nLv && addZone; k++)
+            {
+               if(!g_lv[k].isHigh || g_lv[k].broken) continue;
+               if(high[pBar] >= g_lv[k].boxBot && low[pBar] <= g_lv[k].boxTop)
+               {
+                  if(tick_volume[pBar] > g_lv[k].pivotVolume) RemoveLevel(k);
+                  else addZone = false;
+               }
+            }
+         }
+         if(addZone)
+         {
+            DrawLine(ln, ph, time[pBar], time[i], InpHighColor);
+            DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpHighColor);
+            AddLevel(ph, high[pBar], low[pBar], time[pBar], true,
+                     high[pBar] - low[pBar], tick_volume[pBar], ln, bx);
+         }
+
+         int priorTrend = g_trend;
+         bool isHH = (g_lastPH == 0 || ph > g_lastPH);
+
+         if(isHH && priorTrend == -1)
+         {
+            // CHoCH bear→bull
+            g_chochSeq++;
+            string chochNameBull = PFX + "CHoCH_" + IntegerToString(pBar);
+            string chochTxtBull  = "CHoCH SELL";
+            DrawChochLabel(chochNameBull, chochTxtBull, time[pBar], ph, InpMSSBullCol, false);
+            int legStart = (g_lastPHBar >= 0) ? g_lastPHBar : MathMax(0, pBar - 30);
+            FindMSSZones(legStart, pBar, true,
+                         high, low, open, close, time, rates_total, g_chochSeq);
+            g_mssSL = (g_lastPL > 0) ? g_lastPL : ph * 0.999;
+            g_mssBull = true;
+            g_trend = 1;
+            g_chochBar = pBar;
+                        // Store CHoCH for RS confluence
+            g_chochRSDir = -1;  // SELL
+            g_chochRSBar = pBar;
+            g_chochRSTime = time[pBar];
+                        if(InpWriteGV)
+            { GlobalVariableSet(_Symbol+"_TF_CHOCH_DIR", 1.0); GlobalVariableSet(_Symbol+"_TF_CHOCH_TIME", (double)TimeCurrent()); }
+            if(isLive && i == rates_total - 1 && InpPush && InpPushCHoCH)
+            {
+               string chochBullMsg = "🔵 CHoCH SELL→BULL | " + _Symbol + " " + EnumToString(InpSignalTF) +
+                                     " | Price:" + DoubleToString(ph, _Digits);
+               FirePush(chochBullMsg);
+            }
+         }
+         else if(isHH)
+         { g_trend = (g_trend == 0) ? 1 : g_trend; }
+         else
+         {
+                     // Opposite swing invalidates pending CHoCH
+            g_chochRSDir = 0;
+            // LH → SELL swing signal
+            bool withTrend = (priorTrend == -1);
+            double tp1, tp2, tp3;
+            FindSellTPs(ph, tp1, tp2, tp3);
+            double sl = (g_lastPH > ph) ? g_lastPH : ph * 1.001;
+
+            if(withTrend) BufSellBear[pBar] = ph;
+            else          BufSellCT[pBar]   = ph;
+
+            // Engine 1: register swing SELL
+            int swingResult = E1_Update(-1, 0, i);
+            if(swingResult != 0)
+            {
+               BufE1Sell[pBar] = ph;
+               bool alsoE2 = (BufE2Sell[pBar] > 0);
+               if(isLive && i == rates_total - 1 && CheckMinRR(false, ph, sl))
+                  FireEngine1Signal(-1, ph, sl, tp1, tp2, tp3, alsoE2, i);
+            }
+
+            if(InpWriteGV)
+            { GlobalVariableSet(_Symbol+"_TF_SWING_DIR", -1.0); GlobalVariableSet(_Symbol+"_TF_SWING_PRICE", ph);
+              GlobalVariableSet(_Symbol+"_TF_SWING_BAR",  (double)pBar); GlobalVariableSet(_Symbol+"_TF_SWING_TIME", (double)time[pBar]); }
+         }
+
+         AddSwingHigh(ph);
+         g_lastPH = ph; g_lastPHBar = pBar;
+      }
+
+      // ── NEW PIVOT LOW
+      if(newPL && BufPivLProc[pBar] == 0.0)
+      {
+         BufPivLProc[pBar] = 1.0;
+         double pl = low[pBar];
+
+         string ln = PFX + "LL_" + IntegerToString(pBar);
+         string bx = PFX + "BL_" + IntegerToString(pBar);
+         bool addZone = true;
+         if(InpVolFilter)
+         {
+            for(int k = 0; k < g_nLv && addZone; k++)
+            {
+               if(g_lv[k].isHigh || g_lv[k].broken) continue;
+               if(high[pBar] >= g_lv[k].boxBot && low[pBar] <= g_lv[k].boxTop)
+               {
+                  if(tick_volume[pBar] > g_lv[k].pivotVolume) RemoveLevel(k);
+                  else addZone = false;
+               }
+            }
+         }
+         if(addZone)
+         {
+            DrawLine(ln, pl, time[pBar], time[i], InpLowColor);
+            DrawBox (bx, high[pBar], low[pBar], time[pBar], time[i], InpLowColor);
+            AddLevel(pl, high[pBar], low[pBar], time[pBar], false,
+                     high[pBar] - low[pBar], tick_volume[pBar], ln, bx);
+         }
+
+         int  priorTrend = g_trend;
+         bool isLL = (g_lastPL == 0 || pl < g_lastPL);
+
+         if(isLL && priorTrend == 1)
+         {
+            // CHoCH bull→bear
+            g_chochSeq++;
+            string chochNameBear = PFX + "CHoCH_" + IntegerToString(pBar);
+            string chochTxtBear  = "CHoCH BUY";
+            DrawChochLabel(chochNameBear, chochTxtBear, time[pBar], pl, InpMSSBearCol, true);
+            int legStart = (g_lastPLBar >= 0) ? g_lastPLBar : MathMax(0, pBar - 30);
+            FindMSSZones(legStart, pBar, false,
+                         high, low, open, close, time, rates_total, g_chochSeq);
+            g_mssSL = (g_lastPH > 0) ? g_lastPH : pl * 1.001;
+            g_mssBull = false;
+            g_trend = -1;
+            g_chochBar = pBar;            
+                        // Store CHoCH for RS confluence
+            g_chochRSDir = 1;   // BUYF
+            g_chochRSBar = pBar;
+            g_chochRSTime = time[pBar];
+            if(InpWriteGV)
+            { GlobalVariableSet(_Symbol+"_TF_CHOCH_DIR", -1.0); GlobalVariableSet(_Symbol+"_TF_CHOCH_TIME", (double)TimeCurrent()); }
+            if(isLive && i == rates_total - 1 && InpPush && InpPushCHoCH)
+            {
+               string chochBearMsg = "🔴 CHoCH BUY→BEAR | " + _Symbol + " " + EnumToString(InpSignalTF) +
+                                     " | Price:" + DoubleToString(pl, _Digits);
+               FirePush(chochBearMsg);
+            }
+         }
+         else if(isLL)
+         { g_trend = (g_trend == 0) ? -1 : g_trend; }
+         else
+         {
+         // Opposite swing invalidates pending CHoCH
+            g_chochRSDir = 0;
+            // HL → BUY swing signal
+            bool withTrend = (priorTrend == 1);
+            double tp1, tp2, tp3;
+            FindBuyTPs(pl, tp1, tp2, tp3);
+            double sl = (g_lastPL > 0 && g_lastPL < pl) ? g_lastPL : pl * 0.999;
+
+            if(withTrend) BufBuyBull[pBar] = pl;
+            else          BufBuyCT[pBar]   = pl;
+
+            // Engine 1: register swing BUY
+            int swingResult = E1_Update(1, 0, i);
+            if(swingResult != 0)
+            {
+               BufE1Buy[pBar] = pl;
+               bool alsoE2 = (BufE2Buy[pBar] > 0);
+               if(isLive && i == rates_total - 1 && CheckMinRR(true, pl, sl))
+                  FireEngine1Signal(1, pl, sl, tp1, tp2, tp3, alsoE2, i);
+            }
+
+            if(InpWriteGV)
+            { GlobalVariableSet(_Symbol+"_TF_SWING_DIR", 1.0); GlobalVariableSet(_Symbol+"_TF_SWING_PRICE", pl);
+              GlobalVariableSet(_Symbol+"_TF_SWING_BAR",  (double)pBar); GlobalVariableSet(_Symbol+"_TF_SWING_TIME", (double)time[pBar]); }
+         }
+
+         AddSwingLow(pl);
+         g_lastPL = pl; g_lastPLBar = pBar;
+      }
+
+      // ── LEVEL BREAK TRACKING
+      for(int j = 0; j < g_nLv; j++)
+      {
+         if(g_lv[j].broken) continue;
+         bool broke = g_lv[j].isHigh
+                      ? (close[i] > g_lv[j].boxTop)
+                      : (close[i] < g_lv[j].boxBot);
+         if(broke)
+         { g_lv[j].broken = true; g_lv[j].brokenBar = i;
+           g_lv[j].approached = false; g_lv[j].flipApproached = false; }
+      }
+
+      // ── ENGINE 2 — SBR/RBS ALERTS (on confirmed closed bar)
+      if(InpTrackFlips && i == rates_total - 2 && prev_calculated > 0)
+      {
+         for(int j = 0; j < g_nLv; j++)
+         {
+            if(!g_lv[j].broken) continue;
+            bool inWindow = (InpRetestWindow == 0) ||
+                            (g_lv[j].brokenBar >= 0 &&
+                             i - g_lv[j].brokenBar <= InpRetestWindow);
+            if(!inWindow) continue;
+
+            double lp = g_lv[j].price;
+            bool inFlipZone;
+            if(InpApproachMode == 0)
+               inFlipZone = g_lv[j].isHigh ? (low[i]  <= g_lv[j].boxTop) : (high[i] >= g_lv[j].boxBot);
+            else
+            {
+               double thr = GetApproachThreshold(g_lv[j].swingRange);
+               inFlipZone = g_lv[j].isHigh ? (low[i]  <= lp + thr) : (high[i] >= lp - thr);
+            }
+
+            if(inFlipZone && !g_lv[j].flipApproached)
+            {
+               bool touchOK = (InpMaxFlipTouches == 0 || g_lv[j].touches < InpMaxFlipTouches);
+               if(touchOK)
+               {
+                  g_lv[j].flipApproached = true;
+                  g_lv[j].touches++;
+
+                  // isHigh broken and retested from below → RBS → BUY
+                  // !isHigh broken and retested from above → SBR → SELL
+                  int e2Dir = g_lv[j].isHigh ? 1 : -1;
+
+                  // Mark buffer
+                  if(e2Dir == 1)  { BufE2Buy[i]  = low[i];  }
+                  else            { BufE2Sell[i] = high[i]; }
+
+                  // Check if Engine 1 also fired same direction on same bar
+                  bool alsoE1 = (e2Dir == 1) ? (BufE1Buy[i] > 0) : (BufE1Sell[i] > 0);
+
+                  if(isLive)
+                     FireEngine2Signal(e2Dir, lp, i, alsoE1);
+
+                  // If Engine 1 had already fired same direction same bar → mark bonus on TRIO
+                  if(alsoE1 && isLive && e2Dir == 1 && g_lastE1BuyBar == i)
+                  {
+                     string bonusBuyMsg = "⚡ BONUS CONFLUENCE: TRIO + SBR/RBS BOTH BUY | " +
+                                         _Symbol + " @" + DoubleToString(lp, _Digits);
+                     FirePush(bonusBuyMsg);
+                  }
+                  else if(alsoE1 && isLive && e2Dir == -1 && g_lastE1SellBar == i)
+                  {
+                     string bonusSellMsg = "⚡ BONUS CONFLUENCE: TRIO + SBR/RBS BOTH SELL | " +
+                                          _Symbol + " @" + DoubleToString(lp, _Digits);
+                     FirePush(bonusSellMsg);
+                  }
+               }
+            }
+            // Reset flip approached when price leaves zone
+            if(!inFlipZone && g_lv[j].flipApproached)
+               g_lv[j].flipApproached = false;
+         }
+      }
+
+      // ── EXTEND LEVELS once per new bar
+      if(i == rates_total - 1 && tNow != g_lastExtTime)
+      {
+         g_lastExtTime = tNow;
+
+         // MSS zones
+         for(int z = 0; z < g_nMSSZones; z++)
+            if(g_mssZones[z].active)
+               DrawMSSZoneBox(g_mssZones[z].boxName,
+                              g_mssZones[z].top, g_mssZones[z].bot,
+                              g_mssZones[z].t1, tNow,
+                              g_mssZones[z].isFVG, g_mssZones[z].isBull);
+
+         // Liquidity levels
+         int j = 0;
+         while(j < g_nLv)
+         {
+            double lp  = g_lv[j].price;
+            color  col = g_lv[j].isHigh ? InpHighColor : InpLowColor;
+            if(g_lv[j].broken)
+            {
+               if(!InpTrackFlips) { RemoveLevel(j); continue; }
+               bool inWindow = (InpRetestWindow == 0) ||
+                               (g_lv[j].brokenBar >= 0 &&
+                                i - g_lv[j].brokenBar <= InpRetestWindow);
+               if(!inWindow) { RemoveLevel(j); continue; }
+               bool doubleBroke = g_lv[j].isHigh
+                                  ? (close[i] < g_lv[j].boxBot)
+                                  : (close[i] > g_lv[j].boxTop);
+               if(doubleBroke) { RemoveLevel(j); continue; }
+
+               color dimCol = (color)(((int)(((col >> 16) & 0xFF) * 0.35) << 16) |
+                                      ((int)(((col >>  8) & 0xFF) * 0.35) <<  8) |
+                                       (int)((col & 0xFF) * 0.35));
+               DrawLine(g_lv[j].lineName, lp, g_lv[j].t1, tNow, dimCol);
+               DrawBox (g_lv[j].boxName, g_lv[j].boxTop, g_lv[j].boxBot,
+                        g_lv[j].t1, tNow, dimCol);
+               ObjectSetInteger(0, g_lv[j].lineName, OBJPROP_COLOR,   dimCol);
+               ObjectSetInteger(0, g_lv[j].boxName,  OBJPROP_COLOR,   dimCol);
+               ObjectSetInteger(0, g_lv[j].boxName,  OBJPROP_BGCOLOR, dimCol);
+               j++; continue;
+            }
+
+            bool filled = (high[i] >= lp && low[i] <= lp);
+            if(filled && InpHideFilled)  { RemoveLevel(j); continue; }
+            if(filled && InpExtendFill)
+            {
+               ObjectDelete(0, g_lv[j].lineName); ObjectDelete(0, g_lv[j].boxName);
+               g_lv[j] = g_lv[g_nLv - 1]; g_nLv--; ArrayResize(g_lv, g_nLv); continue;
+            }
+            if(!InpExtendFill) { j++; continue; }
+            DrawLine(g_lv[j].lineName, lp, g_lv[j].t1, tNow, col);
+            DrawBox (g_lv[j].boxName, g_lv[j].boxTop, g_lv[j].boxBot, g_lv[j].t1, tNow, col);
+            if(g_nLv >= MAX_OBJECTS) RemoveLevel(0);
+            j++;
+         }
+      }
+   }
+
+   return rates_total;
+}
+//+------------------------------------------------------------------+
